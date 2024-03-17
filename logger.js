@@ -16,7 +16,7 @@ const users = {};
 
 fs.mkdir("./logs", {recursive: true}, (err) => {
     if (err) {
-        logger.error("An error occurred while creating the logs directory: " + err);
+        logger.error("an error occurred while creating the logs directory: " + err);
     }
 });
 
@@ -49,23 +49,6 @@ try {
 }
 steamUser.on('loggedOn', () => {
     logger.info(`login to Steam as ${steamUser.steamID}`);
-
-    steamUser.chat.getFriendMessageHistory(
-        "76561198453448510",
-        {
-            maxCount: 10,
-        },
-        (err, messages) => {
-            console.log(typeof messages)
-            for (let message of messages.messages) {
-                console.log(typeof message.server_timestamp);
-                console.log(Object.keys(message.server_timestamp));
-            }
-            logger.info("chat history", {
-                messages: messages,
-                err: err,
-            });
-        });
 });
 
 /**
@@ -81,9 +64,12 @@ async function getUserInfo(steamID) {
             users[steamID.getSteamID64()] = personasResult.personas[steamID.getSteamID64()];
             sender = users[steamID.getSteamID64()];
 
-            logger.info("User data received: " + JSON.stringify(sender));
+            importChatHistory(steamID);
+
+            // noinspection ES6MissingAwait
+            logger.info("user data received: " + JSON.stringify(sender));
         } catch (err) {
-            logger.error("An error occurred while getting user data: ", err);
+            logger.error("an error occurred while getting user data: ", err);
             sender = {
                 player_name: "Unknown",
             };
@@ -97,9 +83,13 @@ async function getUserInfo(steamID) {
  * @param {SteamID} steamID
  * @param {string} message
  * @param {boolean} echo
+ * @param {number} ordinal
  * @returns {Promise<void>}
  */
 async function logMessage(date, steamID, message, echo, ordinal) {
+    // try to get chat history
+    await getUserInfo(steamID);
+
     let sender = await getUserInfo(echo ? steamUser.steamID : steamID);
     logger.info("log steam chat message", {
         echo: echo,
@@ -117,23 +107,19 @@ async function logMessage(date, steamID, message, echo, ordinal) {
         ordinal: ordinal,
     }) + "\n", (e) => {
         if (e) {
-            logger.error("An error occurred while writing FullLogs jsonl file: " + e);
+            logger.error("an error occurred while writing chat log file: " + e);
         }
     });
 }
 
 steamUser.chat.on("friendMessage", (message) => {
-    logger.info("friend message", message);
-
     // noinspection JSIgnoredPromiseFromCall
-    logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, false);
+    logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, false, message.ordinal);
 });
 
 steamUser.chat.on("friendMessageEcho", (message) => {
-    logger.info("friend message echo", message);
-
     // noinspection JSIgnoredPromiseFromCall
-    logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, true);
+    logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, true, message.ordinal);
 });
 
 /**
@@ -144,4 +130,32 @@ function dateToString(date) {
     let milliseconds = date.getMilliseconds().toString().padStart(3, '0');
 
     return `${date.toLocaleString()}.${milliseconds}`
+}
+
+function importChatHistory(steamID) {
+    if (steamID === steamUser.steamID) {
+        return;
+    }
+
+    steamUser.chat.getFriendMessageHistory(steamID.getSteamID64(), (err, messages) => {
+        if (err) {
+            logger.error("an error occurred while getting chat history: ", err);
+            return
+        }
+
+        for (let message of messages.messages) {
+            logger.info("get chat history", message);
+            logMessage(
+                dateToString(message.server_timestamp),
+                steamID, message.message,
+                message.sender === steamUser.steamID,
+                message.ordinal,
+            );
+        }
+    });
+}
+
+module.exports = {
+    steamUser: steamUser,
+    getUserInfo: getUserInfo,
 }
