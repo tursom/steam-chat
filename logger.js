@@ -148,9 +148,7 @@ function importChatHistory(steamID) {
         return;
     }
 
-    steamUser.chat.getFriendMessageHistory(steamID.getSteamID64(), {
-        maxCount: 5
-    }, (err, messages) => {
+    steamUser.chat.getFriendMessageHistory(steamID.getSteamID64(), (err, messages) => {
         if (err) {
             logger.error("an error occurred while getting chat history: ", err);
             return
