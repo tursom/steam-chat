@@ -33,11 +33,21 @@ config = require("./config.js");
 try {
     refreshToken = fs.readFileSync('refresh.token', 'utf8');
 
-    const LogOnOptionsAUTO = {
-        logonID: config.logonID,
-        refreshToken: refreshToken,
-    };
-    steamUser.logOn(LogOnOptionsAUTO);
+    if (refreshToken && length(refreshToken) > 0) {
+        const LogOnOptionsAUTO = {
+            logonID: config.logonID,
+            refreshToken: refreshToken,
+            steamID: config.steamID,
+        };
+        steamUser.logOn(LogOnOptionsAUTO);
+    } else {
+        steamUser.logOn({
+            accountName: config.accountName,
+            password: config.password,
+            logonID: config.logonID,
+            steamID: config.steamID,
+        });
+    }
 } catch (e) {
     logger.warn(`failed to load session: ${e.message}`)
 
@@ -45,6 +55,7 @@ try {
         accountName: config.accountName,
         password: config.password,
         logonID: config.logonID,
+        steamID: config.steamID,
     });
 }
 steamUser.on('loggedOn', () => {
@@ -137,7 +148,9 @@ function importChatHistory(steamID) {
         return;
     }
 
-    steamUser.chat.getFriendMessageHistory(steamID.getSteamID64(), (err, messages) => {
+    steamUser.chat.getFriendMessageHistory(steamID.getSteamID64(), {
+        maxCount: 5
+    }, (err, messages) => {
         if (err) {
             logger.error("an error occurred while getting chat history: ", err);
             return
@@ -148,7 +161,7 @@ function importChatHistory(steamID) {
             logMessage(
                 dateToString(message.server_timestamp),
                 steamID, message.message,
-                message.sender === steamUser.steamID,
+                message.sender.getSteamID64() === steamUser.steamID.getSteamID64(),
                 message.ordinal,
             );
         }
