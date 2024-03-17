@@ -33,7 +33,7 @@ config = require("./config.js");
 try {
     refreshToken = fs.readFileSync('refresh.token', 'utf8');
 
-    if (refreshToken && length(refreshToken) > 0) {
+    if (refreshToken && refreshToken.length > 0) {
         const LogOnOptionsAUTO = {
             logonID: config.logonID,
             refreshToken: refreshToken,
