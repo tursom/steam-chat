@@ -10,6 +10,7 @@
   "author": "",
   "license": "ISC",
   "dependencies": {
+    "@matteo.collina/dateformat": "^5.0.1",
     "steam-totp": "^2.1.2",
     "steam-user": "^5.0.8",
     "steamcommunity": "^3.48.2",

@@ -3,6 +3,8 @@ SteamUser = require('steam-user');
 SteamTotp = require('steam-totp');
 fs = require('fs');
 winston = require("winston");
+dateformat = require('@matteo.collina/dateformat');
+
 logger = winston.createLogger({
     level: 'info',
     format: winston.format.json(),
@@ -138,9 +140,7 @@ steamUser.chat.on("friendMessageEcho", (message) => {
  * @returns {string}
  */
 function dateToString(date) {
-    let milliseconds = date.getMilliseconds().toString().padStart(3, '0');
-
-    return `${date.toLocaleString()}.${milliseconds}`
+    return dateformat(date, "yyyy-mm-dd HH:MM:ss.l");
 }
 
 function importChatHistory(steamID) {
