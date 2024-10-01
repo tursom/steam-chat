@@ -58,13 +58,16 @@ steamUser.on('loggedOn', () => {
 });
 
 async function getUserInfo(steamID, onUserInfoReceived) {
-    let sender = users[steamID.getSteamID64()];
+    if (typeof steamID !== 'string') {
+        steamID = steamID.getSteamID64();
+    }
+    let sender = users[steamID];
     // if user is not cached
     if (!sender) {
         try {
             let personasResult = await steamUser.getPersonas([steamID]);
-            users[steamID.getSteamID64()] = personasResult.personas[steamID.getSteamID64()];
-            sender = users[steamID.getSteamID64()];
+            users[steamID] = personasResult.personas[steamID];
+            sender = users[steamID];
 
             onUserInfoReceived(sender);
 

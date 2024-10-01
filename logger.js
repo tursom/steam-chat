@@ -66,7 +66,7 @@ function dateToString(date) {
  * @returns {Promise<{player_name: string}>}
  */
 async function getUserInfo(steamID) {
-    return client.getUserInfo("76561199051592938", (ignore) => {
+    return client.getUserInfo(steamID, (ignore) => {
         importChatHistory(steamID);
     });
 }
