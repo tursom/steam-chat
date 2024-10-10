@@ -1,3 +1,5 @@
+const config = require('./config.js');
+
 dateformat = require('@matteo.collina/dateformat');
 
 client = require("./client.js")
@@ -92,6 +94,10 @@ function importChatHistory(steamID) {
             );
         }
     });
+}
+
+if (config.chat == true) {
+    require("./chat.js")
 }
 
 module.exports = {
