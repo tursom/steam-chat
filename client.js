@@ -1,13 +1,14 @@
-SteamID = require('steamid');
-SteamUser = require('steam-user');
-SteamTotp = require('steam-totp');
+const SteamID = require('steamid');
+const SteamUser = require('steam-user');
+const SteamTotp = require('steam-totp');
+const SteamCommunity = require('steamcommunity');
 fs = require('fs');
 winston = require("winston");
 
 logger = winston.createLogger({
     level: 'info',
     format: winston.format.json(),
-    defaultMeta: {service: 'steam-logger'},
+    defaultMeta: { service: 'steam-logger' },
     transports: [
         new winston.transports.Console(),
     ]
@@ -16,6 +17,7 @@ logger = winston.createLogger({
 const users = {};
 
 const steamUser = new SteamUser();
+const steamCommunity = new SteamCommunity();
 
 steamUser.setOption("renewRefreshTokens", true);
 steamUser.on("refreshToken", (refreshToken) => {
@@ -53,8 +55,14 @@ try {
         steamID: config.steamID,
     });
 }
-steamUser.on('loggedOn', () => {
+steamUser.on('loggedOn', async () => {
     logger.info(`login to Steam as ${steamUser.steamID}`);
+
+    steamUser.webLogOn();
+});
+steamUser.on('webSession', async (sessionID, cookies) => {
+    steamCommunity.setCookies(cookies);
+    steamCommunity.startConfirmationChecker(10000, config.identitySecret);
 });
 
 async function getUserInfo(steamID, onUserInfoReceived) {
@@ -85,6 +93,7 @@ async function getUserInfo(steamID, onUserInfoReceived) {
 
 module.exports = {
     steamUser: steamUser,
+    steamCommunity: steamCommunity,
     getUserInfo: getUserInfo,
 }
 
