@@ -3,6 +3,12 @@ const axios = require('axios');
 const http = require('http');
 const { once } = require("node:events");
 
+fs.mkdir("./logs", { recursive: true }, (err) => {
+    if (err) {
+        logger.error("an error occurred while creating the logs directory: " + err);
+    }
+});
+
 async function sendMsg(req, res) {
     let body = '';
     req.on('data', chunk => {
@@ -27,6 +33,19 @@ async function sendMsg(req, res) {
         res.statusCode = 200;
         res.setHeader('Content-Type', 'text/plain');
         res.end('Success\n');
+
+        fs.appendFile("./logs/chat.jsonl", JSON.stringify({
+            date: dateToString(response.server_timestamp),
+            echo: true,
+            id: requests.id,
+            name: getUserInfo(client.steamUser.steamID).player_name,
+            message: response.modified_message,
+            ordinal: response.ordinal,
+        }) + "\n", (e) => {
+            if (e) {
+                logger.error("an error occurred while writing chat log file: " + e);
+            }
+        });
     })
 }
 
@@ -100,6 +119,15 @@ function readFileAsBuffer(filePath) {
             }
             resolve(data);
         });
+    });
+}
+
+function dateToString(date) {
+    return dateformat(date, "yyyy-mm-dd HH:MM:ss.l");
+}
+
+async function getUserInfo(steamID) {
+    return client.getUserInfo(steamID, (ignore) => {
     });
 }
 
