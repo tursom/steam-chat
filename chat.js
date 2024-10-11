@@ -34,18 +34,20 @@ async function sendMsg(req, res) {
         res.setHeader('Content-Type', 'text/plain');
         res.end('Success\n');
 
-        fs.appendFile("./logs/chat.jsonl", JSON.stringify({
-            date: dateToString(response.server_timestamp),
-            echo: true,
-            id: requests.id,
-            name: getUserInfo(client.steamUser.steamID).player_name,
-            message: response.modified_message,
-            ordinal: response.ordinal,
-        }) + "\n", (e) => {
-            if (e) {
-                logger.error("an error occurred while writing chat log file: " + e);
-            }
-        });
+        getUserInfo(client.steamUser.steamID).then((sender) => {
+            fs.appendFile("./logs/chat.jsonl", JSON.stringify({
+                date: dateToString(response.server_timestamp),
+                echo: true,
+                id: requests.id,
+                name: sender.player_name,
+                message: response.modified_message,
+                ordinal: response.ordinal,
+            }) + "\n", (e) => {
+                if (e) {
+                    logger.error("an error occurred while writing chat log file: " + e);
+                }
+            });
+        })
     })
 }
 
