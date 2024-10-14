@@ -61,7 +61,14 @@ async function sendImg(req, res) {
 
     let requests = JSON.parse(body);
 
-    console.log(requests)
+    if (requests.img) {
+        console.log({
+            id: requests.id,
+            img: requests.img.length,
+        });
+    } else {
+        console.log(requests);
+    }
 
     if (requests.url) {
         img = await readUrlAsBuffer(requests.url)
