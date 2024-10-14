@@ -55,12 +55,17 @@ try {
         steamID: config.steamID,
     });
 }
+
+let webLogOn = false;
 steamUser.on('loggedOn', async () => {
     logger.info(`login to Steam as ${steamUser.steamID}`);
 
-    steamUser.webLogOn();
+    if (!webLogOn) {
+        steamUser.webLogOn();
+    }
 });
 steamUser.on('webSession', async (sessionID, cookies) => {
+    webLogOn = true;
     steamCommunity.setCookies(cookies);
     steamCommunity.startConfirmationChecker(10000, config.identitySecret);
 });
