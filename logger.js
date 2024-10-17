@@ -1,11 +1,14 @@
+const fs = require('fs');
 const config = require('./config.js');
 
-dateformat = require('@matteo.collina/dateformat');
+const logger = client.logger
 
-client = require("./client.js")
-steamUser = client.steamUser
+const dateformat = require('@matteo.collina/dateformat');
 
-fs.mkdir("./logs", {recursive: true}, (err) => {
+const client = require("./client.js")
+const steamUser = client.steamUser
+
+fs.mkdir("./logs", { recursive: true }, (err) => {
     if (err) {
         logger.error("an error occurred while creating the logs directory: " + err);
     }
@@ -45,14 +48,16 @@ async function logMessage(date, steamID, message, echo, ordinal) {
     });
 }
 
-steamUser.chat.on("friendMessage", (message) => {
-    // noinspection JSIgnoredPromiseFromCall
-    logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, false, message.ordinal);
-});
+client.steamLoginPromise.then(() => {
+    steamUser.chat.on("friendMessage", (message) => {
+        // noinspection JSIgnoredPromiseFromCall
+        logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, false, message.ordinal);
+    });
 
-steamUser.chat.on("friendMessageEcho", (message) => {
-    // noinspection JSIgnoredPromiseFromCall
-    logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, true, message.ordinal);
+    steamUser.chat.on("friendMessageEcho", (message) => {
+        // noinspection JSIgnoredPromiseFromCall
+        logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, true, message.ordinal);
+    });
 });
 
 /**

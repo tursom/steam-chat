@@ -2,10 +2,10 @@ const SteamID = require('steamid');
 const SteamUser = require('steam-user');
 const SteamTotp = require('steam-totp');
 const SteamCommunity = require('steamcommunity');
-fs = require('fs');
-winston = require("winston");
+const fs = require('fs');
+const winston = require("winston");
 
-logger = winston.createLogger({
+const logger = winston.createLogger({
     level: 'info',
     format: winston.format.json(),
     defaultMeta: { service: 'steam-logger' },
@@ -25,7 +25,7 @@ steamUser.on("refreshToken", (refreshToken) => {
     fs.writeFileSync('refresh.token', refreshToken);
 });
 
-config = require("./config.js");
+const config = require("./config.js");
 
 try {
     refreshToken = fs.readFileSync('refresh.token', 'utf8');
@@ -56,18 +56,24 @@ try {
     });
 }
 
-let webLogOn = false;
-steamUser.on('loggedOn', async () => {
-    logger.info(`login to Steam as ${steamUser.steamID}`);
+steamLoginPromise = new Promise((resolve, reject) => {
+    steamUser.on('loggedOn', async () => {
+        logger.info(`login to Steam as ${steamUser.steamID}`);
 
-    if (!webLogOn) {
-        steamUser.webLogOn();
-    }
+        resolve();
+    });
 });
-steamUser.on('webSession', async (sessionID, cookies) => {
-    webLogOn = true;
-    steamCommunity.setCookies(cookies);
-    steamCommunity.startConfirmationChecker(10000, config.identitySecret);
+
+steamWebLoginPromise = new Promise((resolve, reject) => {
+    steamUser.on('webSession', async (sessionID, cookies) => {
+        logger.info(`web session received: ${sessionID}`);
+
+        webLogOn = true;
+        steamCommunity.setCookies(cookies);
+        steamCommunity.startConfirmationChecker(10000, config.identitySecret);
+
+        resolve()
+    });
 });
 
 async function getUserInfo(steamID, onUserInfoReceived) {
@@ -97,8 +103,11 @@ async function getUserInfo(steamID, onUserInfoReceived) {
 }
 
 module.exports = {
+    logger: logger,
     steamUser: steamUser,
     steamCommunity: steamCommunity,
     getUserInfo: getUserInfo,
+    steamLoginPromise: steamLoginPromise,
+    steamWebLoginPromise: steamWebLoginPromise,
 }
 

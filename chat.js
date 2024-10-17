@@ -1,7 +1,10 @@
 const client = require("./client")
 const axios = require('axios');
 const http = require('http');
+const fs = require('fs');
 const { once } = require("node:events");
+
+const logger = client.logger
 
 fs.mkdir("./logs", { recursive: true }, (err) => {
     if (err) {
