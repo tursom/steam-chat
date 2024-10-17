@@ -1,12 +1,12 @@
 const fs = require('fs');
 const config = require('./config.js');
 
-const logger = client.logger
-
 const dateformat = require('@matteo.collina/dateformat');
 
 const client = require("./client.js")
 const steamUser = client.steamUser
+
+const logger = client.logger
 
 fs.mkdir("./logs", { recursive: true }, (err) => {
     if (err) {
