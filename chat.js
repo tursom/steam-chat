@@ -88,6 +88,9 @@ async function sendImg(req, res) {
     client.steamCommunity.sendImageToUser(requests.id, img, function (err, imageUrl) {
         if (err) {
             logger.error("an error occurred while sending image: ", err);
+
+            client.steamUser.webLogOn();
+
             res.statusCode = 500;
             res.setHeader('Content-Type', 'text/plain');
             res.end('Internal Server Error\n');

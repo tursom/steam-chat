@@ -68,7 +68,6 @@ steamWebLoginPromise = new Promise((resolve, reject) => {
     steamUser.on('webSession', async (sessionID, cookies) => {
         logger.info(`web session received: ${sessionID}`);
 
-        webLogOn = true;
         steamCommunity.setCookies(cookies);
         steamCommunity.startConfirmationChecker(10000, config.identitySecret);
 
