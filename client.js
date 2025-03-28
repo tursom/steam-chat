@@ -87,7 +87,9 @@ async function getUserInfo(steamID, onUserInfoReceived) {
             users[steamID] = personasResult.personas[steamID];
             sender = users[steamID];
 
-            onUserInfoReceived(sender);
+            if (onUserInfoReceived) {
+                onUserInfoReceived(sender);
+            }
 
             // noinspection ES6MissingAwait
             logger.info("user data received: " + JSON.stringify(sender));
