@@ -27,9 +27,9 @@ async function sendMsg(req, res) {
 
     console.log(requests)
 
-    let [err, response] = sendFriendMessage(requests.id, requests.msg);
+    let err = sendFriendMessage(requests.id, requests.msg);
     if (err) {
-        console.log(err);
+        logger.error("failed to send friend message", err);
         res.statusCode = 500;
         res.setHeader('Content-Type', 'text/plain');
         res.end('Internal Server Error\n');
@@ -39,15 +39,13 @@ async function sendMsg(req, res) {
     res.statusCode = 200;
     res.setHeader('Content-Type', 'text/plain');
     res.end('Success\n');
-
-    logSendMsg(requests.id, response);
 }
 
 function sendFriendMessage(uid, msg) {
     return new Promise((resolve, reject) => {
         client.steamUser.chat.sendFriendMessage(uid, msg, (err, response) => {
             if (err) {
-                resolve([err, response]);
+                resolve(err);
                 return
             }
 
@@ -66,7 +64,14 @@ function sendFriendMessage(uid, msg) {
                 });
             })
 
-            resolve([err, response]);
+            onSteamMessage({
+                server_timestamp: response.server_timestamp,
+                steamid_friend: uid,
+                message: response.modified_message,
+                ordinal: response.ordinal,
+            }, true);
+
+            resolve(err);
         })
     });
 }
@@ -200,18 +205,7 @@ function handleWs(ws) {
 
         switch (data.type) {
             case "msg":
-                sendFriendMessage(data.id, data.msg).then(([err, response]) => {
-                    if (err) {
-                        return;
-                    }
-
-                    onSteamMessage({
-                        server_timestamp: response.server_timestamp,
-                        steamid_friend: data.id,
-                        message: response.modified_message,
-                        ordinal: response.ordinal,
-                    }, true);
-                });
+                sendFriendMessage(data.id, data.msg);
                 break;
             case "img":
                 sendImageToUser(data.id, data.img, data.url);
