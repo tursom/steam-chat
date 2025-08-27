@@ -1,6 +1,4 @@
-const SteamID = require('steamid');
 const SteamUser = require('steam-user');
-const SteamTotp = require('steam-totp');
 const SteamCommunity = require('steamcommunity');
 const fs = require('fs');
 const winston = require("winston");

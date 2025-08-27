@@ -18,5 +18,10 @@
     "steamcommunity": "^3.48.2",
     "winston": "^3.12.0",
     "ws": "^8.18.1"
+  },
+  "devDependencies": {
+    "@types/steam-totp": "^2.1.2",
+    "@types/steam-user": "^5.1.0",
+    "@types/steamcommunity": "^3.43.8"
   }
 }

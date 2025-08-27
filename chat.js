@@ -27,18 +27,17 @@ async function sendMsg(req, res) {
 
     console.log(requests)
 
-    let err = sendFriendMessage(requests.id, requests.msg);
-    if (err) {
+    try {
+        await sendFriendMessage(requests.id, requests.msg);
+        res.statusCode = 200;
+        res.setHeader('Content-Type', 'text/plain');
+        res.end('Success\n');
+    } catch (err) {
         logger.error("failed to send friend message", err);
         res.statusCode = 500;
         res.setHeader('Content-Type', 'text/plain');
         res.end('Internal Server Error\n');
-        return;
     }
-
-    res.statusCode = 200;
-    res.setHeader('Content-Type', 'text/plain');
-    res.end('Success\n');
 }
 
 function sendFriendMessage(uid, msg) {
@@ -71,7 +70,7 @@ function sendFriendMessage(uid, msg) {
                 ordinal: response.ordinal,
             }, true);
 
-            resolve(err);
+            resolve();
         })
     });
 }
