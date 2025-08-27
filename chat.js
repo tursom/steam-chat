@@ -28,10 +28,11 @@ async function sendMsg(req, res) {
     console.log(requests)
 
     try {
-        await sendFriendMessage(requests.id, requests.msg);
+        let resp = await sendFriendMessage(requests.id, requests.msg);
         res.statusCode = 200;
         res.setHeader('Content-Type', 'text/plain');
-        res.end('Success\n');
+        let messageEncoded = await messageToJson(resp, true);
+        res.end(messageEncoded);
     } catch (err) {
         logger.error("failed to send friend message", err);
         res.statusCode = 500;
@@ -44,7 +45,7 @@ function sendFriendMessage(uid, msg) {
     return new Promise((resolve, reject) => {
         client.steamUser.chat.sendFriendMessage(uid, msg, (err, response) => {
             if (err) {
-                resolve(err);
+                reject(err);
                 return
             }
 
@@ -63,14 +64,14 @@ function sendFriendMessage(uid, msg) {
                 });
             })
 
-            onSteamMessage({
+            resp = {
                 server_timestamp: response.server_timestamp,
                 steamid_friend: uid,
                 message: response.modified_message,
                 ordinal: response.ordinal,
-            }, true);
-
-            resolve();
+            }
+            onSteamMessage(resp, true);
+            resolve(resp);
         })
     });
 }
