@@ -104,15 +104,15 @@ async function sendImg(req, res) {
     let requests = JSON.parse(body);
 
     res.setHeader('Content-Type', 'text/plain');
-    let err = await sendImageToUser(requests.id, requests.img, requests.url);
-    if (err) {
+    try {
+        let url = await sendImageToUser(requests.id, requests.img, requests.url);
+        res.statusCode = 200;
+        res.end(url);
+    } catch (err) {
         const { code = 500, message = "Internal Server Error" } = err;
         res.statusCode = code;
-        res.end(message + '\n');
-        return
+        res.end(message);
     }
-    res.statusCode = 200;
-    res.end('Success\n');
 }
 
 function sendImageToUser(uid, img, url) {
@@ -134,7 +134,7 @@ function sendImageToUser(uid, img, url) {
         } else if (img) {
             img = Buffer.from(img, 'base64');
         } else {
-            resolve({ code: 400, message: "Bad Request" });
+            reject({ code: 400, message: "Bad Request" });
             return;
         }
 
@@ -142,11 +142,11 @@ function sendImageToUser(uid, img, url) {
             if (err) {
                 logger.error("an error occurred while sending image: ", err);
                 client.steamUser.webLogOn();
-                resolve({});
+                reject({});
                 return
             }
 
-            resolve();
+            resolve(imageUrl);
         });
     })
 }
