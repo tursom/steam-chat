@@ -2,6 +2,7 @@ const SteamUser = require('steam-user');
 const SteamCommunity = require('steamcommunity');
 const fs = require('fs');
 const winston = require("winston");
+const config = require("./config.js");
 
 const logger = winston.createLogger({
     level: 'info',
@@ -23,10 +24,8 @@ steamUser.on("refreshToken", (refreshToken) => {
     fs.writeFileSync('refresh.token', refreshToken);
 });
 
-const config = require("./config.js");
-
 try {
-    refreshToken = fs.readFileSync('refresh.token', 'utf8');
+    const refreshToken = fs.readFileSync('refresh.token', 'utf8');
 
     if (refreshToken && refreshToken.length > 0) {
         const LogOnOptionsAUTO = {
@@ -54,20 +53,27 @@ try {
     });
 }
 
-steamLoginPromise = new Promise((resolve, reject) => {
+const steamLoginPromise = new Promise((resolve, reject) => {
     steamUser.on('loggedOn', async () => {
         logger.info(`login to Steam as ${steamUser.steamID}`);
+        try {
+            steamUser.webLogOn();
+        } catch (err) {
+            logger.warn(`failed to start web login: ${err.message}`);
+        }
 
         resolve();
     });
 });
 
-steamWebLoginPromise = new Promise((resolve, reject) => {
+const steamWebLoginPromise = new Promise((resolve, reject) => {
     steamUser.on('webSession', async (sessionID, cookies) => {
         logger.info(`web session received: ${sessionID}`);
 
         steamCommunity.setCookies(cookies);
-        steamCommunity.startConfirmationChecker(10000, config.identitySecret);
+        if (config.identitySecret) {
+            steamCommunity.startConfirmationChecker(10000, config.identitySecret);
+        }
 
         resolve()
     });
@@ -109,4 +115,3 @@ module.exports = {
     steamLoginPromise: steamLoginPromise,
     steamWebLoginPromise: steamWebLoginPromise,
 }
-
