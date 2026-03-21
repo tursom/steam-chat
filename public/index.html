@@ -1,0 +1,144 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>Steam Chat</title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <div id="dropOverlay" class="drop-overlay">
+    <div class="drop-overlay-card">松开即可发送图片</div>
+  </div>
+  <div id="sidebarBackdrop" class="sidebar-backdrop" aria-hidden="true"></div>
+  <div id="imageLightbox" class="image-lightbox" aria-hidden="true">
+    <div class="image-lightbox-dialog">
+      <button id="closeImageLightbox" class="secondary image-lightbox-close" type="button" aria-label="关闭">×</button>
+      <div id="imageLightboxViewport" class="image-lightbox-viewport">
+        <img id="imageLightboxImage" alt="放大预览" />
+      </div>
+      <div class="image-lightbox-toolbar">
+        <button id="imageZoomOut" class="secondary" type="button" aria-label="缩小">－</button>
+        <button id="imageZoomReset" class="secondary" type="button" aria-label="重置缩放">100%</button>
+        <button id="imageZoomIn" class="secondary" type="button" aria-label="放大">＋</button>
+      </div>
+      <div id="imageLightboxCaption" class="image-lightbox-caption"></div>
+    </div>
+  </div>
+  <div class="app">
+    <aside class="sidebar">
+      <div class="sidebar-mobile-header">
+        <strong>会话与设置</strong>
+        <button id="closeSidebar" class="secondary" type="button">关闭</button>
+      </div>
+      <div class="card sidebar-config-card">
+        <div class="toolbar">
+          <label>
+            <span class="field-label">打开会话</span>
+            <input id="targetId" placeholder="输入 SteamID64" />
+          </label>
+          <button id="openConversation" type="button">打开</button>
+        </div>
+        <div class="toolbar" style="margin-top: 12px;">
+          <label style="max-width: 160px;">
+            <span class="field-label">历史条数</span>
+            <input id="historyLimit" type="number" min="1" max="500" value="100" />
+          </label>
+          <button id="reloadHistory" class="secondary" type="button">刷新历史</button>
+        </div>
+        <div id="status" style="margin-top: 12px;">正在连接 WebSocket…</div>
+      </div>
+      <div class="card conversation-card" style="flex: 1; min-height: 0; display: flex; flex-direction: column;">
+        <div class="chat-header" style="margin-bottom: 12px;">
+          <strong>最近会话</strong>
+          <button id="reloadConversations" class="secondary" type="button">刷新列表</button>
+        </div>
+        <div id="conversationList"></div>
+      </div>
+    </aside>
+
+    <main class="chat-panel">
+      <div class="card chat-topbar">
+        <div class="chat-header">
+          <div class="chat-heading">
+            <div id="chatTitle" class="chat-title">未选择会话</div>
+            <div id="chatSubtitle" class="chat-subtitle">请选择左侧会话，或手动输入 SteamID64</div>
+          </div>
+          <div class="chat-header-actions">
+            <button id="mobileSidebarToggle" class="secondary mobile-nav-button" type="button" aria-expanded="false">会话列表</button>
+            <span class="chip">WebSocket</span>
+          </div>
+        </div>
+      </div>
+
+      <div id="messages" class="card">
+        <div class="empty-state">请选择一个会话开始聊天</div>
+      </div>
+
+      <div class="card composer">
+        <div id="attachmentPreview" class="attachment-preview">
+          <img id="attachmentPreviewImage" alt="attachment preview" hidden />
+          <div class="attachment-preview-body">
+            <div id="attachmentPreviewTitle" class="attachment-preview-title"></div>
+            <div id="attachmentPreviewSubtitle" class="attachment-preview-subtitle"></div>
+          </div>
+          <button id="clearAttachment" class="secondary" type="button">移除</button>
+        </div>
+        <div id="uploadQueue" class="upload-queue">
+          <div class="upload-queue-title">发送队列</div>
+          <div id="uploadQueueList"></div>
+        </div>
+        <div id="urlPanel" class="url-panel">
+          <label>
+            <span class="field-label">图片 URL</span>
+            <input id="imageUrl" placeholder="https://example.com/a.png" />
+          </label>
+          <button id="confirmImageUrl" type="button">添加</button>
+          <button id="cancelImageUrl" class="secondary" type="button">取消</button>
+        </div>
+        <div class="composer-row">
+          <div class="composer-actions">
+            <button id="attachmentButton" class="secondary icon-button" type="button" title="选择图片或图片 URL">＋</button>
+            <div id="attachmentMenu" class="attachment-menu">
+              <button id="chooseImageButton" type="button">选择图片</button>
+              <button id="chooseUrlButton" type="button">输入图片 URL</button>
+              <div class="attachment-hint">支持直接粘贴剪切板图片到输入框</div>
+            </div>
+            <button id="pickerButton" class="secondary icon-button" type="button" title="表情和贴纸">☺</button>
+            <div id="pickerPanel" class="picker-panel">
+              <div class="picker-tabs">
+                <button type="button" class="picker-tab active" data-tab="emoticons">表情</button>
+                <button type="button" class="picker-tab" data-tab="stickers">贴纸</button>
+              </div>
+              <div class="picker-search">
+                <input id="pickerSearch" type="text" placeholder="搜索..." />
+              </div>
+              <div id="pickerGrid" class="picker-grid"></div>
+              <div id="pickerEmpty" class="picker-empty">加载中…</div>
+            </div>
+            <input id="imageFile" type="file" accept="image/*" hidden />
+          </div>
+          <label class="composer-field">
+            <span class="field-label">文本消息</span>
+            <textarea
+              id="messageInput"
+              placeholder="输入消息，Enter 发送，Shift+Enter 换行；也可直接粘贴图片"
+              data-desktop-placeholder="输入消息，Enter 发送，Shift+Enter 换行；也可直接粘贴图片"
+              data-mobile-placeholder="输入消息"
+            ></textarea>
+            <div id="emoticonSuggestions" class="emoticon-suggestions">
+              <div id="emoticonPreview" class="emoticon-preview">
+                <img id="emoticonPreviewImage" alt="emoticon preview" />
+                <div id="emoticonPreviewLabel" class="emoticon-preview-label"></div>
+              </div>
+            </div>
+          </label>
+          <button id="sendMessage" type="button">发送</button>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

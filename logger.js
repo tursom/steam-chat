@@ -101,7 +101,7 @@ function importChatHistory(steamID) {
     });
 }
 
-if (config.chat == true) {
+if (config.chat) {
     require("./chat.js")
 }
 
