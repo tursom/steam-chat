@@ -560,7 +560,7 @@ test('handleSendMessageRequest broadcasts messages and deduplicates echoed messa
     });
 
     assert.equal(data.echo, true);
-    assert.equal(data.name, 'Self User');
+    assert.equal(data.name, 'Friend User');
     assert.equal(wsClient.messages.length, 1);
     assert.deepEqual(wsClient.messages[0], {
         type: 'message',
@@ -686,7 +686,7 @@ test('handleHttp returns JSON response for message endpoint', async () => {
         date: 'formatted-date',
         echo: true,
         id: 'friend-id',
-        name: 'Self User',
+        name: 'Friend User',
         message: 'hello via http',
         ordinal: 42,
         imageUrl: null,
@@ -1008,7 +1008,7 @@ test('readConversationSummaries groups recent conversations', async () => {
         },
         {
             id: 'b',
-            name: 'Self User',
+            name: 'Friend User',
             updatedAt: '2026-03-20 09:10:00.000',
             preview: '[图片]',
             lastType: 'message',
@@ -1041,7 +1041,7 @@ test('handleWsCommand returns conversation summaries', async () => {
             items: [
                 {
                     id: 'friend-2',
-                    name: 'Self User',
+                    name: 'Friend User',
                     updatedAt: '2026-03-20 11:05:00.000',
                     preview: '[图片]',
                     lastType: 'image',

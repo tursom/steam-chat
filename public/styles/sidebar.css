@@ -1,0 +1,154 @@
+.conversation-card {
+  min-height: 0;
+}
+.sidebar-list {
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-height: 0;
+  overscroll-behavior: contain;
+  -webkit-overflow-scrolling: touch;
+}
+.sidebar-tabs {
+  display: flex;
+  gap: 0;
+  margin-bottom: 12px;
+  border-bottom: 1px solid #374151;
+}
+.sidebar-tab {
+  flex: 1;
+  padding: 8px 4px;
+  font-size: 13px;
+  font-weight: 500;
+  color: #9ca3af;
+  background: none;
+  border: none;
+  border-bottom: 2px solid transparent;
+  cursor: pointer;
+  transition: color 0.15s, border-color 0.15s;
+}
+.sidebar-tab:hover {
+  color: #d1d5db;
+}
+.sidebar-tab.active {
+  color: #60a5fa;
+  border-bottom-color: #2563eb;
+}
+.sidebar-tab[aria-selected="true"] {
+  color: #60a5fa;
+  border-bottom-color: #2563eb;
+}
+.sidebar-tab-panel {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  display: flex;
+  flex-direction: column;
+}
+.sidebar-tab-panel[hidden] {
+  display: none;
+}
+.conversation-item,
+.friend-item,
+.group-item {
+  border: 1px solid #374151;
+  border-radius: 10px;
+  padding: 10px 12px;
+  background: #111827;
+  cursor: pointer;
+  display: flex;
+  width: 100%;
+  text-align: left;
+  gap: 10px;
+}
+.conversation-item:hover,
+.friend-item:hover,
+.group-item:hover {
+  border-color: #4b5563;
+}
+.conversation-item {
+  flex-direction: column;
+  align-items: stretch;
+}
+.friend-item,
+.group-item {
+  align-items: center;
+}
+.friend-avatar {
+  width: 36px;
+  height: 36px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: #1f2937;
+}
+.friend-info, .group-info {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+}
+.friend-name, .group-name {
+  font-weight: 600;
+  font-size: 14px;
+  color: #f9fafb;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.friend-status {
+  font-size: 12px;
+  color: #9ca3af;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.friend-status.online {
+  color: #57cbde;
+}
+.friend-status.in-game {
+  color: #a3d977;
+}
+.friend-id, .group-id {
+  font-size: 11px;
+  color: #6b7280;
+  margin-top: 2px;
+}
+.conversation-item {
+  border: 1px solid #374151;
+  border-radius: 10px;
+  padding: 12px;
+  background: #111827;
+  cursor: pointer;
+}
+.conversation-item.active {
+  border-color: #2563eb;
+  background: #172554;
+}
+.conversation-top {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 14px;
+  margin-bottom: 6px;
+}
+.conversation-name {
+  font-weight: 600;
+  color: #f9fafb;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.conversation-time, .conversation-id {
+  color: #9ca3af;
+  font-size: 12px;
+}
+.conversation-id {
+  margin-top: 6px;
+}
+.conversation-preview {
+  font-size: 13px;
+  color: #d1d5db;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
