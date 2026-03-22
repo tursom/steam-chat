@@ -259,6 +259,18 @@ function normalizeWsRequest(payload) {
                 action: 'get_emoticons',
                 requestId: payload.requestId,
             };
+        case 'friends':
+        case 'get_friends':
+            return {
+                action: 'get_friends',
+                requestId: payload.requestId,
+            };
+        case 'groups':
+        case 'get_groups':
+            return {
+                action: 'get_groups',
+                requestId: payload.requestId,
+            };
         case 'ping':
             return {
                 action: 'ping',
@@ -537,7 +549,7 @@ function buildConversationSummaries(items) {
 
         const current = conversations.get(entry.id) || {
             id: entry.id,
-            name: entry.name || '',
+            name: entry.echo ? '' : (entry.name || ''),
             updatedAt: entry.date || entry.sentAt || '',
             preview: buildConversationPreview(entry),
             lastType: entry.type || (entry.imageUrl ? 'image' : 'message'),
@@ -545,7 +557,9 @@ function buildConversationSummaries(items) {
             messageCount: 0,
         };
 
-        current.name = entry.name || current.name;
+        if (!entry.echo) {
+            current.name = entry.name || current.name;
+        }
         current.updatedAt = entry.date || entry.sentAt || current.updatedAt;
         current.preview = buildConversationPreview(entry) || current.preview;
         current.lastType = entry.type || (entry.imageUrl ? 'image' : 'message');
@@ -784,13 +798,13 @@ function createChatService(customDeps = {}) {
     }
 
     function appendOutgoingLog(uid, response) {
-        client.getUserInfo(steamUser.steamID).then((sender) => {
+        client.getUserInfo(uid).then((friend) => {
             appendLogEntry({
                 type: 'message',
                 date: dateToString(response.server_timestamp),
                 echo: true,
                 id: uid,
-                name: sender.player_name,
+                name: friend.player_name,
                 message: response.modified_message,
                 ordinal: response.ordinal,
             });
@@ -798,13 +812,13 @@ function createChatService(customDeps = {}) {
     }
 
     async function appendOutgoingImageLog(uid, imageUrl) {
-        const sender = await client.getUserInfo(steamUser.steamID, () => {});
+        const friend = await client.getUserInfo(uid, () => {});
         const entry = {
             type: 'image',
             date: dateToString(new Date()),
             echo: true,
             id: uid,
-            name: sender.player_name,
+            name: friend.player_name,
             imageUrl,
             ordinal: null,
             sentAt: new Date().toISOString(),
@@ -926,6 +940,52 @@ function createChatService(customDeps = {}) {
         }));
 
         return { emoticons, stickers };
+    }
+
+    async function getFriendsList() {
+        await client.steamLoginPromise;
+        const myFriends = steamUser.myFriends || {};
+        const friendIds = Object.keys(myFriends).filter((id) => myFriends[id] === 3); // EFriendRelationship.Friend
+
+        const friends = [];
+        for (const id of friendIds) {
+            const cached = steamUser.users && steamUser.users[id];
+            friends.push({
+                id,
+                name: (cached && cached.player_name) || id,
+                avatar: (cached && cached.avatar_url_medium) || null,
+                status: cached ? (cached.persona_state || 0) : 0,
+                game: (cached && cached.game_name) || null,
+            });
+        }
+
+        friends.sort((a, b) => {
+            // Online users first (status > 0), then alphabetical
+            if (a.status > 0 && b.status === 0) return -1;
+            if (a.status === 0 && b.status > 0) return 1;
+            return (a.name || '').localeCompare(b.name || '');
+        });
+
+        return friends;
+    }
+
+    async function getGroupsList() {
+        await client.steamLoginPromise;
+        const myGroups = steamUser.myGroups || {};
+        const groupIds = Object.keys(myGroups);
+
+        const groups = [];
+        for (const id of groupIds) {
+            const cached = steamUser.groups && steamUser.groups[id];
+            const nameInfo = cached && cached.name_info;
+            groups.push({
+                id,
+                name: (nameInfo && nameInfo.clan_name) || id,
+            });
+        }
+
+        groups.sort((a, b) => (a.name || '').localeCompare(b.name || ''));
+        return groups;
     }
 
     function sendFriendMessage(uid, msg) {
@@ -1156,7 +1216,20 @@ function createChatService(customDeps = {}) {
 
     async function readConversationSummaries({ limit } = {}) {
         const items = await readChatHistory({ limit: sanitizeLimit(limit, 500) });
-        return buildConversationSummaries(items);
+        const summaries = buildConversationSummaries(items);
+
+        for (const summary of summaries) {
+            if (!summary.name && summary.id) {
+                try {
+                    const friend = await client.getUserInfo(summary.id, () => {});
+                    summary.name = friend.player_name || summary.id;
+                } catch (err) {
+                    summary.name = summary.id;
+                }
+            }
+        }
+
+        return summaries;
     }
 
     async function fetchStickerBuffer(type) {
@@ -1464,6 +1537,28 @@ function createChatService(customDeps = {}) {
             return;
         }
 
+        if (req.method === 'GET' && requestUrl.pathname === '/api/friends') {
+            try {
+                const items = await getFriendsList();
+                sendJson(res, 200, { items });
+            } catch (err) {
+                logger.error('failed to get friends list', err);
+                sendJson(res, 500, { error: err.message || 'Internal Server Error' });
+            }
+            return;
+        }
+
+        if (req.method === 'GET' && requestUrl.pathname === '/api/groups') {
+            try {
+                const items = await getGroupsList();
+                sendJson(res, 200, { items });
+            } catch (err) {
+                logger.error('failed to get groups list', err);
+                sendJson(res, 500, { error: err.message || 'Internal Server Error' });
+            }
+            return;
+        }
+
         if (req.method === 'GET') {
             const ext = path.extname(requestUrl.pathname);
             if (ext && STATIC_CONTENT_TYPES[ext]) {
@@ -1554,6 +1649,24 @@ function createChatService(customDeps = {}) {
                     type: 'emoticons',
                     requestId: request.requestId,
                     data: emoticonData,
+                });
+                return;
+            }
+            case 'get_friends': {
+                const items = await getFriendsList();
+                sendWs(ws, {
+                    type: 'friends',
+                    requestId: request.requestId,
+                    data: { items },
+                });
+                return;
+            }
+            case 'get_groups': {
+                const items = await getGroupsList();
+                sendWs(ws, {
+                    type: 'groups',
+                    requestId: request.requestId,
+                    data: { items },
                 });
                 return;
             }
@@ -1663,6 +1776,8 @@ function createChatService(customDeps = {}) {
         sendFriendMessage,
         sendImageToUser,
         getEmoticonList,
+        getFriendsList,
+        getGroupsList,
         readChatHistory,
         readConversationSummaries,
         fetchStickerBuffer,

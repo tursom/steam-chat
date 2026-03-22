@@ -12,7 +12,7 @@
   </div>
   <div id="sidebarBackdrop" class="sidebar-backdrop" aria-hidden="true"></div>
   <div id="imageLightbox" class="image-lightbox" aria-hidden="true">
-    <div class="image-lightbox-dialog">
+    <div class="image-lightbox-dialog" role="dialog" aria-modal="true" aria-label="图片预览" tabindex="-1">
       <button id="closeImageLightbox" class="secondary image-lightbox-close" type="button" aria-label="关闭">×</button>
       <div id="imageLightboxViewport" class="image-lightbox-viewport">
         <img id="imageLightboxImage" alt="放大预览" />
@@ -39,21 +39,42 @@
           </label>
           <button id="openConversation" type="button">打开</button>
         </div>
-        <div class="toolbar" style="margin-top: 12px;">
-          <label style="max-width: 160px;">
+        <div class="toolbar toolbar-spaced">
+          <label class="field-compact">
             <span class="field-label">历史条数</span>
             <input id="historyLimit" type="number" min="1" max="500" value="100" />
           </label>
           <button id="reloadHistory" class="secondary" type="button">刷新历史</button>
         </div>
-        <div id="status" style="margin-top: 12px;">正在连接 WebSocket…</div>
+        <div id="feedbackStatus" class="feedback-status" aria-live="polite">准备就绪</div>
       </div>
-      <div class="card conversation-card" style="flex: 1; min-height: 0; display: flex; flex-direction: column;">
-        <div class="chat-header" style="margin-bottom: 12px;">
-          <strong>最近会话</strong>
-          <button id="reloadConversations" class="secondary" type="button">刷新列表</button>
+      <div class="card conversation-card card-fill">
+        <div class="sidebar-tabs" role="tablist" aria-label="侧边栏列表">
+          <button type="button" id="sidebarTabButtonConversations" class="sidebar-tab active" data-tab="conversations" role="tab" aria-selected="true" aria-controls="sidebarTabConversations">最近会话</button>
+          <button type="button" id="sidebarTabButtonFriends" class="sidebar-tab" data-tab="friends" role="tab" aria-selected="false" aria-controls="sidebarTabFriends" tabindex="-1">好友</button>
+          <button type="button" id="sidebarTabButtonGroups" class="sidebar-tab" data-tab="groups" role="tab" aria-selected="false" aria-controls="sidebarTabGroups" tabindex="-1">群组</button>
         </div>
-        <div id="conversationList"></div>
+        <div id="sidebarTabConversations" class="sidebar-tab-panel" role="tabpanel" aria-labelledby="sidebarTabButtonConversations">
+          <div class="chat-header sidebar-section-header">
+            <strong>最近会话</strong>
+            <button id="reloadConversations" class="secondary" type="button">刷新列表</button>
+          </div>
+          <div id="conversationList" class="sidebar-list"></div>
+        </div>
+        <div id="sidebarTabFriends" class="sidebar-tab-panel" role="tabpanel" aria-labelledby="sidebarTabButtonFriends" hidden>
+          <div class="chat-header sidebar-section-header">
+            <strong>好友列表</strong>
+            <button id="reloadFriends" class="secondary" type="button">刷新列表</button>
+          </div>
+          <div id="friendsList" class="sidebar-list"></div>
+        </div>
+        <div id="sidebarTabGroups" class="sidebar-tab-panel" role="tabpanel" aria-labelledby="sidebarTabButtonGroups" hidden>
+          <div class="chat-header sidebar-section-header">
+            <strong>群组列表</strong>
+            <button id="reloadGroups" class="secondary" type="button">刷新列表</button>
+          </div>
+          <div id="groupsList" class="sidebar-list"></div>
+        </div>
       </div>
     </aside>
 
@@ -66,7 +87,10 @@
           </div>
           <div class="chat-header-actions">
             <button id="mobileSidebarToggle" class="secondary mobile-nav-button" type="button" aria-expanded="false">会话列表</button>
-            <span class="chip">WebSocket</span>
+            <div id="connectionStatus" class="connection-chip is-connecting" role="status" aria-live="polite">
+              <span class="connection-chip-dot" aria-hidden="true"></span>
+              <span id="connectionStatusLabel">连接中</span>
+            </div>
           </div>
         </div>
       </div>
@@ -139,6 +163,6 @@
     </main>
   </div>
 
-  <script src="/app.js"></script>
+  <script type="module" src="/app.js"></script>
 </body>
 </html>
