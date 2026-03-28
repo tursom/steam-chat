@@ -9,6 +9,18 @@ export function createMessagesController({
   renderMessageBubble,
 }) {
   let lastRenderedEntry = null;
+  let pendingScrollFrame = 0;
+
+  function scrollToBottom() {
+    if (pendingScrollFrame) {
+      cancelAnimationFrame(pendingScrollFrame);
+    }
+
+    pendingScrollFrame = requestAnimationFrame(() => {
+      pendingScrollFrame = 0;
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    });
+  }
 
   function clearMessages() {
     cleanupManagedImages(messagesEl);
@@ -31,6 +43,7 @@ export function createMessagesController({
     const {
       container = messagesEl,
       autoScroll = true,
+      stickToBottom = autoScroll,
     } = options;
 
     const activeId = getActiveConversationId();
@@ -54,14 +67,20 @@ export function createMessagesController({
     meta.className = 'message-meta';
     meta.textContent = (entry.name || (entry.echo ? '我' : '对方')) + ' · ' + formatTimeLabel(entry.date || entry.sentAt);
 
-    const bubble = renderMessageBubble(entry);
+    const bubble = renderMessageBubble(entry, {
+      onAsyncLayoutChange: stickToBottom
+        ? () => {
+          scrollToBottom();
+        }
+        : null,
+    });
 
     row.appendChild(meta);
     row.appendChild(bubble);
     container.appendChild(row);
     if (autoScroll && container === messagesEl) {
       lastRenderedEntry = entry;
-      messagesEl.scrollTop = messagesEl.scrollHeight;
+      scrollToBottom();
     }
   }
 
@@ -78,17 +97,22 @@ export function createMessagesController({
     const fragment = document.createDocumentFragment();
     let previousEntry = null;
     items.forEach((entry) => {
-      appendEntry(entry, previousEntry, { container: fragment, autoScroll: false });
+      appendEntry(entry, previousEntry, {
+        container: fragment,
+        autoScroll: false,
+        stickToBottom: true,
+      });
       previousEntry = entry;
     });
     messagesEl.appendChild(fragment);
     lastRenderedEntry = previousEntry;
-    messagesEl.scrollTop = messagesEl.scrollHeight;
+    scrollToBottom();
   }
 
   return {
     appendEntry,
     clearMessages,
     renderHistory,
+    scrollToBottom,
   };
 }

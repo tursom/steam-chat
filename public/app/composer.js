@@ -52,8 +52,8 @@ export function createComposerController({
   let stickerInventory = [];
 
   function autoResizeMessageInput() {
-    const minHeight = isMobileLayout() ? 30 : 80;
-    const maxHeight = isMobileLayout() ? 72 : 220;
+    const minHeight = isMobileLayout() ? 30 : 44;
+    const maxHeight = isMobileLayout() ? 72 : 160;
     messageInput.style.height = 'auto';
     const nextHeight = Math.max(minHeight, Math.min(messageInput.scrollHeight, maxHeight));
     messageInput.style.height = nextHeight + 'px';

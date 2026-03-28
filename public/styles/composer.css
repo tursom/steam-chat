@@ -166,6 +166,15 @@
 .composer-field {
   position: relative;
   min-width: 0;
+  gap: 0;
+}
+.composer-field .field-label {
+  display: none;
+}
+#messageInput {
+  min-height: 44px;
+  max-height: 160px;
+  resize: none;
 }
 .emoticon-suggestions {
   position: absolute;

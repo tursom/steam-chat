@@ -28,7 +28,7 @@ export function createRichContentRenderer({
     fragment.appendChild(link);
   }
 
-  function appendInlineImage(fragment, url, altText) {
+  function appendInlineImage(fragment, url, altText, options = {}) {
     const link = document.createElement('a');
     link.href = url;
     link.target = '_blank';
@@ -39,13 +39,16 @@ export function createRichContentRenderer({
     img.alt = altText || '[图片]';
     img.title = altText || url;
     makeImageZoomable(host, url, altText || url);
-    loadManagedImage(host, img, buildCachedImageUrl(url));
+    loadManagedImage(host, img, buildCachedImageUrl(url), {
+      onLoad: options.onAsyncLayoutChange,
+      onError: options.onAsyncLayoutChange,
+    });
 
     link.appendChild(host);
     fragment.appendChild(link);
   }
 
-  function appendOpenGraphCard(fragment, embed) {
+  function appendOpenGraphCard(fragment, embed, options = {}) {
     const wrapper = document.createElement('a');
     wrapper.href = embed.url;
     wrapper.target = '_blank';
@@ -56,7 +59,10 @@ export function createRichContentRenderer({
       const { host, img } = createManagedImageHost('image-loading-host--card', 'image-preview');
       img.alt = embed.title || embed.url;
       makeImageZoomable(host, embed.img, embed.title || embed.url);
-      loadManagedImage(host, img, buildCachedImageUrl(embed.img));
+      loadManagedImage(host, img, buildCachedImageUrl(embed.img), {
+        onLoad: options.onAsyncLayoutChange,
+        onError: options.onAsyncLayoutChange,
+      });
       wrapper.appendChild(host);
     }
 
@@ -73,7 +79,7 @@ export function createRichContentRenderer({
     fragment.appendChild(wrapper);
   }
 
-  function createRichMessageContent(text) {
+  function createRichMessageContent(text, options = {}) {
     const fragment = document.createDocumentFragment();
     const content = String(text || '').replace(/\[img\s+src=(https?:\/\/[^\s\]]+)[^\]]*\][\s\S]*?\[\/img\]/gi, '[img]$1[/img]');
     const tokenRegex = /(\[emoticon\s+name="([^"]+)"\](?:\[\/emoticon\])?)|(\[emoticon\]([^\[]+)\[\/emoticon\])|(:([a-z0-9_][a-z0-9_\-]*):)|(\[img\](https?:\/\/[^\s\[\]]+?)\[\/img\])|(<img\b[^>]*?\bsrc=["'](https?:\/\/[^"']+)["'][^>]*>)|(\[og\s+([^\]]+)\]([\s\S]*?)\[\/og\])|(\[url=([^\]]+)\]([\s\S]*?)\[\/url\])|(\[url\]([\s\S]*?)\[\/url\])|(https?:\/\/\S+)/gi;
@@ -92,9 +98,9 @@ export function createRichContentRenderer({
       } else if (match[6]) {
         appendEmoticonImage(fragment, match[6]);
       } else if (match[8]) {
-        appendInlineImage(fragment, match[8], '[img]');
+        appendInlineImage(fragment, match[8], '[img]', options);
       } else if (match[10]) {
-        appendInlineImage(fragment, match[10], '<img>');
+        appendInlineImage(fragment, match[10], '<img>', options);
       } else if (match[11]) {
         const attrs = parseBbCodeAttributes(match[12] || '');
         const fallbackUrl = String(match[13] || '').trim();
@@ -104,7 +110,7 @@ export function createRichContentRenderer({
           title: attrs.title || '',
         };
         if (embed.url) {
-          appendOpenGraphCard(fragment, embed);
+          appendOpenGraphCard(fragment, embed, options);
         }
       } else if (match[14]) {
         const href = match[15];
@@ -126,7 +132,7 @@ export function createRichContentRenderer({
       } else if (match[19]) {
         const rawUrl = match[19];
         if (extractImageUrls(rawUrl).length > 0) {
-          appendInlineImage(fragment, rawUrl, rawUrl);
+          appendInlineImage(fragment, rawUrl, rawUrl, options);
         } else {
           const link = document.createElement('a');
           link.href = rawUrl;

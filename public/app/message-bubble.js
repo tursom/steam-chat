@@ -31,18 +31,21 @@ export function createMessageBubbleRenderer({
     return leftoverText === '' ? imageUrls[0] : '';
   }
 
-  function renderImageBubble(bubble, entry) {
+  function renderImageBubble(bubble, entry, options = {}) {
     bubble.classList.add('image-bubble');
 
     const rawImageUrl = entry.imageUrl;
     const { host, img } = createManagedImageHost('image-loading-host--bubble');
     img.alt = 'image';
     makeImageZoomable(host, rawImageUrl, rawImageUrl);
-    loadManagedImage(host, img, buildCachedImageUrl(rawImageUrl));
+    loadManagedImage(host, img, buildCachedImageUrl(rawImageUrl), {
+      onLoad: options.onAsyncLayoutChange,
+      onError: options.onAsyncLayoutChange,
+    });
     bubble.appendChild(host);
   }
 
-  function renderStickerBubble(bubble, stickerType) {
+  function renderStickerBubble(bubble, stickerType, options = {}) {
     bubble.classList.add('sticker-bubble');
 
     const stickerCandidates = buildSteamStickerCandidateUrls(stickerType);
@@ -52,12 +55,18 @@ export function createMessageBubbleRenderer({
       stickerImage.alt = stickerType;
       let stickerIndex = 0;
       stickerImage.src = location.origin + '/proxy/sticker/' + encodeURIComponent(stickerType);
+      if (typeof options.onAsyncLayoutChange === 'function') {
+        stickerImage.addEventListener('load', options.onAsyncLayoutChange, { once: true });
+      }
       stickerImage.addEventListener('error', () => {
         stickerIndex += 1;
         if (stickerIndex < stickerCandidates.length) {
           stickerImage.src = stickerCandidates[stickerIndex];
         } else {
           stickerImage.remove();
+          if (typeof options.onAsyncLayoutChange === 'function') {
+            options.onAsyncLayoutChange();
+          }
         }
       });
       bubble.appendChild(stickerImage);
@@ -80,33 +89,33 @@ export function createMessageBubbleRenderer({
     bubble.appendChild(raw);
   }
 
-  function renderTextBubble(bubble, entry) {
-    bubble.appendChild(createRichMessageContent(entry.message || ''));
+  function renderTextBubble(bubble, entry, options = {}) {
+    bubble.appendChild(createRichMessageContent(entry.message || '', options));
   }
 
-  function renderMessageBubble(entry) {
+  function renderMessageBubble(entry, options = {}) {
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
 
     if (entry.type === 'image' || entry.imageUrl) {
-      renderImageBubble(bubble, entry);
+      renderImageBubble(bubble, entry, options);
       return bubble;
     }
 
     const stickerType = extractStickerType(entry.message);
     if (stickerType) {
-      renderStickerBubble(bubble, stickerType);
+      renderStickerBubble(bubble, stickerType, options);
       return bubble;
     }
 
     // 仅包含单张图片的消息（BBCode / HTML / 纯图片链接）走大图气泡
     const standaloneImageUrl = extractStandaloneImageUrl(entry.message);
     if (standaloneImageUrl) {
-      renderImageBubble(bubble, { ...entry, imageUrl: standaloneImageUrl });
+      renderImageBubble(bubble, { ...entry, imageUrl: standaloneImageUrl }, options);
       return bubble;
     }
 
-    renderTextBubble(bubble, entry);
+    renderTextBubble(bubble, entry, options);
     return bubble;
   }
 

@@ -797,14 +797,40 @@ function createChatService(customDeps = {}) {
         }
     }
 
+    function normalizeSteamId(steamId) {
+        if (!steamId) {
+            return '';
+        }
+
+        if (typeof steamId === 'string') {
+            return steamId;
+        }
+
+        if (typeof steamId.getSteamID64 === 'function') {
+            return steamId.getSteamID64();
+        }
+
+        return String(steamId);
+    }
+
+    async function getMessageSenderName(friendId, echo) {
+        const senderId = echo ? normalizeSteamId(steamUser.steamID) : normalizeSteamId(friendId);
+        if (!senderId) {
+            return '';
+        }
+
+        const sender = await client.getUserInfo(senderId, () => {});
+        return sender && sender.player_name ? sender.player_name : senderId;
+    }
+
     function appendOutgoingLog(uid, response) {
-        client.getUserInfo(uid).then((friend) => {
+        getMessageSenderName(uid, true).then((senderName) => {
             appendLogEntry({
                 type: 'message',
                 date: dateToString(response.server_timestamp),
                 echo: true,
                 id: uid,
-                name: friend.player_name,
+                name: senderName,
                 message: response.modified_message,
                 ordinal: response.ordinal,
             });
@@ -812,13 +838,12 @@ function createChatService(customDeps = {}) {
     }
 
     async function appendOutgoingImageLog(uid, imageUrl) {
-        const friend = await client.getUserInfo(uid, () => {});
         const entry = {
             type: 'image',
             date: dateToString(new Date()),
             echo: true,
             id: uid,
-            name: friend.player_name,
+            name: await getMessageSenderName(uid, true),
             imageUrl,
             ordinal: null,
             sentAt: new Date().toISOString(),
@@ -828,19 +853,14 @@ function createChatService(customDeps = {}) {
     }
 
     async function encodeSteamMessage(message, echo) {
-        let friendId = message.steamid_friend;
-        if (typeof friendId !== 'string') {
-            friendId = friendId.getSteamID64();
-        }
-
-        const friend = await client.getUserInfo(friendId, () => {});
+        const friendId = normalizeSteamId(message.steamid_friend);
 
         return {
             type: 'message',
             date: dateToString(message.server_timestamp),
             echo,
             id: friendId,
-            name: friend.player_name,
+            name: await getMessageSenderName(friendId, echo),
             message: message.message,
             ordinal: message.ordinal,
             imageUrl: null,
