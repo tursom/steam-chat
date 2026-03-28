@@ -4,3 +4,4 @@ config.js
 logs/
 session.json
 refresh.token
+.codex

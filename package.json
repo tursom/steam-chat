@@ -9,7 +9,7 @@
   },
   "keywords": [],
   "author": "",
-  "license": "ISC",
+  "license": "GPL-3.0",
   "dependencies": {
     "@matteo.collina/dateformat": "^5.0.1",
     "axios": "^1.7.7",

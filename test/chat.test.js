@@ -560,7 +560,7 @@ test('handleSendMessageRequest broadcasts messages and deduplicates echoed messa
     });
 
     assert.equal(data.echo, true);
-    assert.equal(data.name, 'Friend User');
+    assert.equal(data.name, 'Self User');
     assert.equal(wsClient.messages.length, 1);
     assert.deepEqual(wsClient.messages[0], {
         type: 'message',
@@ -686,7 +686,7 @@ test('handleHttp returns JSON response for message endpoint', async () => {
         date: 'formatted-date',
         echo: true,
         id: 'friend-id',
-        name: 'Friend User',
+        name: 'Self User',
         message: 'hello via http',
         ordinal: 42,
         imageUrl: null,
@@ -976,6 +976,7 @@ test('handleSendImageRequest appends image log and broadcasts image payload', as
 
     assert.equal(data.type, 'image');
     assert.equal(data.id, 'friend-id');
+    assert.equal(data.name, 'Self User');
     assert.equal(data.imageUrl, 'https://image/friend-id/10');
     assert.equal(wsClient.messages.length, 1);
     assert.deepEqual(wsClient.messages[0], {
