@@ -1,8 +1,8 @@
 const SteamUser = require('steam-user');
 const SteamCommunity = require('steamcommunity');
-const fs = require('fs');
 const winston = require("winston");
 const config = require("./config.js");
+const { createSteamLifecycle } = require('./steam-lifecycle');
 
 const logger = winston.createLogger({
     level: 'info',
@@ -18,65 +18,14 @@ const users = {};
 const steamUser = new SteamUser();
 const steamCommunity = new SteamCommunity();
 
-steamUser.setOption("renewRefreshTokens", true);
-steamUser.on("refreshToken", (refreshToken) => {
-    logger.info("Refresh token: " + refreshToken);
-    fs.writeFileSync('refresh.token', refreshToken);
-});
-
-try {
-    const refreshToken = fs.readFileSync('refresh.token', 'utf8');
-
-    if (refreshToken && refreshToken.length > 0) {
-        const LogOnOptionsAUTO = {
-            logonID: config.logonID,
-            refreshToken: refreshToken,
-            steamID: config.steamID,
-        };
-        steamUser.logOn(LogOnOptionsAUTO);
-    } else {
-        steamUser.logOn({
-            accountName: config.accountName,
-            password: config.password,
-            logonID: config.logonID,
-            steamID: config.steamID,
-        });
-    }
-} catch (e) {
-    logger.warn(`failed to load session: ${e.message}`)
-
-    steamUser.logOn({
-        accountName: config.accountName,
-        password: config.password,
-        logonID: config.logonID,
-        steamID: config.steamID,
-    });
-}
-
-const steamLoginPromise = new Promise((resolve, reject) => {
-    steamUser.on('loggedOn', async () => {
-        logger.info(`login to Steam as ${steamUser.steamID}`);
-        try {
-            steamUser.webLogOn();
-        } catch (err) {
-            logger.warn(`failed to start web login: ${err.message}`);
-        }
-
-        resolve();
-    });
-});
-
-const steamWebLoginPromise = new Promise((resolve, reject) => {
-    steamUser.on('webSession', async (sessionID, cookies) => {
-        logger.info(`web session received: ${sessionID}`);
-
-        steamCommunity.setCookies(cookies);
-        if (config.identitySecret) {
-            steamCommunity.startConfirmationChecker(10000, config.identitySecret);
-        }
-
-        resolve()
-    });
+const {
+    steamLoginPromise,
+    steamWebLoginPromise,
+} = createSteamLifecycle({
+    steamUser,
+    steamCommunity,
+    logger,
+    config,
 });
 
 async function getUserInfo(steamID, onUserInfoReceived) {
