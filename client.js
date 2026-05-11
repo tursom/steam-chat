@@ -64,3 +64,5 @@ module.exports = {
     steamLoginPromise: steamLoginPromise,
     steamWebLoginPromise: steamWebLoginPromise,
 }
+
+require('./logger');

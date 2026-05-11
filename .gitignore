@@ -1,7 +1,28 @@
+# Dependencies
 node_modules/
-.idea/
+
+# Config
 config.js
+.env
+
+# Logs
 logs/
+*.log
+
+# Auth / Secrets
 session.json
 refresh.token
+
+# Build
+dist/
+
+# Test coverage
+coverage/
+
+# IDE
+.idea/
 .codex
+.vscode/
+
+# OS
+.DS_Store

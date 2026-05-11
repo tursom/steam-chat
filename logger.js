@@ -50,13 +50,13 @@ async function logMessage(date, steamID, message, echo, ordinal) {
 
 client.steamLoginPromise.then(() => {
     steamUser.chat.on("friendMessage", (message) => {
-        // noinspection JSIgnoredPromiseFromCall
-        logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, false, message.ordinal);
+        logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, false, message.ordinal)
+            .catch((err) => logger.error('failed to log friend message', err));
     });
 
     steamUser.chat.on("friendMessageEcho", (message) => {
-        // noinspection JSIgnoredPromiseFromCall
-        logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, true, message.ordinal);
+        logMessage(dateToString(message.server_timestamp), message.steamid_friend, message.message, true, message.ordinal)
+            .catch((err) => logger.error('failed to log echoed friend message', err));
     });
 });
 
@@ -96,7 +96,7 @@ function importChatHistory(steamID) {
                 steamID, message.message,
                 message.sender.getSteamID64() === steamUser.steamID.getSteamID64(),
                 message.ordinal,
-            );
+            ).catch((err) => logger.error("failed to log imported chat history", err));
         }
     });
 }

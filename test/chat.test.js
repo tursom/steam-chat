@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
 const { once } = require('node:events');
+const { Readable } = require('node:stream');
 
 process.env.STEAM_CHAT_DISABLE_AUTOSTART = '1';
 
@@ -156,6 +157,13 @@ function createService(overrides = {}) {
         writeFile(path, data, cb) {
             extraFiles.set(path, data);
             cb(null);
+        },
+        createReadStream(path, options) {
+            assert.equal(path, CHAT_LOG_FILE);
+            const stream = new Readable();
+            stream.push(logContent);
+            stream.push(null);
+            return stream;
         },
     };
 
