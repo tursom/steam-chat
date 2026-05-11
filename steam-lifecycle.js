@@ -254,6 +254,13 @@ function createSteamLifecycle({
             message: msg,
             autoRelogin: steamUser.options && steamUser.options.autoRelogin,
         });
+
+        // Schedule a retry as fallback — if autoRelogin succeeds,
+        // loggedOn will clear this timer. This ensures reconnection
+        // even if autoRelogin is disabled or fails silently.
+        const err = new Error(msg || `Steam disconnected (eresult: ${eresult})`);
+        err.eresult = eresult;
+        scheduleRetry(err);
     });
 
     steamUser.on('error', (err) => {

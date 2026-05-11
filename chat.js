@@ -3,6 +3,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const path = require('path');
 const { once } = require('node:events');
+const readline = require('readline');
 
 const axios = require('axios');
 const dateformat = require('@matteo.collina/dateformat');
@@ -11,6 +12,9 @@ const WebSocket = require('ws');
 const CHAT_LOG_FILE = './logs/chat.jsonl';
 const STICKER_CACHE_DIR = './logs/stickers';
 const IMAGE_CACHE_DIR = './logs/images';
+const HISTORY_DEFAULT_LIMIT = 100;
+const HISTORY_MAX_LIMIT = 500;
+const PREVIEW_MAX_LENGTH = 60;
 
 function normalizeAuthConfig(rawAuth) {
     const defaultConfig = {
@@ -127,7 +131,6 @@ function getClientIp(req, trustProxy = false) {
 
     return normalizeIpAddress(
         (req && req.socket && req.socket.remoteAddress)
-        || (req && req.connection && req.connection.remoteAddress)
         || '',
     );
 }
@@ -307,12 +310,12 @@ function normalizeHistoryEntry(entry) {
     };
 }
 
-function sanitizeLimit(limit, fallback = 100) {
+function sanitizeLimit(limit, fallback = HISTORY_DEFAULT_LIMIT) {
     const value = Number.parseInt(limit, 10);
     if (!Number.isFinite(value) || value <= 0) {
         return fallback;
     }
-    return Math.min(value, 500);
+    return Math.min(value, HISTORY_MAX_LIMIT);
 }
 
 function extractStickerType(message) {
@@ -520,7 +523,7 @@ function buildConversationPreview(entry) {
         return `[表情] ${emoticonNames.join(' ')}`;
     }
 
-    return String(entry.message || '').trim().replace(/\s+/g, ' ').slice(0, 60);
+    return String(entry.message || '').trim().replace(/\s+/g, ' ').slice(0, PREVIEW_MAX_LENGTH);
 }
 
 function sortHistoryItems(items) {
@@ -655,9 +658,15 @@ function createChatService(customDeps = {}) {
     const recentSelfImageUrls = new Map();
     const pendingStickerFetches = new Map();
     const pendingImageFetches = new Map();
+    let pendingWebSessionRefresh = null;
     let started = false;
 
-    fsModule.mkdir('./logs', { recursive: true }, (err) => {
+    const MSG_DEDUP_TTL_MS = 15000;
+    const WS_SESSION_TIMEOUT_MS = 15000;
+    const EMOTICON_LIST_TIMEOUT_MS = 10000;
+    const LOG_DIR = './logs';
+
+    fsModule.mkdir(LOG_DIR, { recursive: true }, (err) => {
         if (err) {
             logger.error('an error occurred while creating the logs directory: ' + err);
         }
@@ -690,12 +699,22 @@ function createChatService(customDeps = {}) {
     });
 
     async function readRequestBody(req) {
-        let body = '';
-        req.on('data', (chunk) => {
-            body += chunk.toString();
+        return new Promise((resolve, reject) => {
+            let body = '';
+            const MAX_BODY_SIZE = 10 * 1024 * 1024; // 10MB
+
+            req.on('data', (chunk) => {
+                body += chunk.toString();
+                if (body.length > MAX_BODY_SIZE) {
+                    req.destroy();
+                    const error = new Error('Request body too large');
+                    error.code = 413;
+                    reject(error);
+                }
+            });
+            req.on('end', () => resolve(body));
+            req.on('error', reject);
         });
-        await onceFn(req, 'end');
-        return body;
     }
 
     async function readJsonBody(req) {
@@ -834,6 +853,8 @@ function createChatService(customDeps = {}) {
                 message: response.modified_message,
                 ordinal: response.ordinal,
             });
+        }).catch((err) => {
+            logger.error('failed to append outgoing log', { id: uid, error: err.message });
         });
     }
 
@@ -870,10 +891,10 @@ function createChatService(customDeps = {}) {
 
     function rememberSelfMessage(message) {
         const key = buildMessageKey(message);
-        recentSelfMessages.set(key, Date.now() + 15000);
+        recentSelfMessages.set(key, Date.now() + MSG_DEDUP_TTL_MS);
         const timer = setTimeout(() => {
             recentSelfMessages.delete(key);
-        }, 15000);
+        }, MSG_DEDUP_TTL_MS);
 
         if (typeof timer.unref === 'function') {
             timer.unref();
@@ -930,7 +951,7 @@ function createChatService(customDeps = {}) {
             const timeout = setTimeout(() => {
                 removeHandler(handler);
                 reject(new Error('getEmoticonList timed out'));
-            }, 10000);
+            }, EMOTICON_LIST_TIMEOUT_MS);
             if (typeof timeout.unref === 'function') {
                 timeout.unref();
             }
@@ -1008,29 +1029,78 @@ function createChatService(customDeps = {}) {
         return groups;
     }
 
-    function sendFriendMessage(uid, msg) {
-        return new Promise((resolve, reject) => {
-            if (!uid || typeof msg !== 'string') {
-                reject(new Error('id and msg are required'));
-                return;
-            }
+    async function sendFriendMessage(uid, msg) {
+        if (!uid || typeof msg !== 'string') {
+            throw new Error('id and msg are required');
+        }
 
-            steamUser.chat.sendFriendMessage(uid, msg, (err, response) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
+        async function doSend() {
+            return new Promise((resolve, reject) => {
+                steamUser.chat.sendFriendMessage(uid, msg, (err, response) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
 
-                appendOutgoingLog(uid, response);
+                    appendOutgoingLog(uid, response);
 
-                resolve({
-                    server_timestamp: response.server_timestamp,
-                    steamid_friend: uid,
-                    message: response.modified_message,
-                    ordinal: response.ordinal,
+                    resolve({
+                        server_timestamp: response.server_timestamp,
+                        steamid_friend: uid,
+                        message: response.modified_message,
+                        ordinal: response.ordinal,
+                    });
                 });
             });
-        });
+        }
+
+        try {
+            return await doSend();
+        } catch (err) {
+            let sendError = err;
+
+            if (isTransientNetworkError(sendError)) {
+                logger.warn('temporary network error while sending message, retrying once', {
+                    id: uid,
+                    error: sendError.message,
+                    code: sendError.code || null,
+                });
+
+                try {
+                    return await doSend();
+                } catch (retryErr) {
+                    sendError = retryErr;
+                }
+            }
+
+            if (!isLikelyExpiredWebSessionError(sendError) && !isTransientNetworkError(sendError)) {
+                throw sendError;
+            }
+
+            logger.warn('failed to send message, trying to refresh web session', {
+                id: uid,
+                error: sendError.message,
+                code: sendError.code || null,
+            });
+
+            try {
+                if (!pendingWebSessionRefresh) {
+                    pendingWebSessionRefresh = (async () => {
+                        steamUser.webLogOn();
+                        await waitForFreshWebSession();
+                    })();
+                }
+                try {
+                    await pendingWebSessionRefresh;
+                } finally {
+                    pendingWebSessionRefresh = null;
+                }
+                return await doSend();
+            } catch (retryErr) {
+                logger.error('an error occurred while sending message', retryErr);
+                throw retryErr;
+            }
+        }
     }
 
     async function ensureWebSession() {
@@ -1076,24 +1146,26 @@ function createChatService(customDeps = {}) {
             || message.includes('forbidden');
     }
 
-    async function waitForFreshWebSession(timeoutMs = 15000) {
+    async function waitForFreshWebSession(timeoutMs = WS_SESSION_TIMEOUT_MS) {
+        const ac = new AbortController();
         let timer = null;
 
         try {
             await Promise.race([
-                onceFn(steamUser, 'webSession'),
+                onceFn(steamUser, 'webSession', { signal: ac.signal }).catch((err) => {
+                    if (err.name !== 'AbortError') throw err;
+                    // Swallow AbortError — timeout already handled the race
+                }),
                 new Promise((_, reject) => {
                     timer = setTimeout(() => {
-                        const error = new Error(`Timed out after ${timeoutMs}ms while waiting for Steam web session`);
-                        error.code = 'WEB_SESSION_TIMEOUT';
-                        reject(error);
+                        ac.abort();
+                        reject(new Error(`Timed out after ${timeoutMs}ms while waiting for Steam web session`));
                     }, timeoutMs);
                 }),
             ]);
         } finally {
-            if (timer) {
-                clearTimeout(timer);
-            }
+            if (timer) clearTimeout(timer);
+            ac.abort();
         }
     }
 
@@ -1178,8 +1250,17 @@ function createChatService(customDeps = {}) {
             });
 
             try {
-                steamUser.webLogOn();
-                await waitForFreshWebSession();
+                if (!pendingWebSessionRefresh) {
+                    pendingWebSessionRefresh = (async () => {
+                        steamUser.webLogOn();
+                        await waitForFreshWebSession();
+                    })();
+                }
+                try {
+                    await pendingWebSessionRefresh;
+                } finally {
+                    pendingWebSessionRefresh = null;
+                }
                 return await uploadImageToUser(uid, imageBuffer);
             } catch (retryErr) {
                 logger.error('an error occurred while sending image', retryErr);
@@ -1205,37 +1286,47 @@ function createChatService(customDeps = {}) {
     }
 
     async function readChatHistory({ id, limit } = {}) {
-        const lines = await new Promise((resolve, reject) => {
-            fsModule.readFile(CHAT_LOG_FILE, 'utf8', (err, content) => {
-                if (err) {
-                    if (err.code === 'ENOENT') {
-                        resolve('');
-                        return;
-                    }
-                    reject(err);
-                    return;
-                }
+        const maxItems = sanitizeLimit(limit, HISTORY_DEFAULT_LIMIT);
+        const items = [];
 
-                resolve(content);
+        try {
+            const rl = readline.createInterface({
+                input: fsModule.createReadStream(CHAT_LOG_FILE, { encoding: 'utf8' }),
+                crlfDelay: Infinity,
             });
-        });
 
-        const maxItems = sanitizeLimit(limit, 100);
-        let items = parseLogLines(lines);
+            for await (const line of rl) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
 
-        if (id) {
-            items = items.filter((entry) => entry.id === id);
+                try {
+                    const entry = normalizeHistoryEntry(JSON.parse(trimmed));
+                    if (entry && (!id || entry.id === id)) {
+                        items.push(entry);
+                    }
+                } catch (parseErr) {
+                    logger.warn('skip invalid chat log line', { line: trimmed });
+                }
+            }
+        } catch (err) {
+            if (err && err.code === 'ENOENT') {
+                return [];
+            }
+            if (err && err.message && err.message.includes('ENOENT')) {
+                return [];
+            }
+            throw err;
         }
 
         if (items.length > maxItems) {
-            items = items.slice(-maxItems);
+            items.splice(0, items.length - maxItems);
         }
 
         return sortHistoryItems(items);
     }
 
     async function readConversationSummaries({ limit } = {}) {
-        const items = await readChatHistory({ limit: sanitizeLimit(limit, 500) });
+        const items = await readChatHistory({ limit: sanitizeLimit(limit, HISTORY_MAX_LIMIT) });
         const summaries = buildConversationSummaries(items);
 
         for (const summary of summaries) {
@@ -1308,6 +1399,27 @@ function createChatService(customDeps = {}) {
     async function fetchCachedImage(url) {
         const normalizedUrl = String(url || '').trim();
         if (!/^https?:\/\//i.test(normalizedUrl)) {
+            const error = new Error('Invalid image URL');
+            error.code = 400;
+            throw error;
+        }
+
+        // SSRF protection: reject private/internal addresses
+        let parsedUrl;
+        try {
+            parsedUrl = new URL(normalizedUrl);
+        } catch (_) {
+            const error = new Error('Invalid image URL');
+            error.code = 400;
+            throw error;
+        }
+        const hostname = parsedUrl.hostname;
+        if (hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]' || hostname === '0.0.0.0') {
+            const error = new Error('Invalid image URL');
+            error.code = 400;
+            throw error;
+        }
+        if (/^\d{1,3}(?:\.\d{1,3}){3}$/.test(hostname) && isLanIp(hostname)) {
             const error = new Error('Invalid image URL');
             error.code = 400;
             throw error;
@@ -1403,18 +1515,19 @@ function createChatService(customDeps = {}) {
 
     function rememberSelfImageUrl(uid, imageUrl) {
         const urlKey = `${uid}:${imageUrl}`;
-        recentSelfImageUrls.set(urlKey, Date.now() + 15000);
-
-        // Also remember that we sent *any* image to this uid recently,
-        // so we can suppress echo messages that contain image URLs even
-        // if Steam transforms the URL format.
         const uidKey = `img:${uid}`;
-        recentSelfImageUrls.set(uidKey, Date.now() + 15000);
+        const expiresAt = Date.now() + MSG_DEDUP_TTL_MS;
+
+        recentSelfImageUrls.set(urlKey, expiresAt);
+        recentSelfImageUrls.set(uidKey, expiresAt);
 
         const timer = setTimeout(() => {
             recentSelfImageUrls.delete(urlKey);
-            recentSelfImageUrls.delete(uidKey);
-        }, 15000);
+            // Only delete uidKey if it hasn't been refreshed by a newer call
+            if (recentSelfImageUrls.get(uidKey) === expiresAt) {
+                recentSelfImageUrls.delete(uidKey);
+            }
+        }, MSG_DEDUP_TTL_MS);
 
         if (typeof timer.unref === 'function') {
             timer.unref();
@@ -1708,6 +1821,14 @@ function createChatService(customDeps = {}) {
     }
 
     function handleWs(ws) {
+        const MAX_WS_CONNECTIONS = 100;
+        if (wss.clients.size >= MAX_WS_CONNECTIONS) {
+            ws.close(1013, 'Too many connections');
+            logger.warn('WebSocket connection rejected: too many connections', {
+                max: MAX_WS_CONNECTIONS,
+            });
+            return;
+        }
         logger.info('WebSocket connection established');
         sendWs(ws, {
             type: 'ready',
@@ -1755,37 +1876,43 @@ function createChatService(customDeps = {}) {
         }
         started = true;
 
-        await client.steamLoginPromise;
+        try {
+            await client.steamLoginPromise;
 
-        steamUser.chat.on('friendMessage', (message) => {
-            broadcastSteamMessage(message, false).catch((err) => {
-                logger.error('failed to broadcast friend message', err);
-            });
-        });
-
-        steamUser.chat.on('friendMessageEcho', (message) => {
-            broadcastSteamMessage(message, true, { dedupe: true }).catch((err) => {
-                logger.error('failed to broadcast echoed friend message', err);
-            });
-        });
-
-        wss.on('connection', handleWs);
-
-        await new Promise((resolve, reject) => {
-            server.listen(chatConfig.port, chatConfig.host, (err) => {
-                if (err) {
-                    reject(err);
-                    return;
-                }
-
-                logger.info('chat server started', {
-                    host: chatConfig.host,
-                    port: chatConfig.port,
-                    wsPath: chatConfig.wsPath,
+            steamUser.chat.on('friendMessage', (message) => {
+                broadcastSteamMessage(message, false).catch((err) => {
+                    logger.error('failed to broadcast friend message', err);
                 });
-                resolve();
             });
-        });
+
+            steamUser.chat.on('friendMessageEcho', (message) => {
+                broadcastSteamMessage(message, true, { dedupe: true }).catch((err) => {
+                    logger.error('failed to broadcast echoed friend message', err);
+                });
+            });
+
+            wss.on('connection', handleWs);
+
+            await new Promise((resolve, reject) => {
+                server.listen(chatConfig.port, chatConfig.host, (err) => {
+                    if (err) {
+                        reject(err);
+                        return;
+                    }
+
+                    logger.info('chat server started', {
+                        host: chatConfig.host,
+                        port: chatConfig.port,
+                        wsPath: chatConfig.wsPath,
+                    });
+                    resolve();
+                });
+            });
+        } catch (err) {
+            started = false;
+            logger.error('chat service failed to start', err);
+            throw err;
+        }
     }
 
     return {
