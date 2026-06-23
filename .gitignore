@@ -26,3 +26,7 @@ coverage/
 
 # OS
 .DS_Store
+
+.omc
+.sisyphus
+.claude

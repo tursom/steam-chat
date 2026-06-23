@@ -1,27 +1,31 @@
 {
   "name": "steam-chat",
   "version": "1.0.0",
-  "description": "",
+  "description": "Steam account based realtime chat service with a built-in Web UI.",
   "type": "commonjs",
-  "main": "logger.js",
+  "main": "dist/src/index.js",
   "scripts": {
-    "test": "STEAM_CHAT_DISABLE_AUTOSTART=1 node --test"
+    "build": "tsc -p tsconfig.json && mkdir -p dist/web && cp web/index.html web/style.css dist/web/",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "start": "npm run build && node dist/src/index.js",
+    "test": "npm run build && STEAM_CHAT_DISABLE_AUTOSTART=1 node --test dist/test/*.test.js"
   },
-  "keywords": [],
+  "keywords": [
+    "steam",
+    "chat",
+    "websocket"
+  ],
   "author": "",
   "license": "GPL-3.0",
   "dependencies": {
-    "@matteo.collina/dateformat": "^5.0.1",
-    "axios": "^1.7.7",
-    "steam-totp": "^2.1.2",
     "steam-user": "^5.0.8",
     "steamcommunity": "^3.48.2",
     "winston": "^3.12.0",
     "ws": "^8.18.1"
   },
   "devDependencies": {
-    "@types/steam-totp": "^2.1.2",
-    "@types/steam-user": "^5.1.0",
-    "@types/steamcommunity": "^3.43.8"
+    "@types/node": "^26.0.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^6.0.3"
   }
 }
