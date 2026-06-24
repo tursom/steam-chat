@@ -1,6 +1,7 @@
 'use strict';
 
 import type { LoggerLike, Persona } from '../types';
+import type { SteamFriendMessageEvent, SteamFriendMessageEventUser } from './friend-message-events';
 import { errorMessage } from '../types';
 
 const {
@@ -9,24 +10,35 @@ const {
   formatDate,
   steamIdToString
 } = require('../storage/chat-log');
+const {
+  subscribeFriendMessageEvents
+} = require('./friend-message-events');
 
 type SteamHistoryMessage = {
-  imageUrl?: string | null;
   accountid?: string | number;
   message?: string;
   ordinal?: string | number | null;
+  steamID?: unknown;
   timestamp?: number;
 };
 
-type SteamMessageLoggerUser = {
-  on: {
-    (event: 'friendMessage', listener: (steamID: unknown, message: unknown, type?: unknown, chatter?: unknown, ordinal?: unknown) => void): void;
-    (event: 'friendMessageEcho', listener: (steamID: unknown, message: unknown, ordinal?: unknown) => void): void;
-  };
-  off?: {
-    (event: 'friendMessage', listener: (steamID: unknown, message: unknown, type?: unknown, chatter?: unknown, ordinal?: unknown) => void): void;
-    (event: 'friendMessageEcho', listener: (steamID: unknown, message: unknown, ordinal?: unknown) => void): void;
-  };
+type SteamFriendHistoryMessage = {
+  sender?: unknown;
+  server_timestamp?: Date;
+  ordinal?: string | number | null;
+  message?: string;
+};
+
+type SteamMessageLoggerChat = NonNullable<SteamFriendMessageEventUser['chat']> & {
+    getFriendMessageHistory?: (
+      id: string,
+      options: { maxCount: number; wantBbcode: boolean },
+      callback: (error: unknown, response?: { messages?: SteamFriendHistoryMessage[] }) => void
+    ) => void;
+};
+
+type SteamMessageLoggerUser = SteamFriendMessageEventUser & {
+  chat?: SteamMessageLoggerChat;
   getChatHistory?: (id: string, callback: (error: unknown, messages?: SteamHistoryMessage[]) => void) => void;
 };
 
@@ -49,7 +61,7 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
   const importAttempts = new Set<string>();
 
   function echoKey(id: string, message: unknown, ordinal: unknown): string {
-    return `${id}:${ordinal || ''}:${message}`;
+    return `${id}:${ordinal ?? ''}:${message}`;
   }
 
   function rememberEcho(key: string): boolean {
@@ -59,71 +71,105 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
     return true;
   }
 
+  async function importFriendMessageHistory(id: string): Promise<boolean> {
+    if (typeof steamUser.chat?.getFriendMessageHistory !== 'function') return false;
+    const response = await new Promise<{ messages?: SteamFriendHistoryMessage[] }>((resolve, reject) => {
+      steamUser.chat?.getFriendMessageHistory?.(id, { maxCount: 100, wantBbcode: true }, (error: unknown, result?: { messages?: SteamFriendHistoryMessage[] }) => {
+        if (error) reject(error);
+        else resolve(result || {});
+      });
+    });
+    const friendInfo = await getUserInfo(id).catch((): Persona => ({ player_name: id }));
+    const selfName = await getSelfName();
+    for (const message of response.messages || []) {
+      const senderId = steamIdToString(message.sender);
+      const echo = Boolean(senderId && senderId !== id);
+      await appendLog({
+        echo,
+        id,
+        name: echo ? selfName : (friendInfo.player_name || friendInfo.personaName || id),
+        message: typeof message.message === 'string' ? message.message : '',
+        ordinal: message.ordinal ?? null,
+        date: message.server_timestamp instanceof Date ? formatDate(message.server_timestamp) : undefined
+      }, { logPath });
+    }
+    return true;
+  }
+
+  async function importLegacyChatHistory(id: string): Promise<boolean> {
+    if (typeof steamUser.getChatHistory !== 'function') return false;
+    const history = await new Promise<SteamHistoryMessage[]>((resolve) => {
+      steamUser.getChatHistory?.(id, (error: unknown, messages?: SteamHistoryMessage[]) => resolve(error ? [] : messages || []));
+    });
+    for (const message of history) {
+      const senderId = steamIdToString(message.steamID || message.accountid);
+      const echo = Boolean(senderId && senderId !== id);
+      await appendLog({
+        echo,
+        id,
+        name: echo ? await getSelfName() : (message.accountid ? String(message.accountid) : 'Unknown'),
+        message: message.message || '',
+        ordinal: message.ordinal ?? null,
+        date: message.timestamp ? formatDate(new Date(message.timestamp * 1000)) : undefined
+      }, { logPath });
+    }
+    return true;
+  }
+
   async function maybeImportSteamHistory(id: string) {
-    if (!id || importAttempts.has(id) || typeof steamUser.getChatHistory !== 'function') return;
+    if (!id || importAttempts.has(id)) return;
     importAttempts.add(id);
     try {
-      const history = await new Promise<SteamHistoryMessage[]>((resolve) => {
-        steamUser.getChatHistory?.(id, (error: unknown, messages?: SteamHistoryMessage[]) => resolve(error ? [] : messages || []));
-      });
-      for (const message of history) {
-        await appendLog({
-          type: message.imageUrl ? 'image' : 'message',
-          id,
-          name: message.accountid ? String(message.accountid) : 'Unknown',
-          message: message.message || '',
-          imageUrl: message.imageUrl || null,
-          ordinal: message.ordinal ?? null,
-          date: message.timestamp ? formatDate(new Date(message.timestamp * 1000)) : undefined
-        }, { logPath });
-      }
+      const imported = await importFriendMessageHistory(id);
+      if (!imported) await importLegacyChatHistory(id);
     } catch (error) {
-      logger.warn?.('Steam history import failed', { id, error: errorMessage(error) });
+      try {
+        await importLegacyChatHistory(id);
+      } catch (fallbackError) {
+        logger.warn?.('Steam history import failed', { id, error: errorMessage(fallbackError || error) });
+      }
     }
   }
 
-  const onFriendMessage = async (steamID: unknown, message: unknown, type?: unknown, chatter?: unknown, ordinal?: unknown) => {
-    const id = steamIdToString(steamID);
+  const onFriendMessage = async (event: SteamFriendMessageEvent) => {
+    const id = event.id;
     try {
       await maybeImportSteamHistory(id);
-      const info = await getUserInfo(steamID);
+      const info = await getUserInfo(event.steamID || id);
       await appendLog({
-        type: 'message',
         id,
         name: info.player_name || info.personaName || id,
-        message: typeof message === 'string' ? message : '',
-        ordinal: typeof ordinal === 'string' || typeof ordinal === 'number' ? ordinal : null
+        message: event.message,
+        ordinal: event.ordinal ?? null,
+        date: event.serverTimestamp ? formatDate(event.serverTimestamp) : undefined
       }, { logPath });
     } catch (error) {
       logger.error?.('Failed to log friend message', { id, error: errorMessage(error) });
     }
   };
 
-  const onFriendMessageEcho = async (steamID: unknown, message: unknown, ordinal?: unknown) => {
-    const id = steamIdToString(steamID);
-    const key = echoKey(id, message, ordinal);
+  const onFriendMessageEcho = async (event: SteamFriendMessageEvent) => {
+    const id = event.id;
+    const key = echoKey(id, event.message, event.ordinal);
     if (!rememberEcho(key)) return;
     try {
       await appendLog({
-        type: 'message',
         echo: true,
         id,
         name: await getSelfName(),
-        message: typeof message === 'string' ? message : '',
-        ordinal: typeof ordinal === 'string' || typeof ordinal === 'number' ? ordinal : null
+        message: event.message,
+        ordinal: event.ordinal ?? null,
+        date: event.serverTimestamp ? formatDate(event.serverTimestamp) : undefined
       }, { logPath });
     } catch (error) {
       logger.error?.('Failed to log echoed message', { id, error: errorMessage(error) });
     }
   };
 
-  steamUser.on('friendMessage', onFriendMessage);
-  steamUser.on('friendMessageEcho', onFriendMessageEcho);
-
-  return () => {
-    steamUser.off?.('friendMessage', onFriendMessage);
-    steamUser.off?.('friendMessageEcho', onFriendMessageEcho);
-  };
+  return subscribeFriendMessageEvents(steamUser, (event: SteamFriendMessageEvent) => {
+    const task = event.echo ? onFriendMessageEcho(event) : onFriendMessage(event);
+    task.catch((error) => logger.error?.('Failed to log Steam message event', { id: event.id, error: errorMessage(error) }));
+  });
 }
 
 module.exports = {

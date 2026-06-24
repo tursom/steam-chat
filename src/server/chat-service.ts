@@ -11,10 +11,12 @@ import type {
   ChatConfig,
   ConversationSummary,
   HistoryItem,
+  HistoryRecordInput,
   LoggerLike,
   Persona,
   UnknownRecord
 } from '../types';
+import type { SteamFriendMessageEvent, SteamFriendMessageEventUser } from '../steam/friend-message-events';
 import { errorCode, errorMessage, isRecord } from '../types';
 
 const fs = require('node:fs/promises');
@@ -36,6 +38,9 @@ const {
   steamIdToString
 } = require('../storage/chat-log');
 const {
+  subscribeFriendMessageEvents
+} = require('../steam/friend-message-events');
+const {
   IMAGE_CACHE_DIR,
   STICKER_CACHE_DIR,
   cacheKeyForUrl,
@@ -54,6 +59,9 @@ type Waiter = Promise<unknown> | (() => Promise<unknown> | unknown);
 type SteamChatApi = {
   sendFriendMessage?: CallbackStyleFunction;
   getEmoticonList?: CallbackStyleFunction;
+  on?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
+  off?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
+  removeListener?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
 };
 
 type SteamUserLike = {
@@ -61,6 +69,8 @@ type SteamUserLike = {
   sendFriendMessage?: CallbackStyleFunction;
   getEmoticonList?: CallbackStyleFunction;
   on?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
+  off?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
+  removeListener?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
   myFriends?: UnknownRecord;
   users?: Record<string, Persona>;
   myGroups?: unknown;
@@ -409,7 +419,7 @@ function createChatService(options: ChatServiceOptions = {}) {
   const legacyAuth = createAuthChecker(config.auth);
   const clients = new Set<WsConnection>();
   const recentSentText = new Map<string, number>();
-  const recentSentImages = new Map<string, number>();
+  let disposeSteamEvents = () => {};
 
   const server: Server = options.server || http.createServer(handleHttpRequest);
   const wss: WsServer = new WebSocketServer({ noServer: true });
@@ -624,20 +634,25 @@ function createChatService(options: ChatServiceOptions = {}) {
       throw new Error('Steam chat sender is unavailable');
     }
     const message = String(msg);
-    await withSteamRetry(() => {
+    const result = await withSteamRetry(() => {
       const sender = steamUser.chat?.sendFriendMessage || steamUser.sendFriendMessage;
       const context = steamUser.chat?.sendFriendMessage ? steamUser.chat : steamUser;
       if (!sender) throw new Error('Steam chat sender is unavailable');
       return callMaybeCallback(sender, context, [id, message]);
     });
     remember(recentSentText, `${id}:${message}`);
-    const item = await appendLog({
+    const record: HistoryRecordInput = {
       type: 'message',
       echo: true,
       id,
       name: await getSelfName(),
       message
-    }, { logPath });
+    };
+    if (isRecord(result)) {
+      if (typeof result.ordinal === 'string' || typeof result.ordinal === 'number') record.ordinal = result.ordinal;
+      if (result.server_timestamp instanceof Date) record.sentAt = result.server_timestamp.toISOString();
+    }
+    const item = await appendLog(record, { logPath });
     broadcast({ type: 'message', ...item });
     return item;
   }
@@ -648,64 +663,54 @@ function createChatService(options: ChatServiceOptions = {}) {
       throw new Error('Steam image sender is unavailable');
     }
     let imageBuffer: Buffer;
-    let imageUrl: string | null = body.url || null;
+    let message = body.url || '';
     if (body.img) {
       imageBuffer = decodeBase64Image(body.img);
     } else if (body.url) {
       const downloaded = await loadOrDownloadRemoteImage(body.url, { fetchImpl });
       imageBuffer = downloaded.buffer;
-      remember(recentSentImages, body.url);
     } else {
       throw Object.assign(new Error('img or url is required'), { statusCode: 400 });
     }
     const imageArgs = steamCommunity.sendImageToUser.length >= 4 ? [id, imageBuffer, 'image.png'] : [id, imageBuffer];
     const result = await withSteamRetry(() => callMaybeCallback(steamCommunity.sendImageToUser, steamCommunity, imageArgs), true);
-    if (!imageUrl && isRecord(result) && typeof result.url === 'string') imageUrl = result.url;
-    if (imageUrl) remember(recentSentImages, imageUrl);
-    const item = await appendLog({
-      type: 'image',
+    if (!message && isRecord(result) && typeof result.url === 'string') message = result.url;
+    const item = normalizeHistoryItem({
+      type: 'message',
       echo: true,
       id,
       name: await getSelfName(),
-      message: '',
-      imageUrl,
-      sentAt: new Date().toISOString()
-    }, { logPath });
+      message,
+      ordinal: isRecord(result) && (typeof result.ordinal === 'string' || typeof result.ordinal === 'number') ? result.ordinal : 0
+    });
     return item;
   }
 
-  function containsRecentImageEcho(message: unknown): boolean {
-    const text = String(message || '');
-    for (const url of recentSentImages.keys()) {
-      if (text.includes(url)) return true;
-    }
-    return false;
-  }
-
-  async function handleSteamIncoming(steamID: unknown, message: unknown, type?: unknown, chatter?: unknown, ordinal?: unknown) {
-    const id = steamIdToString(steamID);
-    if (containsRecentImageEcho(message)) return;
-    const info = await getUserInfo(steamID).catch((): Persona => ({ player_name: id }));
+  async function handleSteamIncoming(event: SteamFriendMessageEvent) {
+    const id = event.id;
+    const info = await getUserInfo(event.steamID || id).catch((): Persona => ({ player_name: id }));
     const item = normalizeHistoryItem({
       type: 'message',
       id,
       name: info.player_name || info.personaName || id,
-      message: typeof message === 'string' ? message : '',
-      ordinal: typeof ordinal === 'string' || typeof ordinal === 'number' ? ordinal : null
+      message: event.message,
+      ordinal: event.ordinal ?? 0,
+      date: event.serverTimestamp ? formatDate(event.serverTimestamp) : undefined
     });
     broadcast({ type: 'message', ...item });
   }
 
-  async function handleSteamEcho(steamID: unknown, message: unknown, ordinal?: unknown) {
-    const id = steamIdToString(steamID);
-    if (isRecent(recentSentText, `${id}:${message}`) || containsRecentImageEcho(message)) return;
+  async function handleSteamEcho(event: SteamFriendMessageEvent) {
+    const id = event.id;
+    if (isRecent(recentSentText, `${id}:${event.message}`) || isRecent(recentSentText, `${id}:${event.compatibilityMessage}`)) return;
     const item = normalizeHistoryItem({
       type: 'message',
       echo: true,
       id,
       name: await getSelfName(),
-      message: typeof message === 'string' ? message : '',
-      ordinal: typeof ordinal === 'string' || typeof ordinal === 'number' ? ordinal : null
+      message: event.message,
+      ordinal: event.ordinal ?? 0,
+      date: event.serverTimestamp ? formatDate(event.serverTimestamp) : undefined
     });
     broadcast({ type: 'message', ...item });
   }
@@ -794,7 +799,6 @@ function createChatService(options: ChatServiceOptions = {}) {
       if (req.method === 'POST' && (url.pathname === '/image' || url.pathname === '/img')) {
         const body = await readJsonBody(req);
         const item = await sendImageMessage(body.id, body);
-        broadcast({ type: 'image', ...item });
         jsonResponse(res, 200, { ok: true, item });
         return;
       }
@@ -831,7 +835,6 @@ function createChatService(options: ChatServiceOptions = {}) {
       if (type === 'send_image' || type === 'img') {
         const item = await sendImageMessage(payload.id, payload);
         reply({ type: 'image_sent', item });
-        broadcast({ type: 'image', ...item }, ws);
         return;
       }
       if (type === 'get_history' || type === 'history') {
@@ -909,15 +912,11 @@ function createChatService(options: ChatServiceOptions = {}) {
     ws.on('error', () => clients.delete(ws));
   });
 
-  if (steamUser?.on) {
-    steamUser.on('friendMessage', (steamID: unknown, message: unknown, type?: unknown, chatter?: unknown, ordinal?: unknown) => {
-      handleSteamIncoming(steamID, message, type, chatter, ordinal).catch((error) => {
-        logger.warn?.('Failed to broadcast Steam message', { error: errorMessage(error) });
-      });
-    });
-    steamUser.on('friendMessageEcho', (steamID: unknown, message: unknown, ordinal?: unknown) => {
-      handleSteamEcho(steamID, message, ordinal).catch((error) => {
-        logger.warn?.('Failed to broadcast Steam echo', { error: errorMessage(error) });
+  if (steamUser) {
+    disposeSteamEvents = subscribeFriendMessageEvents(steamUser as SteamFriendMessageEventUser, (event: SteamFriendMessageEvent) => {
+      const task = event.echo ? handleSteamEcho(event) : handleSteamIncoming(event);
+      task.catch((error) => {
+        logger.warn?.('Failed to broadcast Steam message', { id: event.id, error: errorMessage(error) });
       });
     });
   }
@@ -935,6 +934,7 @@ function createChatService(options: ChatServiceOptions = {}) {
       return server;
     },
     stop() {
+      disposeSteamEvents();
       for (const ws of clients) ws.close();
       wss.close();
       return new Promise<void>((resolve, reject) => {

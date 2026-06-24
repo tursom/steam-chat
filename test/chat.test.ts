@@ -29,12 +29,17 @@ type WsMessage = Record<string, unknown> & {
 
 type WsInbox = {
   next: () => Promise<WsMessage>;
+  nextWithin: (timeoutMs: number) => Promise<WsMessage | null>;
 };
 
 type TestSteamUser = EventEmitterType & {
   chat: {
     sendFriendMessage: (id: unknown, msg: unknown, callback: (error: Error | null, result?: unknown) => void) => void;
   };
+};
+
+type TestSteamCommunity = {
+  sendImageToUser: (id: unknown, image: Buffer, filename: string, callback: (error: Error | null, result?: unknown) => void) => void;
 };
 
 type ChatServiceRuntime = {
@@ -75,15 +80,37 @@ function createWsInbox(ws: WsConnection): WsInbox {
   });
   return {
     next() {
-      if (queue.length) return Promise.resolve(queue.shift());
+      if (queue.length) return Promise.resolve(queue.shift() as WsMessage);
       return new Promise((resolve, reject) => {
-        const timer = setTimeout(() => reject(new Error('Timed out waiting for WebSocket message')), 2000);
-        waiters.push({
+        const waiter = {
           resolve(value: WsMessage) {
             clearTimeout(timer);
             resolve(value);
           }
-        });
+        };
+        const timer = setTimeout(() => {
+          const index = waiters.indexOf(waiter);
+          if (index >= 0) waiters.splice(index, 1);
+          reject(new Error('Timed out waiting for WebSocket message'));
+        }, 2000);
+        waiters.push(waiter);
+      });
+    },
+    nextWithin(timeoutMs: number) {
+      if (queue.length) return Promise.resolve(queue.shift() as WsMessage);
+      return new Promise((resolve) => {
+        const waiter = {
+          resolve(value: WsMessage) {
+            clearTimeout(timer);
+            resolve(value);
+          }
+        };
+        const timer = setTimeout(() => {
+          const index = waiters.indexOf(waiter);
+          if (index >= 0) waiters.splice(index, 1);
+          resolve(null);
+        }, timeoutMs);
+        waiters.push(waiter);
       });
     }
   };
@@ -157,14 +184,66 @@ test('HTTP API sends messages, writes history, and builds conversations', async 
   const sendPayload = await sendResponse.json();
   assert.equal(sendPayload.item.message, 'hello');
   assert.equal(sendPayload.item.echo, true);
+  assert.equal(typeof sendPayload.item.ordinal, 'number');
+  assert.equal((await fs.readFile(logPath, 'utf8')).includes('"ordinal":null'), false);
 
   const history = await (await fetch(`http://127.0.0.1:${port}/history?id=7656119`)).json();
   assert.equal(history.length, 1);
   assert.equal(history[0].name, 'Me');
+  assert.equal(typeof history[0].ordinal, 'number');
 
   const conversations = await (await fetch(`http://127.0.0.1:${port}/conversations`)).json();
   assert.equal(conversations[0].id, '7656119');
   assert.equal(conversations[0].preview, 'hello');
+});
+
+test('HTTP image API sends images without writing the legacy-incompatible image row', async (t: TestContext) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'steam-chat-http-image-'));
+  const logPath = path.join(dir, 'chat.jsonl');
+  const steamUser = new EventEmitter() as TestSteamUser;
+  steamUser.chat = {
+    sendFriendMessage(id: unknown, msg: unknown, callback: (error: Error | null, result?: unknown) => void) {
+      callback(null, { id, msg });
+    }
+  };
+  const steamCommunity: TestSteamCommunity = {
+    sendImageToUser(_id: unknown, _image: Buffer, _filename: string, callback: (error: Error | null, result?: unknown) => void) {
+      callback(null, {
+        url: 'https://images.steamusercontent.com/ugc/example/'
+      });
+    }
+  };
+  const service = createChatService({
+    config: { host: '127.0.0.1', port: 0, wsPath: '/ws' },
+    steamUser,
+    steamCommunity,
+    logPath,
+    getSelfName: async () => 'Me',
+    logger: { info() {}, warn() {}, error() {} }
+  }) as ChatServiceRuntime;
+  t.after(() => service.stop().catch(() => {}));
+  const port = await listen(service.server);
+
+  const encoded = Buffer.from('hello image').toString('base64');
+  const sendResponse = await fetch(`http://127.0.0.1:${port}/image`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ id: '7656119', img: `data:image/png;base64,${encoded}` })
+  });
+  assert.equal(sendResponse.status, 200);
+  const sendPayload = await sendResponse.json();
+  assert.equal(sendPayload.item.type, 'message');
+  assert.equal(sendPayload.item.ordinal, 0);
+
+  const content = await fs.readFile(logPath, 'utf8').catch((error: NodeJS.ErrnoException) => {
+    if (error.code === 'ENOENT') return '';
+    throw error;
+  });
+  assert.equal(content.includes('"type":"image"'), false);
+  assert.equal(content.includes('imageUrl'), false);
+  assert.equal(content.includes('sentAt'), false);
+  assert.equal(content.includes('"ordinal":null'), false);
+  assert.equal(content.trim(), '');
 });
 
 test('WebSocket sends ready, handles ping, rejects invalid JSON, and supports history requests', async (t: TestContext) => {
@@ -207,4 +286,46 @@ test('WebSocket sends ready, handles ping, rejects invalid JSON, and supports hi
   const history = await inbox.next();
   assert.equal(history.requestId, 'h1');
   assert.equal(history.items[0].message, 'via ws');
+});
+
+test('WebSocket broadcasts merged chat object events with Steam ordinals', async (t: TestContext) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'steam-chat-ws-merged-'));
+  const logPath = path.join(dir, 'chat.jsonl');
+  const steamUser = new EventEmitter() as TestSteamUser;
+  const chat = new EventEmitter() as EventEmitterType & TestSteamUser['chat'];
+  chat.sendFriendMessage = (_id: unknown, _msg: unknown, callback: (error: Error | null, result?: unknown) => void) => {
+    callback(null);
+  };
+  steamUser.chat = chat;
+  const service = createChatService({
+    config: { host: '127.0.0.1', port: 0, wsPath: '/ws' },
+    steamUser,
+    logPath,
+    getUserInfo: async () => ({ player_name: 'Alice' }),
+    getSelfName: async () => 'Me',
+    logger: { info() {}, warn() {}, error() {} }
+  }) as ChatServiceRuntime;
+  t.after(() => service.stop().catch(() => {}));
+  const port = await listen(service.server);
+  const { ws, inbox } = await wsOpen(`ws://127.0.0.1:${port}/ws`);
+  t.after(() => ws.close());
+
+  assert.deepEqual(await inbox.next(), { type: 'ready', wsPath: '/ws' });
+
+  chat.emit('friendMessage', {
+    steamid_friend: '42',
+    message: '[sticker type="happy" limit="0"][/sticker]',
+    message_no_bbcode: 'happy',
+    ordinal: 22,
+    server_timestamp: new Date(1710000000 * 1000)
+  });
+  steamUser.emit('friendMessage', '42', 'happy');
+
+  const event = await inbox.next();
+  assert.equal(event.type, 'message');
+  assert.equal(event.id, '42');
+  assert.equal(event.name, 'Alice');
+  assert.equal(event.message, '[sticker type="happy" limit="0"][/sticker]');
+  assert.equal(event.ordinal, 22);
+  assert.equal(await inbox.nextWithin(50), null);
 });

@@ -9,6 +9,7 @@ const { CHAT_LOG_PATH } = require('../paths');
 
 const DEFAULT_LOG_PATH = CHAT_LOG_PATH;
 const MAX_HISTORY_LIMIT = 500;
+const appendQueues = new Map<string, Promise<unknown>>();
 
 function formatDate(date = new Date()) {
   const pad = (value: unknown, width = 2) => String(value).padStart(width, '0');
@@ -60,26 +61,109 @@ function steamIdToString(value: unknown): string {
 }
 
 function normalizeHistoryItem(record: HistoryRecordInput): HistoryItem {
+  const legacyImageUrl = typeof record.imageUrl === 'string' ? record.imageUrl : '';
+  const type = typeof record.type === 'string' ? record.type : (legacyImageUrl ? 'image' : 'message');
+  const message = typeof record.message === 'string' ? record.message : '';
   const item: HistoryItem = {
-    type: typeof record.type === 'string' ? record.type : (record.imageUrl ? 'image' : 'message'),
+    type,
     date: typeof record.date === 'string' ? record.date : formatDate(record.sentAt ? new Date(record.sentAt) : new Date()),
     echo: Boolean(record.echo),
     id: steamIdToString(record.id || record.steamID),
     name: typeof record.name === 'string' ? record.name : (record.echo ? 'Me' : 'Unknown'),
-    message: typeof record.message === 'string' ? record.message : '',
-    imageUrl: typeof record.imageUrl === 'string' ? record.imageUrl : null,
+    message: type === 'image' && !message && legacyImageUrl ? legacyImageUrl : message,
     ordinal: typeof record.ordinal === 'string' || typeof record.ordinal === 'number' ? record.ordinal : null
   };
   if (typeof record.sentAt === 'string') item.sentAt = record.sentAt;
   return item;
 }
 
+function numericOrdinal(value: unknown): number | null {
+  if (typeof value !== 'string' && typeof value !== 'number') return null;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function ordinalGroupKey(item: Pick<HistoryItem, 'id' | 'date' | 'sentAt' | 'ordinal'>): string {
+  return `${item.id}\0${parseMessageDate(item)}`;
+}
+
+function usedOrdinalsByGroup(items: HistoryItem[]): Map<string, Set<number>> {
+  const used = new Map<string, Set<number>>();
+  for (const item of items) {
+    const ordinal = numericOrdinal(item.ordinal);
+    if (ordinal === null) continue;
+    const key = ordinalGroupKey(item);
+    const values = used.get(key) || new Set<number>();
+    values.add(ordinal);
+    used.set(key, values);
+  }
+  return used;
+}
+
+function nextAvailableOrdinal(used: Set<number>): number {
+  let ordinal = 0;
+  while (used.has(ordinal)) ordinal += 1;
+  return ordinal;
+}
+
+function fillMissingOrdinals(items: HistoryItem[]): HistoryItem[] {
+  const used = usedOrdinalsByGroup(items);
+  for (const item of items) {
+    if (numericOrdinal(item.ordinal) !== null) continue;
+    const key = ordinalGroupKey(item);
+    const values = used.get(key) || new Set<number>();
+    const ordinal = nextAvailableOrdinal(values);
+    item.ordinal = ordinal;
+    values.add(ordinal);
+    used.set(key, values);
+  }
+  return items;
+}
+
+function nextOrdinalForAppend(existing: HistoryItem[], item: HistoryItem): number {
+  const key = ordinalGroupKey(item);
+  let max = -1;
+  for (const record of existing) {
+    if (ordinalGroupKey(record) !== key) continue;
+    const ordinal = numericOrdinal(record.ordinal);
+    if (ordinal !== null) max = Math.max(max, ordinal);
+  }
+  return max + 1;
+}
+
+function serializeHistoryLogRecord(source: HistoryRecordInput, item: HistoryItem) {
+  const record: Record<string, unknown> = {};
+  if (source.type === 'message') record.type = source.type;
+  record.date = item.date;
+  record.echo = item.echo;
+  record.id = item.id;
+  record.name = item.name;
+  record.message = item.message;
+  record.ordinal = item.ordinal;
+  return record;
+}
+
+async function appendLogNow(item: HistoryRecordInput, logPath: string): Promise<HistoryItem> {
+  const normalized = normalizeHistoryItem(item);
+  if (numericOrdinal(normalized.ordinal) === null) {
+    const existing = await readAllLogLines(logPath, { warn() {} });
+    normalized.ordinal = nextOrdinalForAppend(existing, normalized);
+  }
+  await fs.mkdir(path.dirname(logPath), { recursive: true });
+  await fs.appendFile(logPath, `${JSON.stringify(serializeHistoryLogRecord(item, normalized))}\n`, 'utf8');
+  return normalized;
+}
+
 async function appendLog(item: HistoryRecordInput, options: { logPath?: string } = {}): Promise<HistoryItem> {
   const logPath = options.logPath || DEFAULT_LOG_PATH;
-  const normalized = normalizeHistoryItem(item);
-  await fs.mkdir(path.dirname(logPath), { recursive: true });
-  await fs.appendFile(logPath, `${JSON.stringify(normalized)}\n`, 'utf8');
-  return normalized;
+  const pending = appendQueues.get(logPath) || Promise.resolve();
+  const next = pending.catch((): undefined => undefined).then(() => appendLogNow(item, logPath));
+  appendQueues.set(logPath, next);
+  try {
+    return await next;
+  } finally {
+    if (appendQueues.get(logPath) === next) appendQueues.delete(logPath);
+  }
 }
 
 async function readAllLogLines(logPath: string, logger: LoggerLike = console): Promise<HistoryItem[]> {
@@ -100,7 +184,7 @@ async function readAllLogLines(logPath: string, logger: LoggerLike = console): P
       logger.warn?.('Skipping invalid JSONL chat log line', { line: index + 1, error: errorMessage(error) });
     }
   }
-  return records;
+  return fillMissingOrdinals(records);
 }
 
 function sortHistoryItems(items: HistoryItem[]) {
@@ -152,8 +236,8 @@ function stripMarkup(message: unknown): string {
     .trim();
 }
 
-function previewForMessage(item: Pick<HistoryItem, 'type' | 'message' | 'imageUrl'>): string {
-  if (item.type === 'image' || item.imageUrl) return '[图片]';
+function previewForMessage(item: Pick<HistoryItem, 'type' | 'message'>): string {
+  if (item.type === 'image') return '[图片]';
   const stickerType = extractStickerType(item.message);
   if (stickerType) return `[贴纸] ${stickerType}`;
   const emoticon = isEmoticonOnly(item.message);

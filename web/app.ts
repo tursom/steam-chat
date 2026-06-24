@@ -47,7 +47,7 @@ type MessageItem = ListEntry & {
   date?: string;
   sentAt?: string;
   message?: string;
-  imageUrl?: string | null;
+  ordinal?: string | number | null;
 };
 
 type InventoryItem = Record<string, unknown> & {
@@ -60,7 +60,7 @@ type WsPayload = Record<string, unknown> & {
   id?: string;
   name?: string;
   message?: string;
-  imageUrl?: string | null;
+  ordinal?: string | number | null;
   echo?: boolean;
   date?: string;
   sentAt?: string;
@@ -824,8 +824,13 @@ function renderMessage(item: MessageItem) {
   const meta = create('div', 'meta');
   meta.append(create('span', '', item.name || (item.echo ? '我' : item.id)), create('span', '', formatTime(item.sentAt || item.date)));
   const content = create('div', 'message-content');
-  if (item.imageUrl) content.append(imageNode(item.imageUrl));
-  else appendMessageText(content, item.message || '');
+  const message = item.message || '';
+  if (item.type === 'image') {
+    if (isRemoteImageSource(message)) content.append(imageNode(message));
+    else appendMessageText(content, message || '[图片]');
+  } else {
+    appendMessageText(content, message);
+  }
   bubble.append(meta, content);
   row.append(bubble);
   return row;
@@ -870,6 +875,10 @@ function imageNode(sourceUrl: string) {
   image.onerror = () => shell.textContent = '图片加载失败';
   shell.addEventListener('click', () => openLightbox(image.src));
   return shell;
+}
+
+function isRemoteImageSource(value: unknown): value is string {
+  return typeof value === 'string' && /^https?:\/\//i.test(value);
 }
 
 function formatTime(value: unknown): string {
@@ -985,7 +994,7 @@ function ensureWebSocket() {
         id: String(payload.id || ''),
         name: typeof payload.name === 'string' ? payload.name : undefined,
         message: typeof payload.message === 'string' ? payload.message : undefined,
-        imageUrl: typeof payload.imageUrl === 'string' ? payload.imageUrl : null,
+        ordinal: typeof payload.ordinal === 'string' || typeof payload.ordinal === 'number' ? payload.ordinal : 0,
         echo: Boolean(payload.echo),
         date: typeof payload.date === 'string' ? payload.date : undefined,
         sentAt: typeof payload.sentAt === 'string' ? payload.sentAt : undefined

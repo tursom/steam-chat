@@ -48,7 +48,6 @@ export type HistoryRecordInput = UnknownRecord & {
   steamID?: string | number | SteamIdLike;
   name?: string;
   message?: string;
-  imageUrl?: string | null;
   ordinal?: string | number | null;
   sentAt?: string;
 };
@@ -60,7 +59,6 @@ export type HistoryItem = {
   id: string;
   name: string;
   message: string;
-  imageUrl: string | null;
   ordinal: number | string | null;
   sentAt?: string;
 };
