@@ -16,23 +16,32 @@ docker compose up -d --build
 
 需要新增或调整：
 
-- `compose.yaml`
+- `docker-compose.yaml`
 - `.env.example`
 - `Dockerfile`
 - `.dockerignore`
 - `.gitignore`
+- `.github/workflows/docker-publish.yml`
 - 后台改造文档中约定的数据目录和健康检查接口
 
-Compose 文件使用本地源码构建镜像，同时设置固定镜像名，避免只有 `image` 而没有 `build` 时 `docker compose up --build` 仍尝试拉取远端镜像。
+GitHub Actions 在 `master` 分支、`v*.*.*` 标签和手动触发时构建 Docker 镜像；非 PR 事件会推送到 GitHub Container Registry。
+
+默认镜像名：
+
+```text
+ghcr.io/tursom/steam-chat:latest
+```
+
+Compose 文件保留本地源码构建能力，同时设置固定 GHCR 镜像名，避免只有 `image` 而没有 `build` 时 `docker compose up --build` 仍尝试拉取远端镜像。
 
 ## Compose 服务定义
 
-目标 `compose.yaml`：
+目标 `docker-compose.yaml`：
 
 ```yaml
 services:
   steam-chat:
-    image: ${STEAM_CHAT_IMAGE:-steam-chat:latest}
+    image: ${STEAM_CHAT_IMAGE:-ghcr.io/tursom/steam-chat:latest}
     build:
       context: .
       dockerfile: Dockerfile
@@ -85,7 +94,7 @@ sudo chown -R 1000:1000 data
 `.env.example`：
 
 ```dotenv
-STEAM_CHAT_IMAGE=steam-chat:latest
+STEAM_CHAT_IMAGE=ghcr.io/tursom/steam-chat:latest
 STEAM_CHAT_CONTAINER_NAME=steam-chat
 STEAM_CHAT_BIND=0.0.0.0
 STEAM_CHAT_PORT=3000
@@ -207,8 +216,15 @@ http://服务器地址:3000
 
 ```bash
 git pull
-docker compose up -d --build
+docker compose pull
+docker compose up -d
 docker compose ps
+```
+
+如果要在服务器上用当前源码重新构建，而不是拉取 GHCR 镜像，继续使用：
+
+```bash
+docker compose up -d --build
 ```
 
 查看日志：
@@ -309,4 +325,3 @@ curl -fsS http://127.0.0.1:${STEAM_CHAT_PORT:-3000}/healthz
 npm run typecheck
 npm test
 ```
-

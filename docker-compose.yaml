@@ -1,6 +1,6 @@
 services:
   steam-chat:
-    image: ${STEAM_CHAT_IMAGE:-steam-chat:latest}
+    image: ${STEAM_CHAT_IMAGE:-ghcr.io/tursom/steam-chat:latest}
     build:
       context: .
       dockerfile: Dockerfile
