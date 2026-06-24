@@ -51,9 +51,11 @@ type SteamUserLifecycleLike = {
     (event: 'loggedOn', listener: () => void): void;
     (event: 'webSession', listener: (sessionID: string, cookies: string[]) => void): void;
     (event: 'refreshToken', listener: (refreshToken: string) => void): void;
+    (event: 'steamGuard', listener: (domain: string | null, callback: (code: string) => void, lastCodeWrong: boolean) => void): void;
     (event: 'error', listener: (error: unknown) => void): void;
     (event: 'disconnected', listener: (eresult: unknown, message?: string) => void): void;
   };
+  steamID?: unknown;
   logOn: (options: LogOnOptions) => void;
   webLogOn: () => void;
   setPersona?: (state: number) => void;
@@ -74,6 +76,34 @@ type SteamLifecycleOptions = {
   refreshTokenPath?: string;
   fileSystem?: RefreshTokenFileSystem;
   timers?: TimerApi;
+};
+
+type SteamStatus = 'logged_out' | 'logging_in' | 'waiting_guard' | 'online' | 'error' | 'reconnecting';
+
+type SteamGuardInfo = {
+  guardType: 'email' | 'device';
+  domain: string | null;
+  lastCodeWrong: boolean;
+};
+
+type SteamStatusSummary = {
+  status: SteamStatus;
+  requiresGuard: boolean;
+  guardType: 'email' | 'device' | null;
+  domain: string | null;
+  lastCodeWrong: boolean;
+  error: string | null;
+  steamId: string | null;
+};
+
+type SteamLoginRequest = {
+  accountName?: unknown;
+  password?: unknown;
+  logonID?: unknown;
+};
+
+type SteamLoginServiceOptions = SteamLifecycleOptions & {
+  getDefaultLogonID?: () => number;
 };
 
 function createDeferred<T = unknown>(): Deferred<T> {
@@ -139,6 +169,34 @@ function readRefreshToken(refreshTokenPath: string, fileSystem: RefreshTokenFile
     }
     return null;
   }
+}
+
+function deleteRefreshToken(refreshTokenPath: string) {
+  try {
+    fs.unlinkSync(refreshTokenPath);
+  } catch (error) {
+    if (!isRecord(error) || error.code !== 'ENOENT') throw error;
+  }
+}
+
+function steamIdToText(value: unknown): string | null {
+  if (!value) return null;
+  if (isRecord(value) && typeof value.getSteamID64 === 'function') return String(value.getSteamID64.call(value));
+  if (isRecord(value) && value.steamid) return String(value.steamid);
+  return String(value);
+}
+
+function steamUnavailableError(status: SteamStatus) {
+  return Object.assign(new Error('Steam is not logged in'), {
+    statusCode: 503,
+    steamStatus: status
+  });
+}
+
+function createHandledDeferred<T = unknown>(): Deferred<T> {
+  const deferred = createDeferred<T>();
+  deferred.promise.catch(() => {});
+  return deferred;
 }
 
 function buildLogOnOptions(config: SteamLifecycleConfig, refreshTokenPath: string, fileSystem: RefreshTokenFileSystem = fs): LogOnOptions {
@@ -306,13 +364,296 @@ function createSteamLifecycle(options: SteamLifecycleOptions) {
   };
 }
 
+function createSteamLoginService(options: SteamLoginServiceOptions) {
+  const {
+    steamUser,
+    steamCommunity,
+    config = {},
+    logger = console,
+    refreshTokenPath = DEFAULT_REFRESH_TOKEN_PATH,
+    fileSystem = fs,
+    timers = { setTimeout, clearTimeout },
+    getDefaultLogonID
+  } = options;
+
+  if (!steamUser) {
+    throw new Error('steamUser is required');
+  }
+
+  let status: SteamStatus = 'logged_out';
+  let lastError: string | null = null;
+  let guard: SteamGuardInfo | null = null;
+  let pendingGuardCallback: ((code: string) => void) | null = null;
+  let loginDeferred = createHandledDeferred<boolean>();
+  let webDeferred = createHandledDeferred<WebSession>();
+  let retryTimer: TimerHandle | null = null;
+  let retryDelayMs = INITIAL_RETRY_DELAY_MS;
+  let latestWebSession: WebSession | null = null;
+  let stopped = false;
+  let manualLogoff = false;
+  let steamId: string | null = null;
+
+  function log(level: 'info' | 'warn' | 'error', message: string, meta?: unknown) {
+    const method = logger[level] || logger.log || (() => {});
+    method.call(logger, message, meta);
+  }
+
+  function resetDeferreds() {
+    loginDeferred = createHandledDeferred<boolean>();
+    webDeferred = createHandledDeferred<WebSession>();
+  }
+
+  function clearRetryTimer() {
+    if (retryTimer) {
+      timers.clearTimeout(retryTimer);
+      retryTimer = null;
+    }
+  }
+
+  function baseLoginOptions(): LogOnOptions {
+    const base: LogOnOptions = {};
+    if (config.steamID) base.steamID = config.steamID;
+    return base;
+  }
+
+  function beginLogin(logOnOptions: LogOnOptions, label: string) {
+    clearRetryTimer();
+    resetDeferreds();
+    status = 'logging_in';
+    guard = null;
+    pendingGuardCallback = null;
+    lastError = null;
+    try {
+      log('info', `Logging on Steam with ${label}`);
+      steamUser.logOn(logOnOptions);
+    } catch (error) {
+      handleLoginFailure(error);
+    }
+    return loginDeferred.promise;
+  }
+
+  function tryTokenLogin(nextStatus: SteamStatus = 'logging_in'): Promise<boolean> {
+    const refreshToken = readRefreshToken(refreshTokenPath, fileSystem);
+    if (!refreshToken) {
+      status = 'logged_out';
+      guard = null;
+      pendingGuardCallback = null;
+      return Promise.resolve(false);
+    }
+    status = nextStatus;
+    const logOnOptions = { ...baseLoginOptions(), refreshToken };
+    return beginLogin(logOnOptions, 'refresh token');
+  }
+
+  function scheduleReconnect(reason: unknown) {
+    if (stopped || retryTimer) return;
+    const refreshToken = readRefreshToken(refreshTokenPath, fileSystem);
+    if (!refreshToken) {
+      status = 'logged_out';
+      return;
+    }
+    status = 'reconnecting';
+    lastError = errorMessage(reason);
+    const delay = retryDelayMs;
+    retryDelayMs = Math.min(retryDelayMs * 2, MAX_RETRY_DELAY_MS);
+    log('warn', `Steam reconnect scheduled in ${delay} ms`, { reason: errorMessage(reason) });
+    retryTimer = timers.setTimeout(() => {
+      retryTimer = null;
+      tryTokenLogin('reconnecting').catch(() => {});
+    }, delay);
+  }
+
+  function handleLoginFailure(error: unknown) {
+    if (stopped) return;
+    lastError = errorMessage(error);
+    guard = null;
+    pendingGuardCallback = null;
+    if (isRecoverableLoginError(error)) {
+      scheduleReconnect(error);
+      return;
+    }
+    status = 'error';
+    log('error', 'Steam login failed', { error: lastError });
+    loginDeferred.reject(error);
+    webDeferred.reject(error);
+  }
+
+  function refreshWebSession(): Promise<WebSession> {
+    if (stopped) return Promise.reject(new Error('Steam login service is stopped'));
+    webDeferred = createHandledDeferred<WebSession>();
+    try {
+      steamUser.webLogOn();
+    } catch (error) {
+      webDeferred.reject(error);
+    }
+    return webDeferred.promise;
+  }
+
+  steamUser.on('steamGuard', (domain: string | null, callback: (code: string) => void, lastCodeWrong: boolean) => {
+    status = 'waiting_guard';
+    guard = {
+      guardType: typeof domain === 'string' ? 'email' : 'device',
+      domain: typeof domain === 'string' ? domain : null,
+      lastCodeWrong: Boolean(lastCodeWrong)
+    };
+    pendingGuardCallback = callback;
+    lastError = lastCodeWrong ? 'Steam Guard code was rejected' : null;
+  });
+
+  steamUser.on('loggedOn', () => {
+    clearRetryTimer();
+    retryDelayMs = INITIAL_RETRY_DELAY_MS;
+    status = 'online';
+    guard = null;
+    pendingGuardCallback = null;
+    lastError = null;
+    steamId = steamIdToText(steamUser.steamID);
+    loginDeferred.resolve(true);
+    log('info', 'Steam logged on');
+    try {
+      steamUser.setPersona?.(steamUser.EPersonaState?.Online || 1);
+    } catch (_) {
+      // setPersona is optional and not important enough to break runtime login.
+    }
+    refreshWebSession().catch((error: unknown) => {
+      log('warn', 'Steam webLogOn failed after login', { error: errorMessage(error) });
+    });
+  });
+
+  steamUser.on('webSession', (sessionID: string, cookies: string[]) => {
+    latestWebSession = { sessionID, cookies };
+    if (steamCommunity && typeof steamCommunity.setCookies === 'function') {
+      steamCommunity.setCookies(cookies);
+    }
+    if (steamCommunity && config.identitySecret && typeof steamCommunity.startConfirmationChecker === 'function') {
+      steamCommunity.startConfirmationChecker(10 * 1000, config.identitySecret);
+    }
+    webDeferred.resolve(latestWebSession);
+  });
+
+  steamUser.on('refreshToken', (refreshToken: string) => {
+    if (!refreshToken) return;
+    fileSystem.mkdirSync(path.dirname(refreshTokenPath), { recursive: true });
+    fileSystem.writeFileSync(refreshTokenPath, `${refreshToken}\n`, 'utf8');
+    log('info', 'Steam refresh token saved');
+  });
+
+  steamUser.on('error', handleLoginFailure);
+
+  steamUser.on('disconnected', (eresult: unknown, message?: string) => {
+    if (manualLogoff) {
+      manualLogoff = false;
+      return;
+    }
+    const error = new Error(message || `Steam disconnected: ${eresult || 'unknown'}`);
+    if (status === 'online' || status === 'reconnecting') {
+      scheduleReconnect(error);
+      return;
+    }
+    handleLoginFailure(error);
+  });
+
+  function getStatus(): SteamStatusSummary {
+    return {
+      status,
+      requiresGuard: status === 'waiting_guard',
+      guardType: guard?.guardType || null,
+      domain: guard?.domain || null,
+      lastCodeWrong: Boolean(guard?.lastCodeWrong),
+      error: lastError,
+      steamId
+    };
+  }
+
+  return {
+    start() {
+      stopped = false;
+      return tryTokenLogin();
+    },
+    stop() {
+      stopped = true;
+      clearRetryTimer();
+      if (typeof steamUser.logOff === 'function') steamUser.logOff();
+    },
+    login(input: SteamLoginRequest) {
+      if (status === 'logging_in' || status === 'waiting_guard' || status === 'reconnecting' || status === 'online') {
+        throw Object.assign(new Error('Steam login is already active'), { statusCode: 409 });
+      }
+      const accountName = String(input.accountName || '').trim();
+      const password = String(input.password || '');
+      if (!accountName || !password) {
+        throw Object.assign(new Error('accountName and password are required'), { statusCode: 400 });
+      }
+      const parsedLogonID = Number(input.logonID);
+      const logonID = Number.isFinite(parsedLogonID) && parsedLogonID > 0
+        ? Math.floor(parsedLogonID)
+        : getDefaultLogonID?.();
+      const optionsForLogin: LogOnOptions = {
+        ...baseLoginOptions(),
+        accountName,
+        password
+      };
+      if (logonID) optionsForLogin.logonID = logonID;
+      beginLogin(optionsForLogin, 'account credentials').catch(() => {});
+      return getStatus();
+    },
+    submitGuard(code: unknown) {
+      const value = String(code || '').trim();
+      if (!value) throw Object.assign(new Error('Steam Guard code is required'), { statusCode: 400 });
+      if (status !== 'waiting_guard' || !pendingGuardCallback) {
+        throw Object.assign(new Error('Steam Guard is not pending'), { statusCode: 409 });
+      }
+      const callback = pendingGuardCallback;
+      pendingGuardCallback = null;
+      guard = null;
+      lastError = null;
+      status = 'logging_in';
+      callback(value);
+      return getStatus();
+    },
+    logout() {
+      clearRetryTimer();
+      manualLogoff = true;
+      guard = null;
+      pendingGuardCallback = null;
+      latestWebSession = null;
+      steamId = null;
+      lastError = null;
+      status = 'logged_out';
+      resetDeferreds();
+      deleteRefreshToken(refreshTokenPath);
+      if (typeof steamUser.logOff === 'function') steamUser.logOff();
+      return getStatus();
+    },
+    ensureOnline() {
+      if (status !== 'online') throw steamUnavailableError(status);
+    },
+    waitForLogin() {
+      return status === 'online' ? Promise.resolve(true) : loginDeferred.promise;
+    },
+    waitForWebSession() {
+      return latestWebSession ? Promise.resolve(latestWebSession) : webDeferred.promise;
+    },
+    refreshWebSession,
+    getLatestWebSession() {
+      return latestWebSession;
+    },
+    getStatus,
+    getRetryDelayMs() {
+      return retryDelayMs;
+    }
+  };
+}
+
 module.exports = {
   DEFAULT_REFRESH_TOKEN_PATH,
   INITIAL_RETRY_DELAY_MS,
   MAX_RETRY_DELAY_MS,
   buildLogOnOptions,
   createDeferred,
+  createSteamLoginService,
   createSteamLifecycle,
+  deleteRefreshToken,
   isRecoverableLoginError,
   isUnrecoverableLoginError,
   readRefreshToken
