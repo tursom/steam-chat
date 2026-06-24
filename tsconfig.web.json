@@ -1,17 +1,15 @@
 {
   "compilerOptions": {
     "target": "ES2022",
-    "module": "Node16",
-    "moduleResolution": "Node16",
-    "rootDir": ".",
-    "outDir": "dist",
+    "module": "ES2022",
+    "rootDir": "web",
+    "outDir": "dist/web",
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
-    "types": ["node"],
-    "esModuleInterop": true,
+    "types": [],
     "forceConsistentCasingInFileNames": true,
     "skipLibCheck": true,
     "noImplicitAny": true,
     "strict": false
   },
-  "include": ["src/**/*.ts", "test/**/*.ts"]
+  "include": ["web/**/*.ts"]
 }
