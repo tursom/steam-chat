@@ -106,7 +106,7 @@ const state: AppState = {
   me: null,
   needsSetup: false,
   steam: defaultSteamStatus,
-  view: (localStorage.getItem('steam-chat.view') as View) || 'steam',
+  view: normalizeView(localStorage.getItem('steam-chat.view')),
   users: [],
   conversations: [],
   friends: [],
@@ -149,6 +149,11 @@ function clampLimit(value: unknown): number {
   return Math.min(parsed, 500);
 }
 
+function normalizeView(value: unknown): View {
+  const view = String(value || '');
+  return view === 'steam' || view === 'chat' || view === 'users' || view === 'account' ? view : 'steam';
+}
+
 function asListEntries(value: unknown): ListEntry[] {
   return Array.isArray(value) ? value.filter(isRecord).map((item) => ({ ...item, id: String(item.id || '') })) : [];
 }
@@ -187,6 +192,18 @@ function steamOnline() {
   return state.steam.status === 'online';
 }
 
+function steamStatusSignature(status = state.steam) {
+  return [
+    status.status,
+    status.requiresGuard,
+    status.guardType || '',
+    status.domain || '',
+    status.lastCodeWrong,
+    status.error || '',
+    status.steamId || ''
+  ].join('|');
+}
+
 function updateSteamStatus(status: SteamStatus) {
   state.steam = { ...defaultSteamStatus, ...status };
   const badge = document.querySelector<HTMLElement>('#steamBadge');
@@ -196,6 +213,8 @@ function updateSteamStatus(status: SteamStatus) {
   }
   const hint = document.querySelector<HTMLElement>('#steamHint');
   if (hint) hint.textContent = state.steam.error || (state.steam.steamId ? `SteamID ${state.steam.steamId}` : '后台服务已启动');
+  const subtitle = document.querySelector<HTMLElement>('#pageSubtitle');
+  if (subtitle) subtitle.textContent = pageSubtitle();
   updateChatAvailability();
 }
 
@@ -323,7 +342,10 @@ function renderShell() {
   const main = create('main', 'workspace');
   const top = create('header', 'topbar');
   const title = create('div');
-  title.append(create('h1', '', pageTitle()), create('p', 'muted', pageSubtitle()));
+  const heading = create('h1', '', pageTitle());
+  const subtitle = create('p', 'muted', pageSubtitle());
+  subtitle.id = 'pageSubtitle';
+  title.append(heading, subtitle);
   const status = create('div', 'top-actions');
   const badge = create('span', 'steam-badge', steamLabel());
   badge.id = 'steamBadge';
@@ -388,10 +410,15 @@ function renderSteamView() {
     const guardText = state.steam.guardType === 'email'
       ? `邮箱验证码${state.steam.domain ? `：${state.steam.domain}` : ''}`
       : '手机 2FA 验证码';
-    guardForm.innerHTML = `
-      <label>${guardText}<input name="code" autocomplete="one-time-code" required></label>
-      <button type="submit">提交验证</button>
-    `;
+    const codeLabel = create('label', '', guardText);
+    const codeInput = create('input') as HTMLInputElement;
+    codeInput.name = 'code';
+    codeInput.autocomplete = 'one-time-code';
+    codeInput.required = true;
+    const submit = create('button', '', '提交验证');
+    submit.type = 'submit';
+    codeLabel.append(codeInput);
+    guardForm.append(codeLabel, submit);
     if (state.steam.lastCodeWrong) guardForm.prepend(create('p', 'warn-text', '上一次验证码被拒绝，请等待新的验证码后再提交。'));
     guardForm.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -581,16 +608,22 @@ function renderChatView() {
   const view = create('div', 'chat-layout');
   const lists = create('aside', 'chat-lists');
   const openForm = create('form', 'open-chat-form') as HTMLFormElement;
-  openForm.innerHTML = `
-    <input name="target" inputmode="numeric" autocomplete="off" placeholder="SteamID64" value="${state.activeId}">
-    <button type="submit">打开</button>
-  `;
+  const targetInput = create('input') as HTMLInputElement;
+  targetInput.name = 'target';
+  targetInput.inputMode = 'numeric';
+  targetInput.autocomplete = 'off';
+  targetInput.placeholder = 'SteamID64';
+  targetInput.value = state.activeId;
+  const openButton = create('button', '', '打开');
+  openButton.type = 'submit';
+  openForm.append(targetInput, openButton);
   openForm.addEventListener('submit', (event) => {
     event.preventDefault();
     openConversation(formValue(openForm, 'target'));
   });
   const tabs = create('div', 'list-sections');
-  tabs.append(renderListSection('最近', state.conversations), renderListSection('好友', state.friends), renderListSection('群组', state.groups));
+  tabs.id = 'chatListSections';
+  renderChatListSections(tabs);
   lists.append(openForm, tabs);
 
   const thread = create('section', 'thread');
@@ -607,6 +640,16 @@ function renderChatView() {
     updateChatAvailability();
   }, 0);
   return view;
+}
+
+function renderChatListSections(container: HTMLElement) {
+  clear(container);
+  container.append(renderListSection('最近', state.conversations), renderListSection('好友', state.friends), renderListSection('群组', state.groups));
+}
+
+function updateChatLists() {
+  const tabs = document.querySelector<HTMLElement>('#chatListSections');
+  if (tabs) renderChatListSections(tabs);
 }
 
 function renderListSection(title: string, items: ListEntry[]) {
@@ -727,7 +770,10 @@ async function refreshChatData() {
       state.emoticons = [];
       state.stickers = [];
     }
-    if (state.view === 'chat') renderShell();
+    if (state.view === 'chat') {
+      updateChatLists();
+      updateChatAvailability();
+    }
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
@@ -974,8 +1020,13 @@ function startStatusPolling() {
   state.statusTimer = setInterval(async () => {
     try {
       const status = await api('/api/steam/status');
+      const previousSignature = steamStatusSignature();
       const wasOnline = steamOnline();
       updateSteamStatus(status as SteamStatus);
+      if (state.view === 'steam' && steamStatusSignature() !== previousSignature) {
+        renderShell();
+        return;
+      }
       if (state.view === 'chat' && steamOnline() !== wasOnline) await refreshChatData();
     } catch (_) {
       // Authentication errors are handled by api().
@@ -1009,7 +1060,11 @@ async function bootstrap() {
     renderLogin();
     return;
   }
-  const config = await api('/api/config').catch(() => ({ wsPath: '/ws' }));
+  const [status, config] = await Promise.all([
+    api('/api/steam/status').catch((): SteamStatus => state.steam),
+    api('/api/config').catch(() => ({ wsPath: '/ws' }))
+  ]);
+  if (isRecord(status)) updateSteamStatus(status as SteamStatus);
   if (isRecord(config) && typeof config.wsPath === 'string') state.wsPath = config.wsPath;
   renderShell();
 }
