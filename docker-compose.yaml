@@ -16,7 +16,7 @@ services:
       STEAM_CHAT_PORT: 3000
       STEAM_CHAT_WS_PATH: /ws
     volumes:
-      - steam-chat-data:/app/data
+      - ./data:/app/data
     healthcheck:
       test:
         - CMD
@@ -27,6 +27,3 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-
-volumes:
-  steam-chat-data:

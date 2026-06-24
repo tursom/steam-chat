@@ -5,7 +5,7 @@ WORKDIR /app
 COPY package.json package-lock.json ./
 RUN npm ci
 
-COPY tsconfig.json config.example.js ./
+COPY tsconfig.json tsconfig.web.json config.example.js ./
 COPY src ./src
 COPY web ./web
 
@@ -26,9 +26,11 @@ RUN mkdir -p /app/data \
 COPY --from=build --chown=node:node /app/package.json /app/package-lock.json ./
 COPY --from=build --chown=node:node /app/node_modules ./node_modules
 COPY --from=build --chown=node:node /app/dist ./dist
+COPY docker-entrypoint.sh /usr/local/bin/steam-chat-entrypoint
 
-USER node
+RUN chmod +x /usr/local/bin/steam-chat-entrypoint
 
 EXPOSE 3000
 
+ENTRYPOINT ["steam-chat-entrypoint"]
 CMD ["node", "dist/src/index.js"]
