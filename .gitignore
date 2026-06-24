@@ -8,10 +8,12 @@ config.js
 # Logs
 logs/
 *.log
+data/
 
 # Auth / Secrets
 session.json
 refresh.token
+auth.sqlite
 
 # Build
 dist/

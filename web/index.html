@@ -3,98 +3,16 @@
   <head>
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-    <title>Steam Chat</title>
+    <title>Steam Chat Admin</title>
     <link rel="stylesheet" href="/style.css">
   </head>
   <body>
-    <div class="shell">
-      <aside id="sidebar" class="sidebar">
-        <header class="side-head">
-          <div>
-            <h1>Steam Chat</h1>
-            <p id="connectionText">连接中</p>
-          </div>
-          <button id="closeSidebar" class="icon-btn" type="button" title="关闭侧栏">×</button>
-        </header>
-
-        <form id="openForm" class="open-form">
-          <input id="targetInput" inputmode="numeric" autocomplete="off" placeholder="SteamID64">
-          <button type="submit">打开</button>
-        </form>
-
-        <div class="side-tools">
-          <label>历史 <input id="historyLimit" type="number" min="1" max="500" step="10"></label>
-          <button id="refreshAll" type="button">刷新</button>
-        </div>
-
-        <div class="tabs" role="tablist">
-          <button class="is-active" type="button" data-tab="conversations">最近</button>
-          <button type="button" data-tab="friends">好友</button>
-          <button type="button" data-tab="groups">群组</button>
-        </div>
-
-        <section class="panel is-active" data-panel="conversations">
-          <div id="conversationList" class="list"></div>
-        </section>
-        <section class="panel" data-panel="friends">
-          <div id="friendList" class="list"></div>
-        </section>
-        <section class="panel" data-panel="groups">
-          <div id="groupList" class="list"></div>
-        </section>
-      </aside>
-
-      <div id="backdrop" class="backdrop"></div>
-
-      <main class="chat">
-        <header class="chat-head">
-          <button id="openSidebar" class="icon-btn menu-btn" type="button" title="打开侧栏">☰</button>
-          <div class="chat-title">
-            <h2 id="chatTitle">未选择会话</h2>
-            <p id="chatSubtitle">选择好友、群组或输入 SteamID64</p>
-          </div>
-          <div id="feedback" class="feedback">就绪</div>
-        </header>
-
-        <section id="messages" class="messages" aria-live="polite"></section>
-
-        <footer class="composer">
-          <div id="uploadTray" class="upload-tray"></div>
-          <div id="picker" class="picker" hidden>
-            <div class="picker-head">
-              <button class="is-active" type="button" data-picker="emoticons">表情</button>
-              <button type="button" data-picker="stickers">贴纸</button>
-              <input id="pickerSearch" type="search" placeholder="搜索">
-            </div>
-            <div id="pickerGrid" class="picker-grid"></div>
-          </div>
-          <div id="autocomplete" class="autocomplete" hidden></div>
-          <div class="compose-row">
-            <button id="pickerToggle" class="icon-btn" type="button" title="表情和贴纸">☺</button>
-            <button id="fileButton" class="icon-btn" type="button" title="选择图片">＋</button>
-            <input id="fileInput" type="file" accept="image/*" multiple hidden>
-            <textarea id="messageInput" rows="1" placeholder="发送消息"></textarea>
-            <button id="sendButton" type="button">发送</button>
-          </div>
-          <form id="imageUrlForm" class="url-row">
-            <input id="imageUrlInput" type="url" placeholder="图片 URL">
-            <button type="submit">发送图片</button>
-          </form>
-        </footer>
-      </main>
-    </div>
-
+    <div id="app"></div>
     <div id="dropOverlay" class="drop-overlay">释放发送图片</div>
     <div id="lightbox" class="lightbox" hidden>
-      <button id="lightboxClose" class="icon-btn lightbox-close" type="button" title="关闭">×</button>
-      <div class="lightbox-tools">
-        <button id="zoomOut" type="button">-</button>
-        <button id="zoomReset" type="button">100%</button>
-        <button id="zoomIn" type="button">+</button>
-      </div>
+      <button id="lightboxClose" class="icon-btn lightbox-close" type="button" title="关闭">x</button>
       <img id="lightboxImage" alt="">
     </div>
-
     <script type="module" src="/app.js"></script>
   </body>
 </html>

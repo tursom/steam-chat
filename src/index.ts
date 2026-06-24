@@ -5,10 +5,12 @@ import { errorMessage, isRecord } from './types';
 
 const winston = require('winston');
 
-const { loadConfig, isChatEnabled } = require('./config/load');
-const { REFRESH_TOKEN_PATH } = require('./paths');
+const { createAuthStore } = require('./auth/store');
+const { createSessionManager } = require('./auth/session');
+const { loadConfig } = require('./config/load');
+const { AUTH_DB_PATH, REFRESH_TOKEN_PATH } = require('./paths');
 const { createChatService } = require('./server/chat-service');
-const { createSteamLifecycle } = require('./steam/lifecycle');
+const { createSteamLoginService } = require('./steam/lifecycle');
 const {
   steamIdToString
 } = require('./storage/chat-log');
@@ -66,6 +68,8 @@ const config = loadConfig();
 const steamUser = new SteamUser({ renewRefreshTokens: true });
 const steamCommunity = new SteamCommunity();
 const users: Record<string, Persona> = {};
+const authStore = createAuthStore({ dbPath: AUTH_DB_PATH });
+const sessionManager = createSessionManager({ store: authStore });
 
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
@@ -122,12 +126,16 @@ async function getSelfName() {
   return info.player_name || info.personaName || 'Me';
 }
 
-const lifecycle = createSteamLifecycle({
+const lifecycle = createSteamLoginService({
   steamUser,
   steamCommunity,
-  config,
+  config: {
+    steamID: typeof config.steamID === 'string' ? config.steamID : undefined,
+    identitySecret: typeof config.identitySecret === 'string' ? config.identitySecret : undefined
+  },
   logger,
-  refreshTokenPath: REFRESH_TOKEN_PATH
+  refreshTokenPath: REFRESH_TOKEN_PATH,
+  getDefaultLogonID: authStore.getOrCreateSteamLogonID
 });
 
 createSteamMessageLogger({
@@ -142,39 +150,45 @@ let steamWebLoginPromise = lifecycle.waitForWebSession();
 let chatService: ChatServiceRuntime | null = null;
 
 function start() {
-  steamLoginPromise = lifecycle.start();
+  const tokenLoginPromise = lifecycle.start().catch((error: unknown) => {
+    logger.warn('Steam token login failed', { error: errorMessage(error) });
+    return false;
+  });
+  steamLoginPromise = lifecycle.waitForLogin();
   steamWebLoginPromise = lifecycle.waitForWebSession();
-  if (isChatEnabled(config.chat)) {
-    chatService = createChatService({
-      config,
-      steamUser,
-      steamCommunity,
-      logger,
-      getUserInfo,
-      getSelfName,
-      waitForLogin: steamLoginPromise,
-      waitForWebSession: steamWebLoginPromise,
-      refreshWebSession: lifecycle.refreshWebSession
-    });
-    chatService.start();
-  }
-  return steamLoginPromise;
+  chatService = createChatService({
+    config,
+    steamUser,
+    steamCommunity,
+    logger,
+    getUserInfo,
+    getSelfName,
+    waitForLogin: () => lifecycle.waitForLogin(),
+    waitForWebSession: () => lifecycle.waitForWebSession(),
+    refreshWebSession: lifecycle.refreshWebSession,
+    authStore,
+    sessionManager,
+    steamLoginService: lifecycle
+  });
+  chatService.start();
+  return tokenLoginPromise;
 }
 
 if (process.env.STEAM_CHAT_DISABLE_AUTOSTART !== '1') {
   start().catch((error: unknown) => {
     logger.error('Steam startup failed', { error: errorMessage(error) });
-    process.exitCode = 1;
   });
 }
 
 module.exports = {
+  authStore,
   chatService,
   config,
   getSelfName,
   getUserInfo,
   lifecycle,
   logger,
+  sessionManager,
   start,
   steamCommunity,
   steamLoginPromise,

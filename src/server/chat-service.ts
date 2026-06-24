@@ -3,6 +3,8 @@
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
 import type { RawData, WebSocket as WsConnection, WebSocketServer as WsServer } from 'ws';
+import type { AppSession } from '../auth/session';
+import type { PublicUser } from '../auth/store';
 import type {
   AuthConfig,
   CallbackStyleFunction,
@@ -97,6 +99,47 @@ type ChatServiceOptions = {
   getEmoticons?: (options: GetEmoticonsOptions) => Promise<EmoticonPayload>;
   fetchImpl?: typeof fetch;
   server?: Server;
+  authStore?: AuthStoreLike;
+  sessionManager?: SessionManagerLike;
+  steamLoginService?: SteamLoginServiceLike;
+};
+
+type AuthStoreLike = {
+  authenticate: (username: unknown, password: unknown) => PublicUser | null;
+  changeOwnPassword: (id: unknown, oldPassword: unknown, newPassword: unknown) => PublicUser;
+  createInitialAdmin: (input: UnknownRecord) => PublicUser;
+  createUser: (input: UnknownRecord) => PublicUser;
+  deleteUser: (id: unknown, currentUserId: unknown) => void;
+  listUsers: () => PublicUser[];
+  requiresSetup: () => boolean;
+  setPassword: (id: unknown, password: unknown) => PublicUser;
+  updateUser: (id: unknown, patch: UnknownRecord) => PublicUser;
+};
+
+type SessionManagerLike = {
+  createClearCookie: (req?: IncomingMessage) => string;
+  createSetCookie: (user: PublicUser, req?: IncomingMessage) => string;
+  getSession: (req: IncomingMessage) => AppSession | null;
+  requireAdmin: (req: IncomingMessage) => AppSession;
+  requireSession: (req: IncomingMessage) => AppSession;
+};
+
+type SteamStatusSummary = {
+  status: string;
+  requiresGuard?: boolean;
+  guardType?: string | null;
+  domain?: string | null;
+  lastCodeWrong?: boolean;
+  error?: string | null;
+  steamId?: string | null;
+};
+
+type SteamLoginServiceLike = {
+  ensureOnline: () => void;
+  getStatus: () => SteamStatusSummary;
+  login: (input: UnknownRecord) => SteamStatusSummary;
+  logout: () => SteamStatusSummary;
+  submitGuard: (code: unknown) => SteamStatusSummary;
 };
 
 type WsPayload = UnknownRecord & {
@@ -196,6 +239,16 @@ function jsonResponse(res: ServerResponse, statusCode: number, payload: unknown,
   res.end(JSON.stringify(payload));
 }
 
+function errorPayload(error: unknown): UnknownRecord {
+  const payload: UnknownRecord = {
+    error: errorMessage(error) || 'Internal Server Error'
+  };
+  if (isRecord(error) && typeof error.steamStatus === 'string') {
+    payload.steamStatus = error.steamStatus;
+  }
+  return payload;
+}
+
 function textResponse(res: ServerResponse, statusCode: number, payload: string | Buffer, headers: Record<string, string> = {}) {
   res.writeHead(statusCode, headers);
   res.end(payload);
@@ -250,6 +303,14 @@ function staticFileForUrl(pathname: string) {
     return null;
   }
   return filePath;
+}
+
+function isStaticRequest(pathname: string) {
+  return pathname === '/'
+    || pathname === '/index.html'
+    || pathname === '/style.css'
+    || pathname === '/app.js'
+    || pathname === '/favicon.ico';
 }
 
 async function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: string) {
@@ -342,7 +403,10 @@ function createChatService(options: ChatServiceOptions = {}) {
   const getSelfName = options.getSelfName || (async () => 'Me');
   const getEmoticons = options.getEmoticons || defaultGetEmoticons;
   const fetchImpl = options.fetchImpl;
-  const auth = createAuthChecker(config.auth);
+  const authStore = options.authStore;
+  const sessionManager = options.sessionManager;
+  const steamLoginService = options.steamLoginService;
+  const legacyAuth = createAuthChecker(config.auth);
   const clients = new Set<WsConnection>();
   const recentSentText = new Map<string, number>();
   const recentSentImages = new Map<string, number>();
@@ -365,7 +429,175 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
   }
 
+  function currentSteamStatus(): SteamStatusSummary {
+    return steamLoginService?.getStatus?.() || {
+      status: 'online',
+      requiresGuard: false,
+      guardType: null,
+      domain: null,
+      lastCodeWrong: false,
+      error: null,
+      steamId: null
+    };
+  }
+
+  function requireLegacyOrSession(req: IncomingMessage): AppSession | null {
+    if (sessionManager) return sessionManager.requireSession(req);
+    if (!legacyAuth.isAuthorized(req)) throw Object.assign(new Error('Unauthorized'), { statusCode: 401, legacyChallenge: true });
+    return null;
+  }
+
+  function requireAdminSession(req: IncomingMessage): AppSession | null {
+    if (sessionManager) return sessionManager.requireAdmin(req);
+    if (!legacyAuth.isAuthorized(req)) throw Object.assign(new Error('Unauthorized'), { statusCode: 401, legacyChallenge: true });
+    return null;
+  }
+
+  function requireSteamOnline() {
+    steamLoginService?.ensureOnline?.();
+  }
+
+  function writeAuthError(req: IncomingMessage, res: ServerResponse, error: unknown) {
+    if (isRecord(error) && error.legacyChallenge && !sessionManager) {
+      legacyAuth.challenge(res);
+      return;
+    }
+    jsonResponse(res, statusCodeForError(error), errorPayload(error));
+  }
+
+  function authMe(req: IncomingMessage) {
+    const session = sessionManager?.getSession(req) || null;
+    return {
+      needsSetup: authStore?.requiresSetup?.() ?? false,
+      user: session?.user || null,
+      steam: currentSteamStatus()
+    };
+  }
+
+  async function handleAuthApi(req: IncomingMessage, res: ServerResponse, pathname: string) {
+    if (!authStore || !sessionManager) return false;
+
+    if (req.method === 'GET' && pathname === '/api/auth/me') {
+      jsonResponse(res, 200, authMe(req));
+      return true;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/auth/setup') {
+      const body = await readJsonBody(req);
+      const user = authStore.createInitialAdmin(body);
+      jsonResponse(res, 200, { ok: true, user, steam: currentSteamStatus() }, {
+        'Set-Cookie': sessionManager.createSetCookie(user, req)
+      });
+      return true;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/auth/login') {
+      const body = await readJsonBody(req);
+      const user = authStore.authenticate(body.username, body.password);
+      if (!user) throw Object.assign(new Error('Invalid username or password'), { statusCode: 401 });
+      jsonResponse(res, 200, { ok: true, user, steam: currentSteamStatus() }, {
+        'Set-Cookie': sessionManager.createSetCookie(user, req)
+      });
+      return true;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/auth/logout') {
+      jsonResponse(res, 200, { ok: true }, {
+        'Set-Cookie': sessionManager.createClearCookie(req)
+      });
+      return true;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/auth/password') {
+      const session = sessionManager.requireSession(req);
+      const body = await readJsonBody(req);
+      const user = authStore.changeOwnPassword(session.user.id, body.oldPassword, body.newPassword);
+      jsonResponse(res, 200, { ok: true, user }, {
+        'Set-Cookie': sessionManager.createSetCookie(user, req)
+      });
+      return true;
+    }
+
+    return false;
+  }
+
+  async function handleUsersApi(req: IncomingMessage, res: ServerResponse, pathname: string) {
+    if (!authStore || !sessionManager) return false;
+    if (pathname === '/api/users') {
+      requireAdminSession(req);
+      if (req.method === 'GET') {
+        jsonResponse(res, 200, { users: authStore.listUsers() });
+        return true;
+      }
+      if (req.method === 'POST') {
+        const user = authStore.createUser(await readJsonBody(req));
+        jsonResponse(res, 201, { ok: true, user });
+        return true;
+      }
+      return false;
+    }
+
+    const passwordMatch = pathname.match(/^\/api\/users\/(\d+)\/password$/);
+    if (passwordMatch && req.method === 'POST') {
+      requireAdminSession(req);
+      const body = await readJsonBody(req);
+      const user = authStore.setPassword(passwordMatch[1], body.password);
+      jsonResponse(res, 200, { ok: true, user });
+      return true;
+    }
+
+    const userMatch = pathname.match(/^\/api\/users\/(\d+)$/);
+    if (userMatch) {
+      const session = requireAdminSession(req);
+      if (req.method === 'PATCH') {
+        const user = authStore.updateUser(userMatch[1], await readJsonBody(req));
+        jsonResponse(res, 200, { ok: true, user });
+        return true;
+      }
+      if (req.method === 'DELETE') {
+        authStore.deleteUser(userMatch[1], session?.user.id);
+        jsonResponse(res, 200, { ok: true });
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  async function handleSteamApi(req: IncomingMessage, res: ServerResponse, pathname: string) {
+    if (!steamLoginService) return false;
+
+    if (req.method === 'GET' && pathname === '/api/steam/status') {
+      requireLegacyOrSession(req);
+      jsonResponse(res, 200, currentSteamStatus());
+      return true;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/steam/login') {
+      requireAdminSession(req);
+      const status = steamLoginService.login(await readJsonBody(req));
+      jsonResponse(res, 200, status);
+      return true;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/steam/guard') {
+      requireAdminSession(req);
+      const body = await readJsonBody(req);
+      jsonResponse(res, 200, steamLoginService.submitGuard(body.code));
+      return true;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/steam/logout') {
+      requireAdminSession(req);
+      jsonResponse(res, 200, steamLoginService.logout());
+      return true;
+    }
+
+    return false;
+  }
+
   async function withSteamRetry<T>(operation: () => Promise<T> | T, needsWebSession = false): Promise<T> {
+    requireSteamOnline();
     await resolveWaiter(waitForLogin);
     if (needsWebSession) {
       await resolveWaiter(waitForWebSession);
@@ -481,10 +713,20 @@ function createChatService(options: ChatServiceOptions = {}) {
   async function handleHttpRequest(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     try {
-      if (!auth.isAuthorized(req)) {
-        auth.challenge(res);
+      if (req.method === 'GET' && url.pathname === '/healthz') {
+        jsonResponse(res, 200, { ok: true });
         return;
       }
+
+      if (req.method === 'GET' && isStaticRequest(url.pathname)) {
+        if (await serveStatic(req, res, url.pathname)) return;
+      }
+
+      if (await handleAuthApi(req, res, url.pathname)) return;
+      if (await handleSteamApi(req, res, url.pathname)) return;
+      if (await handleUsersApi(req, res, url.pathname)) return;
+
+      requireLegacyOrSession(req);
 
       if (req.method === 'GET') {
         if (url.pathname === '/api/config') {
@@ -492,15 +734,18 @@ function createChatService(options: ChatServiceOptions = {}) {
           return;
         }
         if (url.pathname === '/api/emoticons') {
+          requireSteamOnline();
           const data = await getEmoticons({ steamUser, waitForLogin, waitForWebSession });
           jsonResponse(res, 200, data);
           return;
         }
         if (url.pathname === '/api/friends') {
+          requireSteamOnline();
           jsonResponse(res, 200, await listFriends(steamUser));
           return;
         }
         if (url.pathname === '/api/groups') {
+          requireSteamOnline();
           jsonResponse(res, 200, await listGroups(steamUser));
           return;
         }
@@ -556,7 +801,7 @@ function createChatService(options: ChatServiceOptions = {}) {
 
       jsonResponse(res, req.method === 'GET' ? 404 : 405, { error: 'Not found' });
     } catch (error) {
-      jsonResponse(res, statusCodeForError(error), { error: errorMessage(error) || 'Internal Server Error' });
+      writeAuthError(req, res, error);
     }
   }
 
@@ -604,20 +849,23 @@ function createChatService(options: ChatServiceOptions = {}) {
         return;
       }
       if (type === 'get_emoticons' || type === 'emoticons') {
+        requireSteamOnline();
         reply({ type: 'emoticons', ...(await getEmoticons({ steamUser, waitForLogin, waitForWebSession })) });
         return;
       }
       if (type === 'get_friends' || type === 'friends') {
+        requireSteamOnline();
         reply({ type: 'friends', friends: await listFriends(steamUser) });
         return;
       }
       if (type === 'get_groups' || type === 'groups') {
+        requireSteamOnline();
         reply({ type: 'groups', groups: await listGroups(steamUser) });
         return;
       }
       reply({ type: 'error', error: `Unsupported WebSocket type: ${type || 'unknown'}` });
     } catch (error) {
-      reply({ type: 'error', error: errorMessage(error) || 'Request failed' });
+      reply({ type: 'error', error: errorMessage(error) || 'Request failed', statusCode: statusCodeForError(error), ...(errorPayload(error)) });
     }
   }
 
@@ -627,8 +875,21 @@ function createChatService(options: ChatServiceOptions = {}) {
       socket.destroy();
       return;
     }
-    if (!auth.isAuthorized(req)) {
-      auth.challengeUpgrade(socket);
+    try {
+      requireLegacyOrSession(req);
+    } catch (error) {
+      if (sessionManager) {
+        socket.write([
+          'HTTP/1.1 401 Unauthorized',
+          'Content-Type: application/json; charset=utf-8',
+          'Connection: close',
+          '',
+          JSON.stringify({ error: 'Unauthorized' })
+        ].join('\r\n'));
+        socket.destroy();
+        return;
+      }
+      legacyAuth.challengeUpgrade(socket);
       return;
     }
     wss.handleUpgrade(req, socket, head, (ws: WsConnection) => {

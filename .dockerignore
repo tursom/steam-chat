@@ -11,6 +11,8 @@ config.js
 .env
 session.json
 refresh.token
+auth.sqlite
+data/
 
 logs/
 *.log
