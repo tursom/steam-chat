@@ -64,6 +64,11 @@ function normalizeHistoryItem(record: HistoryRecordInput): HistoryItem {
   const legacyImageUrl = typeof record.imageUrl === 'string' ? record.imageUrl : '';
   const type = typeof record.type === 'string' ? record.type : (legacyImageUrl ? 'image' : 'message');
   const message = typeof record.message === 'string' ? record.message : '';
+  const steamAccountId = typeof record.steamAccountId === 'string'
+    ? record.steamAccountId
+    : typeof record.steam_account_id === 'string'
+      ? record.steam_account_id
+      : '';
   const item: HistoryItem = {
     type,
     date: typeof record.date === 'string' ? record.date : formatDate(record.sentAt ? new Date(record.sentAt) : new Date()),
@@ -73,6 +78,7 @@ function normalizeHistoryItem(record: HistoryRecordInput): HistoryItem {
     message: type === 'image' && !message && legacyImageUrl ? legacyImageUrl : message,
     ordinal: typeof record.ordinal === 'string' || typeof record.ordinal === 'number' ? record.ordinal : null
   };
+  if (steamAccountId) item.steamAccountId = steamAccountId;
   if (typeof record.sentAt === 'string') item.sentAt = record.sentAt;
   return item;
 }
@@ -83,8 +89,8 @@ function numericOrdinal(value: unknown): number | null {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-function ordinalGroupKey(item: Pick<HistoryItem, 'id' | 'date' | 'sentAt' | 'ordinal'>): string {
-  return `${item.id}\0${parseMessageDate(item)}`;
+function ordinalGroupKey(item: Pick<HistoryItem, 'steamAccountId' | 'id' | 'date' | 'sentAt' | 'ordinal'>): string {
+  return `${item.steamAccountId || ''}\0${item.id}\0${parseMessageDate(item)}`;
 }
 
 function usedOrdinalsByGroup(items: HistoryItem[]): Map<string, Set<number>> {
@@ -136,6 +142,7 @@ function serializeHistoryLogRecord(source: HistoryRecordInput, item: HistoryItem
   if (source.type === 'message') record.type = source.type;
   record.date = item.date;
   record.echo = item.echo;
+  if (item.steamAccountId) record.steamAccountId = item.steamAccountId;
   record.id = item.id;
   record.name = item.name;
   record.message = item.message;
@@ -195,11 +202,22 @@ function sortHistoryItems(items: HistoryItem[]) {
   });
 }
 
-async function readHistory(options: { logPath?: string; limit?: unknown; id?: unknown; logger?: LoggerLike } = {}): Promise<HistoryItem[]> {
+async function readHistory(options: {
+  logPath?: string;
+  limit?: unknown;
+  id?: unknown;
+  steamAccountId?: unknown;
+  includeLegacy?: boolean;
+  logger?: LoggerLike;
+} = {}): Promise<HistoryItem[]> {
   const logPath = options.logPath || DEFAULT_LOG_PATH;
   const limit = limitFrom(options.limit);
   const id = options.id ? steamIdToString(options.id) : '';
+  const steamAccountId = typeof options.steamAccountId === 'string' ? options.steamAccountId : '';
   let records = await readAllLogLines(logPath, options.logger);
+  if (steamAccountId) {
+    records = records.filter((item) => item.steamAccountId === steamAccountId || (options.includeLegacy && !item.steamAccountId));
+  }
   if (id) {
     records = records.filter((item) => item.id === id);
   }
@@ -250,13 +268,21 @@ function previewForMessage(item: Pick<HistoryItem, 'type' | 'message'>): string 
 async function buildConversations(options: {
   logPath?: string;
   limit?: unknown;
+  steamAccountId?: unknown;
+  includeLegacy?: boolean;
   getUserInfo?: (id: string) => Promise<{ player_name?: string; personaName?: string }>;
   logger?: LoggerLike;
 } = {}): Promise<ConversationSummary[]> {
   const logPath = options.logPath || DEFAULT_LOG_PATH;
   const limit = limitFrom(options.limit, 100);
   const getUserInfo = options.getUserInfo;
-  const records = await readHistory({ logPath, limit, logger: options.logger });
+  const records = await readHistory({
+    logPath,
+    limit,
+    steamAccountId: options.steamAccountId,
+    includeLegacy: options.includeLegacy,
+    logger: options.logger
+  });
   const conversations = new Map<string, ConversationSummary & { updatedAtMs: number }>();
 
   for (const item of records) {

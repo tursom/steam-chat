@@ -104,6 +104,8 @@ type SteamLoginRequest = {
 
 type SteamLoginServiceOptions = SteamLifecycleOptions & {
   getDefaultLogonID?: () => number;
+  onLoggedOn?: (steamId: string | null) => void;
+  onRefreshToken?: (refreshToken: string, steamId: string | null) => void;
 };
 
 function createDeferred<T = unknown>(): Deferred<T> {
@@ -373,7 +375,9 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
     refreshTokenPath = DEFAULT_REFRESH_TOKEN_PATH,
     fileSystem = fs,
     timers = { setTimeout, clearTimeout },
-    getDefaultLogonID
+    getDefaultLogonID,
+    onLoggedOn,
+    onRefreshToken
   } = options;
 
   if (!steamUser) {
@@ -396,6 +400,15 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
   function log(level: 'info' | 'warn' | 'error', message: string, meta?: unknown) {
     const method = logger[level] || logger.log || (() => {});
     method.call(logger, message, meta);
+  }
+
+  function callHook(name: 'onLoggedOn' | 'onRefreshToken', callback: (() => void) | undefined) {
+    if (!callback) return;
+    try {
+      callback();
+    } catch (error) {
+      log('warn', `${name} hook failed`, { error: errorMessage(error) });
+    }
   }
 
   function resetDeferreds() {
@@ -509,6 +522,7 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
     lastError = null;
     steamId = steamIdToText(steamUser.steamID);
     loginDeferred.resolve(true);
+    callHook('onLoggedOn', () => onLoggedOn?.(steamId));
     log('info', 'Steam logged on');
     try {
       steamUser.setPersona?.(steamUser.EPersonaState?.Online || 1);
@@ -535,6 +549,7 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
     if (!refreshToken) return;
     fileSystem.mkdirSync(path.dirname(refreshTokenPath), { recursive: true });
     fileSystem.writeFileSync(refreshTokenPath, `${refreshToken}\n`, 'utf8');
+    callHook('onRefreshToken', () => onRefreshToken?.(refreshToken, steamId));
     log('info', 'Steam refresh token saved');
   });
 
@@ -595,6 +610,20 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
       };
       if (logonID) optionsForLogin.logonID = logonID;
       beginLogin(optionsForLogin, 'account credentials').catch(() => {});
+      return getStatus();
+    },
+    connectWithRefreshToken(refreshToken: unknown, steamID?: unknown) {
+      if (status === 'logging_in' || status === 'waiting_guard' || status === 'reconnecting' || status === 'online') {
+        throw Object.assign(new Error('Steam login is already active'), { statusCode: 409 });
+      }
+      const token = String(refreshToken || '').trim();
+      if (!token) throw Object.assign(new Error('Steam account refresh token is missing'), { statusCode: 409 });
+      const logOnOptions: LogOnOptions = {
+        ...baseLoginOptions(),
+        refreshToken: token
+      };
+      if (steamID) logOnOptions.steamID = String(steamID);
+      beginLogin(logOnOptions, 'stored refresh token').catch(() => {});
       return getStatus();
     },
     submitGuard(code: unknown) {

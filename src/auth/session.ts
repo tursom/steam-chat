@@ -1,17 +1,22 @@
 'use strict';
 
 import type { IncomingMessage } from 'node:http';
-import type { PublicUser } from './store';
+import type { PublicUser, PublicUserSession } from './store';
 import { isRecord } from '../types';
 
 const crypto = require('node:crypto');
 
 type AuthStoreLike = {
+  createSession: (userId: unknown, input: { expiresAt: string; ip?: string | null; userAgent?: string | null }) => PublicUserSession;
   getOrCreateSessionSecret: () => string;
   getUserById: (id: unknown) => (PublicUser & { passwordHash?: string }) | null;
+  revokeSession: (sessionId: unknown, revokedBy?: unknown) => boolean;
+  revokeUserSessions: (userId: unknown, revokedBy?: unknown, exceptSessionId?: unknown) => number;
+  touchSession: (sessionId: unknown, userId: unknown, context?: { ip?: string | null; userAgent?: string | null }) => PublicUserSession | null;
 };
 
 type SessionPayload = {
+  sid: string;
   uid: number;
   role: 'admin' | 'user';
   sv: number;
@@ -21,6 +26,7 @@ type SessionPayload = {
 
 export type AppSession = {
   payload: SessionPayload;
+  sessionId: string;
   user: PublicUser;
 };
 
@@ -28,6 +34,7 @@ type SessionManagerOptions = {
   store: AuthStoreLike;
   cookieName?: string;
   maxAgeMs?: number;
+  getClientIp?: (req: IncomingMessage) => string;
 };
 
 const DEFAULT_COOKIE_NAME = 'steam_chat_session';
@@ -60,6 +67,10 @@ function parseCookieHeader(header: unknown): Record<string, string> {
   return cookies;
 }
 
+function headerText(value: string | string[] | undefined): string {
+  return Array.isArray(value) ? value[0] || '' : value || '';
+}
+
 function secureCookieFor(req?: IncomingMessage): boolean {
   if (!req) return false;
   const socket = req.socket as IncomingMessage['socket'] & { encrypted?: boolean };
@@ -90,11 +101,20 @@ function userToPublic(user: PublicUser & { passwordHash?: string }): PublicUser 
   return safeUser;
 }
 
+function requestContext(req?: IncomingMessage, getClientIp?: (req: IncomingMessage) => string) {
+  if (!req) return {};
+  return {
+    ip: getClientIp ? getClientIp(req) : req.socket?.remoteAddress || null,
+    userAgent: headerText(req.headers['user-agent']) || null
+  };
+}
+
 function createSessionManager(options: SessionManagerOptions) {
   const store = options.store;
   const cookieName = options.cookieName || DEFAULT_COOKIE_NAME;
   const maxAgeMs = options.maxAgeMs || DEFAULT_MAX_AGE_MS;
   const secret = store.getOrCreateSessionSecret();
+  const getRequestClientIp = options.getClientIp;
 
   function encode(payload: SessionPayload): string {
     const encoded = base64urlJson(payload);
@@ -112,13 +132,14 @@ function createSessionManager(options: SessionManagerOptions) {
       const parsed: unknown = JSON.parse(Buffer.from(encoded, 'base64url').toString('utf8'));
       if (!isRecord(parsed)) return null;
       const payload: SessionPayload = {
+        sid: typeof parsed.sid === 'string' ? parsed.sid : '',
         uid: Number(parsed.uid || 0),
         role: parsed.role === 'admin' ? 'admin' : 'user',
         sv: Number(parsed.sv || 0),
         iat: Number(parsed.iat || 0),
         exp: Number(parsed.exp || 0)
       };
-      if (!payload.uid || !payload.sv || !payload.iat || !payload.exp) return null;
+      if (!payload.sid || !payload.uid || !payload.sv || !payload.iat || !payload.exp) return null;
       return payload;
     } catch (_) {
       return null;
@@ -131,23 +152,41 @@ function createSessionManager(options: SessionManagerOptions) {
     if (!payload || payload.exp <= Date.now()) return null;
     const user = store.getUserById(payload.uid);
     if (!user || user.disabled || user.sessionVersion !== payload.sv || user.role !== payload.role) return null;
-    return { payload, user: userToPublic(user) };
+    const session = store.touchSession(payload.sid, user.id, requestContext(req, getRequestClientIp));
+    if (!session) return null;
+    return { payload, sessionId: session.id, user: userToPublic(user) };
   }
 
   function createSetCookie(user: PublicUser, req?: IncomingMessage) {
     const iat = Date.now();
+    const exp = iat + maxAgeMs;
+    const session = store.createSession(user.id, {
+      ...requestContext(req, getRequestClientIp),
+      expiresAt: new Date(exp).toISOString()
+    });
     const payload: SessionPayload = {
+      sid: session.id,
       uid: user.id,
       role: user.role,
       sv: user.sessionVersion,
       iat,
-      exp: iat + maxAgeMs
+      exp
     };
     return serializeCookie(cookieName, encode(payload), {
       maxAge: maxAgeMs / 1000,
       expires: new Date(payload.exp),
       secure: secureCookieFor(req)
     });
+  }
+
+  function revokeCurrentSession(req: IncomingMessage, revokedBy?: unknown): boolean {
+    const raw = parseCookieHeader(req.headers.cookie)[cookieName];
+    const payload = decode(raw);
+    return payload ? store.revokeSession(payload.sid, revokedBy ?? payload.uid) : false;
+  }
+
+  function revokeUserSessions(userId: unknown, revokedBy?: unknown, exceptSessionId?: unknown): number {
+    return store.revokeUserSessions(userId, revokedBy, exceptSessionId);
   }
 
   function createClearCookie(req?: IncomingMessage) {
@@ -179,7 +218,9 @@ function createSessionManager(options: SessionManagerOptions) {
     getSession,
     maxAgeMs,
     requireAdmin,
-    requireSession
+    requireSession,
+    revokeCurrentSession,
+    revokeUserSessions
   };
 }
 

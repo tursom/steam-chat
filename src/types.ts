@@ -44,6 +44,7 @@ export type HistoryRecordInput = UnknownRecord & {
   type?: string;
   date?: string;
   echo?: boolean;
+  steamAccountId?: string;
   id?: string | number | SteamIdLike;
   steamID?: string | number | SteamIdLike;
   name?: string;
@@ -56,6 +57,7 @@ export type HistoryItem = {
   type: string;
   date: string;
   echo: boolean;
+  steamAccountId?: string;
   id: string;
   name: string;
   message: string;

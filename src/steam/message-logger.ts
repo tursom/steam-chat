@@ -46,12 +46,13 @@ type SteamMessageLoggerOptions = {
   steamUser: SteamMessageLoggerUser;
   getUserInfo?: (steamID: unknown) => Promise<Persona>;
   getSelfName?: () => Promise<string>;
+  getSteamAccountId?: () => string | null | undefined;
   logPath?: string;
   logger?: LoggerLike;
 };
 
 function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
-  const { steamUser, getSelfName = async () => 'Me', logPath = DEFAULT_LOG_PATH, logger = console } = options;
+  const { steamUser, getSelfName = async () => 'Me', getSteamAccountId = () => null, logPath = DEFAULT_LOG_PATH, logger = console } = options;
   const getUserInfo: (steamID: unknown) => Promise<Persona> = options.getUserInfo || (async () => ({ player_name: 'Unknown' }));
   if (!steamUser || typeof steamUser.on !== 'function') {
     throw new Error('steamUser EventEmitter is required');
@@ -71,6 +72,10 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
     return true;
   }
 
+  function activeSteamAccountId(): string | undefined {
+    return getSteamAccountId() || undefined;
+  }
+
   async function importFriendMessageHistory(id: string): Promise<boolean> {
     if (typeof steamUser.chat?.getFriendMessageHistory !== 'function') return false;
     const response = await new Promise<{ messages?: SteamFriendHistoryMessage[] }>((resolve, reject) => {
@@ -86,6 +91,7 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
       const echo = Boolean(senderId && senderId !== id);
       await appendLog({
         echo,
+        steamAccountId: activeSteamAccountId(),
         id,
         name: echo ? selfName : (friendInfo.player_name || friendInfo.personaName || id),
         message: typeof message.message === 'string' ? message.message : '',
@@ -106,6 +112,7 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
       const echo = Boolean(senderId && senderId !== id);
       await appendLog({
         echo,
+        steamAccountId: activeSteamAccountId(),
         id,
         name: echo ? await getSelfName() : (message.accountid ? String(message.accountid) : 'Unknown'),
         message: message.message || '',
@@ -137,6 +144,7 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
       await maybeImportSteamHistory(id);
       const info = await getUserInfo(event.steamID || id);
       await appendLog({
+        steamAccountId: activeSteamAccountId(),
         id,
         name: info.player_name || info.personaName || id,
         message: event.message,
@@ -155,6 +163,7 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
     try {
       await appendLog({
         echo: true,
+        steamAccountId: activeSteamAccountId(),
         id,
         name: await getSelfName(),
         message: event.message,

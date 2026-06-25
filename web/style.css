@@ -7,6 +7,7 @@
   --muted: #657283;
   --brand: #176b87;
   --brand-soft: #d9ecf2;
+  --surface-muted: #f8fafc;
   --ok: #1f7a4d;
   --warn: #a45d14;
   --danger: #b33a3a;
@@ -293,7 +294,7 @@ nav button.is-active {
 .content {
   min-height: 0;
   overflow: auto;
-  padding: 20px;
+  padding: 18px;
 }
 
 .feedback {
@@ -316,48 +317,198 @@ nav button.is-active {
 }
 
 .steam-view,
-.users-view {
+.users-view,
+.steam-accounts-view,
+.audit-view,
+.account-view {
   display: grid;
   gap: 16px;
+}
+
+.users-view {
+  grid-template-columns: minmax(300px, 0.8fr) minmax(520px, 1.2fr);
+  align-items: start;
+}
+
+.panel {
+  display: grid;
+  gap: 12px;
+  min-width: 0;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 14px;
+}
+
+.panel-title {
+  margin: 0;
+  color: var(--text);
+  font-size: 14px;
+  line-height: 1.2;
+}
+
+.panel .stack-form {
+  margin-top: 0;
+}
+
+.toolbar-panel {
+  align-self: start;
+}
+
+.list-panel {
+  grid-column: 1 / -1;
+  gap: 10px;
+  border: 0;
+  background: transparent;
+  padding: 0;
+}
+
+.form-panel,
+.status-note-panel {
+  max-width: 720px;
+}
+
+.page-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.user-filters {
+  grid-template-columns: minmax(220px, 1.4fr) minmax(120px, 0.65fr) minmax(120px, 0.65fr) auto;
+}
+
+.user-create {
+  grid-template-columns: minmax(150px, 0.9fr) minmax(150px, 0.9fr) minmax(160px, 0.9fr) minmax(130px, 0.7fr) minmax(210px, 1.2fr) auto;
+}
+
+.steam-account-login {
+  grid-template-columns: minmax(150px, 1fr) minmax(170px, 1fr) minmax(170px, 1fr) minmax(120px, 0.7fr) auto;
+}
+
+.audit-filters {
+  grid-template-columns: minmax(220px, 1fr) minmax(180px, 0.8fr) auto;
+  max-width: 760px;
 }
 
 .status-panel {
   display: grid;
   gap: 4px;
-  border-bottom: 1px solid var(--line);
-  padding-bottom: 16px;
+  max-width: 720px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 14px;
 }
 
 .status-panel strong {
   font-size: 20px;
 }
 
-.user-table {
+.user-table,
+.account-table,
+.audit-table {
   display: grid;
   gap: 8px;
 }
 
-.user-row {
+.user-row,
+.account-row {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: minmax(280px, 1fr) minmax(320px, auto);
   align-items: center;
-  gap: 12px;
+  gap: 14px;
   border: 1px solid var(--line);
   border-radius: 8px;
   background: var(--surface);
-  padding: 12px;
+  padding: 14px 16px;
 }
 
-.user-row div:first-child {
+.user-row > div:first-child,
+.account-row > div:first-child {
   display: grid;
   gap: 2px;
   min-width: 0;
 }
 
 .user-row strong,
-.user-row span {
+.user-row span,
+.account-row strong,
+.account-row span {
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.user-detail {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  gap: 12px;
+  border-top: 1px solid var(--line);
+  padding-top: 12px;
+}
+
+.detail-block,
+.grant-grid {
+  display: grid;
+  gap: 8px;
+  align-content: start;
+  border-radius: 6px;
+  background: var(--surface-muted);
+  padding: 10px;
+}
+
+.detail-block h3,
+.grant-grid h3 {
+  margin: 0;
+  font-size: 14px;
+}
+
+.session-row,
+.check-row {
+  display: grid;
+  grid-template-columns: minmax(140px, 0.9fr) minmax(220px, 1.2fr) auto;
+  gap: 8px;
+  align-items: center;
+}
+
+.grant-grid {
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+}
+
+.grant-grid h3,
+.grant-grid .empty,
+.grant-grid .primary-btn {
+  grid-column: 1 / -1;
+}
+
+.check-row {
+  grid-template-columns: auto minmax(0, 1fr);
+  justify-content: start;
+  color: var(--text);
+}
+
+.check-row input {
+  width: auto;
+}
+
+.audit-row {
+  display: grid;
+  grid-template-columns: minmax(220px, 0.75fr) minmax(300px, 1fr) minmax(260px, 1fr);
+  gap: 10px;
+  align-items: center;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  padding: 12px;
+}
+
+.audit-row code {
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--soft);
+  padding: 8px;
   white-space: nowrap;
 }
 
@@ -366,6 +517,13 @@ nav button.is-active {
   flex-wrap: wrap;
   justify-content: flex-end;
   gap: 6px;
+  max-width: 640px;
+}
+
+.row-actions button {
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 13px;
 }
 
 .chat-layout {
@@ -711,6 +869,46 @@ nav button.is-active {
   color: #fff;
 }
 
+@media (max-width: 1500px) {
+  .users-view {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 1200px) {
+  .top-actions {
+    flex-wrap: wrap;
+  }
+
+  .user-row,
+  .account-row,
+  .session-row,
+  .audit-row {
+    grid-template-columns: 1fr;
+  }
+
+  .inline-form,
+  .user-filters,
+  .user-create,
+  .steam-account-login,
+  .audit-filters {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .inline-form button,
+  .user-filters button,
+  .user-create button,
+  .steam-account-login button,
+  .audit-filters button {
+    grid-column: auto;
+  }
+
+  .row-actions {
+    justify-content: flex-start;
+    max-width: none;
+  }
+}
+
 @media (max-width: 920px) {
   .admin-shell {
     grid-template-columns: 1fr;
@@ -760,14 +958,38 @@ nav button.is-active {
     min-height: 70dvh;
   }
 
+  .bubble {
+    max-width: 94%;
+  }
+}
+
+@media (max-width: 640px) {
+  .content {
+    padding: 12px;
+  }
+
   .inline-form,
-  .user-row,
+  .user-filters,
+  .user-create,
+  .steam-account-login,
+  .audit-filters,
   .compose-row,
   .image-url-form {
     grid-template-columns: 1fr;
   }
 
-  .bubble {
-    max-width: 94%;
+  .topbar {
+    padding: 14px 12px;
+  }
+
+  .panel {
+    padding: 12px;
+  }
+
+  .user-row,
+  .account-row,
+  .audit-row {
+    grid-template-columns: 1fr;
+    padding: 12px;
   }
 }

@@ -4,7 +4,7 @@ import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
 import type { RawData, WebSocket as WsConnection, WebSocketServer as WsServer } from 'ws';
 import type { AppSession } from '../auth/session';
-import type { PublicUser } from '../auth/store';
+import type { PublicAuditLog, PublicSteamAccount, PublicUser, PublicUserSession, UserPermission } from '../auth/store';
 import type {
   AuthConfig,
   CallbackStyleFunction,
@@ -51,7 +51,7 @@ const {
   stickerUrlForType
 } = require('../storage/media-cache');
 const { WEB_DIR } = require('../paths');
-const { createAuthChecker } = require('./auth');
+const { createAuthChecker, getClientIp } = require('./auth');
 const { isLocalOrLanIp, normalizeIp } = require('./network');
 
 type Waiter = Promise<unknown> | (() => Promise<unknown> | unknown);
@@ -114,16 +114,39 @@ type ChatServiceOptions = {
   steamLoginService?: SteamLoginServiceLike;
 };
 
+type RequestContext = {
+  ip?: string | null;
+  userAgent?: string | null;
+};
+
 type AuthStoreLike = {
-  authenticate: (username: unknown, password: unknown) => PublicUser | null;
+  authenticate: (username: unknown, password: unknown, context?: RequestContext) => PublicUser | null;
+  canAccessSteamAccount: (userId: unknown, steamAccountId: unknown) => boolean;
   changeOwnPassword: (id: unknown, oldPassword: unknown, newPassword: unknown) => PublicUser;
   createInitialAdmin: (input: UnknownRecord) => PublicUser;
   createUser: (input: UnknownRecord) => PublicUser;
+  deleteSteamAccount: (id: unknown) => void;
   deleteUser: (id: unknown, currentUserId: unknown) => void;
-  listUsers: () => PublicUser[];
+  getActiveSteamAccount: (includeToken?: boolean) => (PublicSteamAccount & { refreshToken?: string | null }) | null;
+  getSteamAccountById: (id: unknown, includeToken?: boolean) => (PublicSteamAccount & { refreshToken?: string | null }) | null;
+  hasPermission: (roleOrUser: string | Pick<PublicUser, 'role'>, permission: UserPermission) => boolean;
+  listAuditLogs: (filters?: UnknownRecord) => PublicAuditLog[];
+  listSteamAccountsForUser: (userId: unknown) => PublicSteamAccount[];
+  listUserSessions: (userId: unknown) => PublicUserSession[];
+  listUserSteamAccounts: (userId: unknown) => PublicSteamAccount[];
+  listUsers: (filters?: UnknownRecord) => PublicUser[];
+  markSteamAccountActive: (id: unknown) => void;
+  permissionsForRole: (role: PublicUser['role']) => UserPermission[];
+  recordAudit: (input: UnknownRecord) => PublicAuditLog;
+  replaceUserSteamAccounts: (userId: unknown, steamAccountIds: unknown, grantedBy?: unknown) => PublicSteamAccount[];
   requiresSetup: () => boolean;
-  setPassword: (id: unknown, password: unknown) => PublicUser;
+  revokeSession: (sessionId: unknown, revokedBy?: unknown) => boolean;
+  revokeUserSessions: (userId: unknown, revokedBy?: unknown, exceptSessionId?: unknown) => number;
+  setActiveSteamAccount: (id: unknown) => PublicSteamAccount;
+  setPassword: (id: unknown, password: unknown, options?: UnknownRecord) => PublicUser;
+  updateSteamAccount: (id: unknown, patch: UnknownRecord) => PublicSteamAccount;
   updateUser: (id: unknown, patch: UnknownRecord) => PublicUser;
+  upsertSteamAccount: (input: UnknownRecord) => PublicSteamAccount;
 };
 
 type SessionManagerLike = {
@@ -132,6 +155,8 @@ type SessionManagerLike = {
   getSession: (req: IncomingMessage) => AppSession | null;
   requireAdmin: (req: IncomingMessage) => AppSession;
   requireSession: (req: IncomingMessage) => AppSession;
+  revokeCurrentSession: (req: IncomingMessage, revokedBy?: unknown) => boolean;
+  revokeUserSessions: (userId: unknown, revokedBy?: unknown, exceptSessionId?: unknown) => number;
 };
 
 type SteamStatusSummary = {
@@ -142,11 +167,14 @@ type SteamStatusSummary = {
   lastCodeWrong?: boolean;
   error?: string | null;
   steamId?: string | null;
+  activeAccount?: Pick<PublicSteamAccount, 'id' | 'steamId' | 'label'> | null;
+  accessAllowed?: boolean;
 };
 
 type SteamLoginServiceLike = {
   ensureOnline: () => void;
   getStatus: () => SteamStatusSummary;
+  connectWithRefreshToken?: (refreshToken: unknown, steamID?: unknown) => SteamStatusSummary;
   login: (input: UnknownRecord) => SteamStatusSummary;
   logout: () => SteamStatusSummary;
   submitGuard: (code: unknown) => SteamStatusSummary;
@@ -160,6 +188,13 @@ type WsPayload = UnknownRecord & {
 type ImageBody = UnknownRecord & {
   img?: string;
   url?: string;
+};
+
+type SteamAccessContext = {
+  session: AppSession | null;
+  activeAccount: PublicSteamAccount | null;
+  steamAccountId?: string;
+  includeLegacy: boolean;
 };
 
 type FriendSummary = {
@@ -418,6 +453,7 @@ function createChatService(options: ChatServiceOptions = {}) {
   const steamLoginService = options.steamLoginService;
   const legacyAuth = createAuthChecker(config.auth);
   const clients = new Set<WsConnection>();
+  const wsSessions = new Map<WsConnection, AppSession | null>();
   const recentSentText = new Map<string, number>();
   let disposeSteamEvents = () => {};
 
@@ -433,9 +469,122 @@ function createChatService(options: ChatServiceOptions = {}) {
     return map.has(key);
   }
 
+  function requestContext(req: IncomingMessage): RequestContext {
+    return {
+      ip: getClientIp(req, config.auth),
+      userAgent: Array.isArray(req.headers['user-agent']) ? req.headers['user-agent'][0] || null : req.headers['user-agent'] || null
+    };
+  }
+
+  function activeAccountSummary(account: PublicSteamAccount | null) {
+    return account ? { id: account.id, steamId: account.steamId, label: account.label } : null;
+  }
+
+  function ensureActiveSteamAccount(status = currentSteamStatus()): PublicSteamAccount | null {
+    if (!authStore) return null;
+    const active = authStore.getActiveSteamAccount(false);
+    const statusSteamId = status.steamId ? String(status.steamId) : '';
+    if (statusSteamId && (!active || active.steamId !== statusSteamId)) {
+      return authStore.upsertSteamAccount({ steamId: statusSteamId, setActive: true });
+    }
+    return active;
+  }
+
+  function steamStatusForSession(session: AppSession | null): SteamStatusSummary {
+    const status = currentSteamStatus();
+    const active = ensureActiveSteamAccount(status);
+    const accessAllowed = !session || !active ? false : authStore?.canAccessSteamAccount(session.user.id, active.id) === true;
+    return {
+      ...status,
+      activeAccount: accessAllowed || session?.user.role === 'admin' ? activeAccountSummary(active) : null,
+      accessAllowed
+    };
+  }
+
+  function requirePermission(req: IncomingMessage, permission: UserPermission): AppSession | null {
+    if (!sessionManager || !authStore) return requireAdminSession(req);
+    const session = sessionManager.requireSession(req);
+    if (!authStore.hasPermission(session.user, permission)) {
+      throw Object.assign(new Error('Forbidden'), { statusCode: 403 });
+    }
+    return session;
+  }
+
+  function recordAudit(session: AppSession | null, req: IncomingMessage, action: string, targetType: string, targetId: unknown, detail: UnknownRecord = {}) {
+    if (!authStore || !session) return;
+    const context = requestContext(req);
+    authStore.recordAudit({
+      actorUserId: session.user.id,
+      action,
+      targetType,
+      targetId: String(targetId || ''),
+      detail,
+      ip: context.ip,
+      userAgent: context.userAgent
+    });
+  }
+
+  function steamAccountUnavailable(status = currentSteamStatus()) {
+    return Object.assign(new Error('Steam account is not connected'), {
+      statusCode: 503,
+      steamStatus: status.status
+    });
+  }
+
+  function requireSteamAccountAccess(req: IncomingMessage, needsOnline: boolean): SteamAccessContext {
+    const session = requireLegacyOrSession(req);
+    if (needsOnline) requireSteamOnline();
+    if (!sessionManager || !authStore) {
+      const active = ensureActiveSteamAccount();
+      return {
+        session,
+        activeAccount: active,
+        steamAccountId: active?.steamId,
+        includeLegacy: true
+      };
+    }
+    const status = currentSteamStatus();
+    const active = ensureActiveSteamAccount(status);
+    if (!active) throw steamAccountUnavailable(status);
+    if (!authStore.canAccessSteamAccount(session?.user.id, active.id)) {
+      throw Object.assign(new Error('Steam account access denied'), { statusCode: 403 });
+    }
+    authStore.markSteamAccountActive(active.id);
+    return {
+      session,
+      activeAccount: active,
+      steamAccountId: active.steamId,
+      includeLegacy: session?.user.role === 'admin'
+    };
+  }
+
+  function wsAccessContext(ws: WsConnection, needsOnline: boolean): SteamAccessContext {
+    const session = wsSessions.get(ws) || null;
+    if (needsOnline) requireSteamOnline();
+    if (!sessionManager || !authStore) {
+      const active = ensureActiveSteamAccount();
+      return { session, activeAccount: active, steamAccountId: active?.steamId, includeLegacy: true };
+    }
+    const status = currentSteamStatus();
+    const active = ensureActiveSteamAccount(status);
+    if (!active) throw steamAccountUnavailable(status);
+    if (!session || !authStore.canAccessSteamAccount(session.user.id, active.id)) {
+      throw Object.assign(new Error('Steam account access denied'), { statusCode: 403 });
+    }
+    authStore.markSteamAccountActive(active.id);
+    return { session, activeAccount: active, steamAccountId: active.steamId, includeLegacy: session.user.role === 'admin' };
+  }
+
+  function canWsReceiveActiveAccount(ws: WsConnection): boolean {
+    if (!sessionManager || !authStore) return true;
+    const session = wsSessions.get(ws);
+    const active = ensureActiveSteamAccount();
+    return Boolean(session && active && authStore.canAccessSteamAccount(session.user.id, active.id));
+  }
+
   function broadcast(payload: unknown, except?: WsConnection) {
     for (const ws of clients) {
-      if (ws !== except) sendWs(ws, payload);
+      if (ws !== except && canWsReceiveActiveAccount(ws)) sendWs(ws, payload);
     }
   }
 
@@ -480,7 +629,8 @@ function createChatService(options: ChatServiceOptions = {}) {
     return {
       needsSetup: authStore?.requiresSetup?.() ?? false,
       user: session?.user || null,
-      steam: currentSteamStatus()
+      permissions: session && authStore ? authStore.permissionsForRole(session.user.role) : [],
+      steam: steamStatusForSession(session)
     };
   }
 
@@ -495,7 +645,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (req.method === 'POST' && pathname === '/api/auth/setup') {
       const body = await readJsonBody(req);
       const user = authStore.createInitialAdmin(body);
-      jsonResponse(res, 200, { ok: true, user, steam: currentSteamStatus() }, {
+      jsonResponse(res, 200, { ok: true, user, permissions: authStore.permissionsForRole(user.role), steam: steamStatusForSession(null) }, {
         'Set-Cookie': sessionManager.createSetCookie(user, req)
       });
       return true;
@@ -503,15 +653,30 @@ function createChatService(options: ChatServiceOptions = {}) {
 
     if (req.method === 'POST' && pathname === '/api/auth/login') {
       const body = await readJsonBody(req);
-      const user = authStore.authenticate(body.username, body.password);
+      const user = authStore.authenticate(body.username, body.password, requestContext(req));
       if (!user) throw Object.assign(new Error('Invalid username or password'), { statusCode: 401 });
-      jsonResponse(res, 200, { ok: true, user, steam: currentSteamStatus() }, {
+      jsonResponse(res, 200, { ok: true, user, permissions: authStore.permissionsForRole(user.role), steam: steamStatusForSession(null) }, {
         'Set-Cookie': sessionManager.createSetCookie(user, req)
       });
       return true;
     }
 
     if (req.method === 'POST' && pathname === '/api/auth/logout') {
+      const session = sessionManager.getSession(req);
+      if (session) {
+        sessionManager.revokeCurrentSession(req, session.user.id);
+        recordAudit(session, req, 'session.logout', 'session', session.sessionId);
+      }
+      jsonResponse(res, 200, { ok: true }, {
+        'Set-Cookie': sessionManager.createClearCookie(req)
+      });
+      return true;
+    }
+
+    if (req.method === 'POST' && pathname === '/api/auth/logout-all') {
+      const session = sessionManager.requireSession(req);
+      sessionManager.revokeUserSessions(session.user.id, session.user.id);
+      recordAudit(session, req, 'session.logout_all', 'user', session.user.id);
       jsonResponse(res, 200, { ok: true }, {
         'Set-Cookie': sessionManager.createClearCookie(req)
       });
@@ -522,6 +687,7 @@ function createChatService(options: ChatServiceOptions = {}) {
       const session = sessionManager.requireSession(req);
       const body = await readJsonBody(req);
       const user = authStore.changeOwnPassword(session.user.id, body.oldPassword, body.newPassword);
+      recordAudit(session, req, 'user.password.change_self', 'user', session.user.id);
       jsonResponse(res, 200, { ok: true, user }, {
         'Set-Cookie': sessionManager.createSetCookie(user, req)
       });
@@ -531,41 +697,94 @@ function createChatService(options: ChatServiceOptions = {}) {
     return false;
   }
 
-  async function handleUsersApi(req: IncomingMessage, res: ServerResponse, pathname: string) {
+  async function handleUsersApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     if (!authStore || !sessionManager) return false;
+    const pathname = url.pathname;
     if (pathname === '/api/users') {
-      requireAdminSession(req);
+      const session = requirePermission(req, 'user.manage');
       if (req.method === 'GET') {
-        jsonResponse(res, 200, { users: authStore.listUsers() });
+        jsonResponse(res, 200, {
+          users: authStore.listUsers({
+            query: url.searchParams.get('query'),
+            role: url.searchParams.get('role'),
+            status: url.searchParams.get('status')
+          })
+        });
         return true;
       }
       if (req.method === 'POST') {
-        const user = authStore.createUser(await readJsonBody(req));
+        const body = await readJsonBody(req);
+        const user = authStore.createUser({ ...body, createdBy: session?.user.id });
+        recordAudit(session, req, 'user.create', 'user', user.id, { username: user.username, role: user.role, steamAccountIds: body.steamAccountIds });
         jsonResponse(res, 201, { ok: true, user });
         return true;
       }
       return false;
     }
 
+    const sessionsMatch = pathname.match(/^\/api\/users\/(\d+)\/sessions$/);
+    if (sessionsMatch) {
+      const session = requirePermission(req, 'session.manage');
+      if (req.method === 'GET') {
+        jsonResponse(res, 200, { sessions: authStore.listUserSessions(sessionsMatch[1]) });
+        return true;
+      }
+      if (req.method === 'DELETE') {
+        const revoked = authStore.revokeUserSessions(sessionsMatch[1], session?.user.id);
+        recordAudit(session, req, 'session.revoke_user', 'user', sessionsMatch[1], { revoked });
+        jsonResponse(res, 200, { ok: true, revoked });
+        return true;
+      }
+    }
+
+    const sessionMatch = pathname.match(/^\/api\/users\/(\d+)\/sessions\/([^/]+)$/);
+    if (sessionMatch && req.method === 'DELETE') {
+      const session = requirePermission(req, 'session.manage');
+      const revoked = authStore.revokeSession(decodeURIComponent(sessionMatch[2]), session?.user.id);
+      recordAudit(session, req, 'session.revoke', 'session', sessionMatch[2], { userId: sessionMatch[1], revoked });
+      jsonResponse(res, 200, { ok: true, revoked });
+      return true;
+    }
+
+    const steamAccountsMatch = pathname.match(/^\/api\/users\/(\d+)\/steam-accounts$/);
+    if (steamAccountsMatch) {
+      const session = requirePermission(req, 'steam.account.manage');
+      if (req.method === 'GET') {
+        jsonResponse(res, 200, { steamAccounts: authStore.listUserSteamAccounts(steamAccountsMatch[1]) });
+        return true;
+      }
+      if (req.method === 'PUT') {
+        const body = await readJsonBody(req);
+        const steamAccounts = authStore.replaceUserSteamAccounts(steamAccountsMatch[1], body.steamAccountIds, session?.user.id);
+        recordAudit(session, req, 'steam_account.grant_replace', 'user', steamAccountsMatch[1], { steamAccountIds: body.steamAccountIds });
+        jsonResponse(res, 200, { ok: true, steamAccounts });
+        return true;
+      }
+    }
+
     const passwordMatch = pathname.match(/^\/api\/users\/(\d+)\/password$/);
     if (passwordMatch && req.method === 'POST') {
-      requireAdminSession(req);
+      const session = requirePermission(req, 'user.manage');
       const body = await readJsonBody(req);
-      const user = authStore.setPassword(passwordMatch[1], body.password);
+      const user = authStore.setPassword(passwordMatch[1], body.password, { forcePasswordChange: body.forcePasswordChange });
+      recordAudit(session, req, 'user.password.reset', 'user', user.id, { forcePasswordChange: body.forcePasswordChange });
       jsonResponse(res, 200, { ok: true, user });
       return true;
     }
 
     const userMatch = pathname.match(/^\/api\/users\/(\d+)$/);
     if (userMatch) {
-      const session = requireAdminSession(req);
+      const session = requirePermission(req, 'user.manage');
       if (req.method === 'PATCH') {
-        const user = authStore.updateUser(userMatch[1], await readJsonBody(req));
+        const body = await readJsonBody(req);
+        const user = authStore.updateUser(userMatch[1], body);
+        recordAudit(session, req, 'user.update', 'user', user.id, body);
         jsonResponse(res, 200, { ok: true, user });
         return true;
       }
       if (req.method === 'DELETE') {
         authStore.deleteUser(userMatch[1], session?.user.id);
+        recordAudit(session, req, 'user.delete', 'user', userMatch[1]);
         jsonResponse(res, 200, { ok: true });
         return true;
       }
@@ -574,36 +793,124 @@ function createChatService(options: ChatServiceOptions = {}) {
     return false;
   }
 
-  async function handleSteamApi(req: IncomingMessage, res: ServerResponse, pathname: string) {
+  async function handleSteamApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     if (!steamLoginService) return false;
+    const pathname = url.pathname;
 
     if (req.method === 'GET' && pathname === '/api/steam/status') {
-      requireLegacyOrSession(req);
-      jsonResponse(res, 200, currentSteamStatus());
+      const session = requireLegacyOrSession(req);
+      jsonResponse(res, 200, steamStatusForSession(session));
       return true;
     }
 
-    if (req.method === 'POST' && pathname === '/api/steam/login') {
-      requireAdminSession(req);
-      const status = steamLoginService.login(await readJsonBody(req));
-      jsonResponse(res, 200, status);
+    if (req.method === 'GET' && pathname === '/api/steam/accounts') {
+      const session = requireLegacyOrSession(req);
+      if (!session || !authStore) throw Object.assign(new Error('Forbidden'), { statusCode: 403 });
+      jsonResponse(res, 200, { steamAccounts: authStore.listSteamAccountsForUser(session.user.id) });
+      return true;
+    }
+
+    if (req.method === 'POST' && (pathname === '/api/steam/login' || pathname === '/api/steam/accounts/login')) {
+      const session = requirePermission(req, 'steam.manage');
+      const body = await readJsonBody(req);
+      const status = steamLoginService.login(body);
+      if (authStore && status.steamId) {
+        authStore.upsertSteamAccount({
+          steamId: status.steamId,
+          label: body.label,
+          accountNameHint: body.accountName,
+          createdBy: session?.user.id,
+          setActive: true
+        });
+      }
+      recordAudit(session, req, 'steam_account.login', 'steam_account', status.steamId || 'pending', { label: body.label, accountName: body.accountName });
+      jsonResponse(res, 200, steamStatusForSession(session));
       return true;
     }
 
     if (req.method === 'POST' && pathname === '/api/steam/guard') {
-      requireAdminSession(req);
+      const session = requirePermission(req, 'steam.manage');
       const body = await readJsonBody(req);
-      jsonResponse(res, 200, steamLoginService.submitGuard(body.code));
+      steamLoginService.submitGuard(body.code);
+      recordAudit(session, req, 'steam_account.guard_submit', 'steam_account', 'pending');
+      jsonResponse(res, 200, steamStatusForSession(session));
       return true;
     }
 
     if (req.method === 'POST' && pathname === '/api/steam/logout') {
-      requireAdminSession(req);
-      jsonResponse(res, 200, steamLoginService.logout());
+      const session = requirePermission(req, 'steam.manage');
+      const active = authStore?.getActiveSteamAccount(false);
+      steamLoginService.logout();
+      recordAudit(session, req, 'steam_account.logout', 'steam_account', active?.id || 'active');
+      jsonResponse(res, 200, steamStatusForSession(session));
+      return true;
+    }
+
+    const accountMatch = pathname.match(/^\/api\/steam\/accounts\/(\d+)$/);
+    if (accountMatch) {
+      const session = requirePermission(req, 'steam.account.manage');
+      if (req.method === 'PATCH') {
+        const account = authStore!.updateSteamAccount(accountMatch[1], await readJsonBody(req));
+        recordAudit(session, req, 'steam_account.update', 'steam_account', account.id);
+        jsonResponse(res, 200, { ok: true, steamAccount: account });
+        return true;
+      }
+      if (req.method === 'DELETE') {
+        const active = authStore!.getActiveSteamAccount(false);
+        if (active?.id === Number(accountMatch[1])) steamLoginService.logout();
+        authStore!.deleteSteamAccount(accountMatch[1]);
+        recordAudit(session, req, 'steam_account.delete', 'steam_account', accountMatch[1]);
+        jsonResponse(res, 200, { ok: true });
+        return true;
+      }
+    }
+
+    const connectMatch = pathname.match(/^\/api\/steam\/accounts\/(\d+)\/connect$/);
+    if (connectMatch && req.method === 'POST') {
+      const session = requirePermission(req, 'steam.manage');
+      const account = authStore!.getSteamAccountById(connectMatch[1], true);
+      if (!account) throw Object.assign(new Error('Steam account not found'), { statusCode: 404 });
+      if (!account.enabled) throw Object.assign(new Error('Steam account is disabled'), { statusCode: 409 });
+      const status = steamLoginService.connectWithRefreshToken
+        ? steamLoginService.connectWithRefreshToken(account.refreshToken, account.steamId)
+        : steamLoginService.login({});
+      authStore!.setActiveSteamAccount(account.id);
+      recordAudit(session, req, 'steam_account.connect', 'steam_account', account.id);
+      jsonResponse(res, 200, { ...steamStatusForSession(session), ...status });
+      return true;
+    }
+
+    const accountLogoutMatch = pathname.match(/^\/api\/steam\/accounts\/(\d+)\/logout$/);
+    if (accountLogoutMatch && req.method === 'POST') {
+      const session = requirePermission(req, 'steam.manage');
+      const active = authStore?.getActiveSteamAccount(false);
+      if (!active || active.id !== Number(accountLogoutMatch[1])) {
+        throw Object.assign(new Error('Steam account is not active'), { statusCode: 409 });
+      }
+      steamLoginService.logout();
+      recordAudit(session, req, 'steam_account.logout', 'steam_account', active.id);
+      jsonResponse(res, 200, steamStatusForSession(session));
       return true;
     }
 
     return false;
+  }
+
+  async function handleAuditApi(req: IncomingMessage, res: ServerResponse, url: URL) {
+    if (!authStore || !sessionManager) return false;
+    if (req.method !== 'GET' || url.pathname !== '/api/audit-logs') return false;
+    requirePermission(req, 'audit.view');
+    jsonResponse(res, 200, {
+      auditLogs: authStore.listAuditLogs({
+        action: url.searchParams.get('action'),
+        targetType: url.searchParams.get('targetType'),
+        actorUserId: url.searchParams.get('actorUserId'),
+        from: url.searchParams.get('from'),
+        to: url.searchParams.get('to'),
+        limit: url.searchParams.get('limit')
+      })
+    });
+    return true;
   }
 
   async function withSteamRetry<T>(operation: () => Promise<T> | T, needsWebSession = false): Promise<T> {
@@ -626,7 +933,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
   }
 
-  async function sendTextMessage(id: unknown, msg: unknown): Promise<HistoryItem> {
+  async function sendTextMessage(id: unknown, msg: unknown, steamAccountId?: string): Promise<HistoryItem> {
     if (!id || !String(msg || '').trim()) {
       throw Object.assign(new Error('id and msg are required'), { statusCode: 400 });
     }
@@ -644,6 +951,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     const record: HistoryRecordInput = {
       type: 'message',
       echo: true,
+      steamAccountId,
       id,
       name: await getSelfName(),
       message
@@ -657,7 +965,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     return item;
   }
 
-  async function sendImageMessage(id: unknown, body: ImageBody): Promise<HistoryItem> {
+  async function sendImageMessage(id: unknown, body: ImageBody, steamAccountId?: string): Promise<HistoryItem> {
     if (!id) throw Object.assign(new Error('id is required'), { statusCode: 400 });
     if (!steamCommunity || typeof steamCommunity.sendImageToUser !== 'function') {
       throw new Error('Steam image sender is unavailable');
@@ -678,6 +986,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     const item = normalizeHistoryItem({
       type: 'message',
       echo: true,
+      steamAccountId,
       id,
       name: await getSelfName(),
       message,
@@ -689,8 +998,10 @@ function createChatService(options: ChatServiceOptions = {}) {
   async function handleSteamIncoming(event: SteamFriendMessageEvent) {
     const id = event.id;
     const info = await getUserInfo(event.steamID || id).catch((): Persona => ({ player_name: id }));
+    const active = ensureActiveSteamAccount();
     const item = normalizeHistoryItem({
       type: 'message',
+      steamAccountId: active?.steamId,
       id,
       name: info.player_name || info.personaName || id,
       message: event.message,
@@ -703,9 +1014,11 @@ function createChatService(options: ChatServiceOptions = {}) {
   async function handleSteamEcho(event: SteamFriendMessageEvent) {
     const id = event.id;
     if (isRecent(recentSentText, `${id}:${event.message}`) || isRecent(recentSentText, `${id}:${event.compatibilityMessage}`)) return;
+    const active = ensureActiveSteamAccount();
     const item = normalizeHistoryItem({
       type: 'message',
       echo: true,
+      steamAccountId: active?.steamId,
       id,
       name: await getSelfName(),
       message: event.message,
@@ -728,8 +1041,9 @@ function createChatService(options: ChatServiceOptions = {}) {
       }
 
       if (await handleAuthApi(req, res, url.pathname)) return;
-      if (await handleSteamApi(req, res, url.pathname)) return;
-      if (await handleUsersApi(req, res, url.pathname)) return;
+      if (await handleSteamApi(req, res, url)) return;
+      if (await handleUsersApi(req, res, url)) return;
+      if (await handleAuditApi(req, res, url)) return;
 
       requireLegacyOrSession(req);
 
@@ -739,46 +1053,54 @@ function createChatService(options: ChatServiceOptions = {}) {
           return;
         }
         if (url.pathname === '/api/emoticons') {
-          requireSteamOnline();
+          requireSteamAccountAccess(req, true);
           const data = await getEmoticons({ steamUser, waitForLogin, waitForWebSession });
           jsonResponse(res, 200, data);
           return;
         }
         if (url.pathname === '/api/friends') {
-          requireSteamOnline();
+          requireSteamAccountAccess(req, true);
           jsonResponse(res, 200, await listFriends(steamUser));
           return;
         }
         if (url.pathname === '/api/groups') {
-          requireSteamOnline();
+          requireSteamAccountAccess(req, true);
           jsonResponse(res, 200, await listGroups(steamUser));
           return;
         }
         if (url.pathname === '/history') {
+          const access = requireSteamAccountAccess(req, false);
           jsonResponse(res, 200, await readHistory({
             logPath,
             id: url.searchParams.get('id'),
             limit: url.searchParams.get('limit'),
+            steamAccountId: access.steamAccountId,
+            includeLegacy: access.includeLegacy,
             logger
           }));
           return;
         }
         if (url.pathname === '/conversations') {
+          const access = requireSteamAccountAccess(req, false);
           jsonResponse(res, 200, await buildConversations({
             logPath,
             limit: url.searchParams.get('limit'),
+            steamAccountId: access.steamAccountId,
+            includeLegacy: access.includeLegacy,
             getUserInfo,
             logger
           }));
           return;
         }
         if (url.pathname.startsWith('/proxy/sticker/')) {
+          requireSteamAccountAccess(req, false);
           const type = decodeURIComponent(url.pathname.slice('/proxy/sticker/'.length));
           const sticker = await loadOrDownloadSticker(type, { fetchImpl });
           textResponse(res, 200, sticker.buffer, { 'Content-Type': sticker.contentType, 'Cache-Control': 'public, max-age=86400' });
           return;
         }
         if (url.pathname === '/proxy/image') {
+          requireSteamAccountAccess(req, false);
           const source = url.searchParams.get('url') || '';
           const image = await loadOrDownloadRemoteImage(source, { fetchImpl });
           textResponse(res, 200, image.buffer, { 'Content-Type': image.contentType, 'Cache-Control': 'public, max-age=86400' });
@@ -791,14 +1113,16 @@ function createChatService(options: ChatServiceOptions = {}) {
 
       if (req.method === 'POST' && (url.pathname === '/' || url.pathname === '/message')) {
         const body = await readJsonBody(req);
-        const item = await sendTextMessage(body.id, body.msg);
+        const access = requireSteamAccountAccess(req, true);
+        const item = await sendTextMessage(body.id, body.msg, access.steamAccountId);
         jsonResponse(res, 200, { ok: true, item });
         return;
       }
 
       if (req.method === 'POST' && (url.pathname === '/image' || url.pathname === '/img')) {
         const body = await readJsonBody(req);
-        const item = await sendImageMessage(body.id, body);
+        const access = requireSteamAccountAccess(req, true);
+        const item = await sendImageMessage(body.id, body, access.steamAccountId);
         jsonResponse(res, 200, { ok: true, item });
         return;
       }
@@ -828,41 +1152,59 @@ function createChatService(options: ChatServiceOptions = {}) {
         return;
       }
       if (type === 'send_message' || type === 'msg') {
-        const item = await sendTextMessage(payload.id, payload.msg || payload.message || '');
+        const access = wsAccessContext(ws, true);
+        const item = await sendTextMessage(payload.id, payload.msg || payload.message || '', access.steamAccountId);
         reply({ type: 'message_sent', item });
         return;
       }
       if (type === 'send_image' || type === 'img') {
-        const item = await sendImageMessage(payload.id, payload);
+        const access = wsAccessContext(ws, true);
+        const item = await sendImageMessage(payload.id, payload, access.steamAccountId);
         reply({ type: 'image_sent', item });
         return;
       }
       if (type === 'get_history' || type === 'history') {
+        const access = wsAccessContext(ws, false);
         reply({
           type: 'history',
-          items: await readHistory({ logPath, id: payload.id, limit: payload.limit, logger })
+          items: await readHistory({
+            logPath,
+            id: payload.id,
+            limit: payload.limit,
+            steamAccountId: access.steamAccountId,
+            includeLegacy: access.includeLegacy,
+            logger
+          })
         });
         return;
       }
       if (type === 'get_conversations' || type === 'conversations') {
+        const access = wsAccessContext(ws, false);
         reply({
           type: 'conversations',
-          conversations: await buildConversations({ logPath, limit: payload.limit, getUserInfo, logger })
+          conversations: await buildConversations({
+            logPath,
+            limit: payload.limit,
+            steamAccountId: access.steamAccountId,
+            includeLegacy: access.includeLegacy,
+            getUserInfo,
+            logger
+          })
         });
         return;
       }
       if (type === 'get_emoticons' || type === 'emoticons') {
-        requireSteamOnline();
+        wsAccessContext(ws, true);
         reply({ type: 'emoticons', ...(await getEmoticons({ steamUser, waitForLogin, waitForWebSession })) });
         return;
       }
       if (type === 'get_friends' || type === 'friends') {
-        requireSteamOnline();
+        wsAccessContext(ws, true);
         reply({ type: 'friends', friends: await listFriends(steamUser) });
         return;
       }
       if (type === 'get_groups' || type === 'groups') {
-        requireSteamOnline();
+        wsAccessContext(ws, true);
         reply({ type: 'groups', groups: await listGroups(steamUser) });
         return;
       }
@@ -895,7 +1237,9 @@ function createChatService(options: ChatServiceOptions = {}) {
       legacyAuth.challengeUpgrade(socket);
       return;
     }
+    const session = sessionManager?.getSession(req) || null;
     wss.handleUpgrade(req, socket, head, (ws: WsConnection) => {
+      wsSessions.set(ws, session);
       wss.emit('connection', ws, req);
     });
   });
@@ -908,8 +1252,14 @@ function createChatService(options: ChatServiceOptions = {}) {
     clients.add(ws);
     sendWs(ws, { type: 'ready', wsPath: config.wsPath });
     ws.on('message', (raw: RawData) => handleWsMessage(ws, raw));
-    ws.on('close', () => clients.delete(ws));
-    ws.on('error', () => clients.delete(ws));
+    ws.on('close', () => {
+      clients.delete(ws);
+      wsSessions.delete(ws);
+    });
+    ws.on('error', () => {
+      clients.delete(ws);
+      wsSessions.delete(ws);
+    });
   });
 
   if (steamUser) {

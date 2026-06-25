@@ -1,6 +1,7 @@
 'use strict';
 
 import type { CallbackStyleFunction, Persona, UnknownRecord } from './types';
+import type { IncomingMessage } from 'node:http';
 import { errorMessage, isRecord } from './types';
 
 const winston = require('winston');
@@ -9,8 +10,9 @@ const { createAuthStore } = require('./auth/store');
 const { createSessionManager } = require('./auth/session');
 const { loadConfig } = require('./config/load');
 const { AUTH_DB_PATH, REFRESH_TOKEN_PATH } = require('./paths');
+const { getClientIp } = require('./server/auth');
 const { createChatService } = require('./server/chat-service');
-const { createSteamLoginService } = require('./steam/lifecycle');
+const { createSteamLoginService, readRefreshToken } = require('./steam/lifecycle');
 const {
   steamIdToString
 } = require('./storage/chat-log');
@@ -69,7 +71,11 @@ const steamUser = new SteamUser({ renewRefreshTokens: true });
 const steamCommunity = new SteamCommunity();
 const users: Record<string, Persona> = {};
 const authStore = createAuthStore({ dbPath: AUTH_DB_PATH });
-const sessionManager = createSessionManager({ store: authStore });
+const chatAuthConfig = isRecord(config.chat) && isRecord(config.chat.auth) ? config.chat.auth : {};
+const sessionManager = createSessionManager({
+  store: authStore,
+  getClientIp: (req: IncomingMessage) => getClientIp(req, chatAuthConfig)
+});
 
 const logger = winston.createLogger({
   level: process.env.LOG_LEVEL || 'info',
@@ -135,13 +141,30 @@ const lifecycle = createSteamLoginService({
   },
   logger,
   refreshTokenPath: REFRESH_TOKEN_PATH,
-  getDefaultLogonID: authStore.getOrCreateSteamLogonID
+  getDefaultLogonID: authStore.getOrCreateSteamLogonID,
+  onLoggedOn(steamId: string | null) {
+    if (!steamId) return;
+    authStore.upsertSteamAccount({
+      steamId,
+      refreshToken: readRefreshToken(REFRESH_TOKEN_PATH) || undefined,
+      setActive: true
+    });
+  },
+  onRefreshToken(refreshToken: string, steamId: string | null) {
+    if (!steamId) return;
+    authStore.upsertSteamAccount({
+      steamId,
+      refreshToken,
+      setActive: true
+    });
+  }
 });
 
 createSteamMessageLogger({
   steamUser,
   getUserInfo,
   getSelfName,
+  getSteamAccountId: () => authStore.getActiveSteamAccount(false)?.steamId || steamIdToString(steamUser.steamID || ''),
   logger
 });
 

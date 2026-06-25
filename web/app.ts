@@ -1,16 +1,71 @@
 type Role = 'admin' | 'user';
-type View = 'steam' | 'chat' | 'users' | 'account';
+type View = 'steam' | 'chat' | 'users' | 'steamAccounts' | 'audit' | 'account';
 type Tone = 'muted' | 'ok' | 'warn' | 'error';
+type Permission =
+  | 'user.manage'
+  | 'session.manage'
+  | 'audit.view'
+  | 'steam.manage'
+  | 'steam.account.manage'
+  | 'chat.use'
+  | 'self.password.change';
 
 type User = {
   id: number;
   username: string;
+  displayName: string;
+  note: string;
   role: Role;
   disabled: boolean;
+  forcePasswordChange: boolean;
   sessionVersion: number;
   createdAt: string;
   updatedAt: string;
   lastLoginAt: string | null;
+  lastLoginIp: string | null;
+  lastSeenAt: string | null;
+  passwordChangedAt: string | null;
+  failedLoginCount: number;
+  lockedUntil: string | null;
+  locked: boolean;
+  steamAccountCount: number;
+};
+
+type UserSession = {
+  id: string;
+  userId: number;
+  createdAt: string;
+  lastSeenAt: string;
+  expiresAt: string;
+  ip: string | null;
+  userAgent: string | null;
+};
+
+type SteamAccount = {
+  id: number;
+  steamId: string;
+  label: string;
+  accountNameHint: string;
+  enabled: boolean;
+  createdAt: string;
+  updatedAt: string;
+  lastLoginAt: string | null;
+  lastActiveAt: string | null;
+  refreshTokenUpdatedAt: string | null;
+  authorizedUserCount: number;
+  active: boolean;
+};
+
+type AuditLog = {
+  id: number;
+  actorUserId: number | null;
+  actorUsername: string | null;
+  action: string;
+  targetType: string;
+  targetId: string;
+  detail: Record<string, unknown>;
+  ip: string | null;
+  createdAt: string;
 };
 
 type SteamStatus = {
@@ -21,11 +76,14 @@ type SteamStatus = {
   lastCodeWrong: boolean;
   error: string | null;
   steamId: string | null;
+  activeAccount?: Pick<SteamAccount, 'id' | 'steamId' | 'label'> | null;
+  accessAllowed?: boolean;
 };
 
 type MeResponse = {
   needsSetup: boolean;
   user: User | null;
+  permissions: Permission[];
   steam: SteamStatus;
 };
 
@@ -70,9 +128,14 @@ type WsPayload = Record<string, unknown> & {
 type AppState = {
   me: User | null;
   needsSetup: boolean;
+  permissions: Permission[];
   steam: SteamStatus;
   view: View;
   users: User[];
+  userSessions: Record<number, UserSession[]>;
+  userSteamAccounts: Record<number, SteamAccount[]>;
+  steamAccounts: SteamAccount[];
+  auditLogs: AuditLog[];
   conversations: ListEntry[];
   friends: ListEntry[];
   groups: ListEntry[];
@@ -85,6 +148,11 @@ type AppState = {
   ws: WebSocket | null;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   statusTimer: ReturnType<typeof setInterval> | null;
+  userQuery: string;
+  userRole: string;
+  userStatus: string;
+  auditAction: string;
+  auditTargetType: string;
   feedback: string;
   feedbackTone: Tone;
 };
@@ -96,7 +164,9 @@ const defaultSteamStatus: SteamStatus = {
   domain: null,
   lastCodeWrong: false,
   error: null,
-  steamId: null
+  steamId: null,
+  activeAccount: null,
+  accessAllowed: false
 };
 
 const root = document.querySelector<HTMLElement>('#app');
@@ -105,9 +175,14 @@ if (!root) throw new Error('Missing app root');
 const state: AppState = {
   me: null,
   needsSetup: false,
+  permissions: [],
   steam: defaultSteamStatus,
   view: normalizeView(localStorage.getItem('steam-chat.view')),
   users: [],
+  userSessions: {},
+  userSteamAccounts: {},
+  steamAccounts: [],
+  auditLogs: [],
   conversations: [],
   friends: [],
   groups: [],
@@ -120,6 +195,11 @@ const state: AppState = {
   ws: null,
   reconnectTimer: null,
   statusTimer: null,
+  userQuery: '',
+  userRole: '',
+  userStatus: '',
+  auditAction: '',
+  auditTargetType: '',
   feedback: '就绪',
   feedbackTone: 'muted'
 };
@@ -151,7 +231,7 @@ function clampLimit(value: unknown): number {
 
 function normalizeView(value: unknown): View {
   const view = String(value || '');
-  return view === 'steam' || view === 'chat' || view === 'users' || view === 'account' ? view : 'steam';
+  return view === 'steam' || view === 'chat' || view === 'users' || view === 'steamAccounts' || view === 'audit' || view === 'account' ? view : 'steam';
 }
 
 function asListEntries(value: unknown): ListEntry[] {
@@ -192,6 +272,35 @@ function steamOnline() {
   return state.steam.status === 'online';
 }
 
+function steamAccessAllowed() {
+  return state.steam.accessAllowed !== false;
+}
+
+function hasPermission(permission: Permission) {
+  return state.permissions.includes(permission);
+}
+
+function displayName(user: User) {
+  return user.displayName || user.username;
+}
+
+function dateTime(value: unknown): string {
+  if (!value) return '无';
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) return String(value);
+  return date.toLocaleString('zh-CN', {
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit'
+  });
+}
+
+function compactJson(value: unknown): string {
+  if (!isRecord(value) || !Object.keys(value).length) return '{}';
+  return JSON.stringify(value);
+}
+
 function steamStatusSignature(status = state.steam) {
   return [
     status.status,
@@ -200,7 +309,9 @@ function steamStatusSignature(status = state.steam) {
     status.domain || '',
     status.lastCodeWrong,
     status.error || '',
-    status.steamId || ''
+    status.steamId || '',
+    status.activeAccount?.id || '',
+    status.accessAllowed
   ].join('|');
 }
 
@@ -232,6 +343,7 @@ async function api(path: string, options: RequestInit = {}): Promise<unknown> {
     if (response.status === 401 && !path.startsWith('/api/auth/me') && !path.startsWith('/api/auth/login')) {
       stopWebSocket();
       state.me = null;
+      state.permissions = [];
       state.needsSetup = false;
       renderLogin();
     }
@@ -322,12 +434,18 @@ function navButton(view: View, label: string) {
   return button;
 }
 
+function panel(title: string, className = '') {
+  const section = create('section', `panel${className ? ` ${className}` : ''}`);
+  section.append(create('h2', 'panel-title', title));
+  return section;
+}
+
 function renderShell() {
   if (!state.me) {
     renderLogin();
     return;
   }
-  if (state.me.role !== 'admin' && state.view === 'users') state.view = 'steam';
+  if (state.me.role !== 'admin' && ['users', 'steamAccounts', 'audit'].includes(state.view)) state.view = 'steam';
   clear(root);
   const shell = create('div', 'admin-shell');
   const sidebar = create('aside', 'admin-sidebar');
@@ -335,7 +453,9 @@ function renderShell() {
   brand.append(create('strong', '', 'Steam Chat'), create('span', '', state.me.username));
   const nav = create('nav');
   nav.append(navButton('steam', 'Steam 连接'), navButton('chat', '聊天'));
-  if (state.me.role === 'admin') nav.append(navButton('users', '用户管理'));
+  if (hasPermission('user.manage')) nav.append(navButton('users', '用户管理'));
+  if (hasPermission('steam.account.manage')) nav.append(navButton('steamAccounts', 'Steam 账户'));
+  if (hasPermission('audit.view')) nav.append(navButton('audit', '审计日志'));
   nav.append(navButton('account', '账号'));
   sidebar.append(brand, nav);
 
@@ -366,7 +486,12 @@ function renderShell() {
   shell.append(sidebar, main);
   root.append(shell);
   if (state.view === 'chat') void refreshChatData();
-  if (state.view === 'users' && state.me.role === 'admin') void loadUsers();
+  if (state.view === 'users' && hasPermission('user.manage')) {
+    void loadSteamAccounts();
+    void loadUsers();
+  }
+  if (state.view === 'steamAccounts') void loadSteamAccounts();
+  if (state.view === 'audit') void loadAuditLogs();
   ensureWebSocket();
   startStatusPolling();
 }
@@ -374,20 +499,29 @@ function renderShell() {
 function pageTitle() {
   if (state.view === 'chat') return '聊天';
   if (state.view === 'users') return '用户管理';
+  if (state.view === 'steamAccounts') return 'Steam 账户';
+  if (state.view === 'audit') return '审计日志';
   if (state.view === 'account') return '账号';
   return 'Steam 连接';
 }
 
 function pageSubtitle() {
-  if (state.view === 'chat') return steamOnline() ? '好友、群组、历史和实时消息' : 'Steam 未在线，聊天操作已禁用';
-  if (state.view === 'users') return '后台用户、角色和启用状态';
+  if (state.view === 'chat') {
+    if (!steamAccessAllowed()) return '当前后台用户未被授权访问活动 Steam 账户';
+    return steamOnline() ? '好友、群组、历史和实时消息' : 'Steam 未在线，聊天操作已禁用';
+  }
+  if (state.view === 'users') return '后台用户、会话、角色、资料和 Steam 授权';
+  if (state.view === 'steamAccounts') return 'Steam 账户资料、连接状态和授权计数';
+  if (state.view === 'audit') return '关键管理动作和敏感字段脱敏记录';
   if (state.view === 'account') return '修改当前后台账号密码';
   return state.me?.role === 'admin' ? '管理员在这里完成 Steam 登录和 Guard 验证' : '等待管理员连接 Steam';
 }
 
 function renderCurrentView() {
   if (state.view === 'chat') return renderChatView();
-  if (state.view === 'users' && state.me?.role === 'admin') return renderUsersView();
+  if (state.view === 'users' && hasPermission('user.manage')) return renderUsersView();
+  if (state.view === 'steamAccounts' && hasPermission('steam.account.manage')) return renderSteamAccountsView();
+  if (state.view === 'audit' && hasPermission('audit.view')) return renderAuditView();
   if (state.view === 'account') return renderAccountView();
   return renderSteamView();
 }
@@ -396,16 +530,22 @@ function renderSteamView() {
   const view = create('div', 'steam-view');
   const summary = create('section', 'status-panel');
   const statusText = create('strong', '', steamLabel());
-  const detail = create('p', 'muted', state.steam.error || (state.steam.steamId ? `当前 SteamID：${state.steam.steamId}` : '当前没有可用的 Steam 会话'));
+  const activeLabel = state.steam.activeAccount
+    ? `${state.steam.activeAccount.label || state.steam.activeAccount.steamId} · ${state.steam.activeAccount.steamId}`
+    : state.steam.steamId ? `当前 SteamID：${state.steam.steamId}` : '当前没有可用的 Steam 会话';
+  const detail = create('p', 'muted', state.steam.error || activeLabel);
   summary.append(statusText, detail);
   view.append(summary);
 
   if (state.me?.role !== 'admin') {
-    view.append(create('p', 'muted', '普通用户只能在 Steam 在线后使用聊天。'));
+    const access = panel('访问状态', 'status-note-panel');
+    access.append(create('p', state.steam.accessAllowed === false ? 'warn-text' : 'muted', state.steam.accessAllowed === false ? '当前账号未被授权访问活动 Steam 账户。' : '普通用户只能在 Steam 在线且被授权后使用聊天。'));
+    view.append(access);
     return view;
   }
 
   if (state.steam.requiresGuard) {
+    const guardPanel = panel('Steam Guard', 'form-panel');
     const guardForm = create('form', 'inline-form') as HTMLFormElement;
     const guardText = state.steam.guardType === 'email'
       ? `邮箱验证码${state.steam.domain ? `：${state.steam.domain}` : ''}`
@@ -430,10 +570,13 @@ function renderSteamView() {
         setFeedback(errorMessage(error), 'error');
       }
     });
-    view.append(guardForm);
+    guardPanel.append(guardForm);
+    view.append(guardPanel);
   } else if (!['logging_in', 'online', 'reconnecting'].includes(state.steam.status)) {
+    const loginPanel = panel('登录 Steam', 'form-panel');
     const loginForm = create('form', 'stack-form narrow-form') as HTMLFormElement;
     loginForm.innerHTML = `
+      <label>显示名称<input name="label" autocomplete="off" placeholder="例如：客服一号"></label>
       <label>Steam 账号<input name="accountName" autocomplete="username" required></label>
       <label>Steam 密码<input name="password" type="password" autocomplete="current-password" required></label>
       <label>Logon ID<input name="logonID" inputmode="numeric" placeholder="留空使用后台固定值"></label>
@@ -446,6 +589,7 @@ function renderSteamView() {
         const result = await api('/api/steam/login', jsonBody({
           accountName: formValue(loginForm, 'accountName'),
           password: formValue(loginForm, 'password'),
+          label: formValue(loginForm, 'label'),
           ...(rawLogonID ? { logonID: Number(rawLogonID) } : {})
         }));
         updateSteamStatus(result as SteamStatus);
@@ -454,9 +598,11 @@ function renderSteamView() {
         setFeedback(errorMessage(error), 'error');
       }
     });
-    view.append(loginForm);
+    loginPanel.append(loginForm);
+    view.append(loginPanel);
   }
 
+  const actions = create('div', 'page-actions');
   const logout = create('button', 'danger-btn', '退出 Steam 并删除 token');
   logout.type = 'button';
   logout.disabled = state.steam.status === 'logged_out';
@@ -469,17 +615,39 @@ function renderSteamView() {
       setFeedback(errorMessage(error), 'error');
     }
   });
-  view.append(logout);
+  actions.append(logout);
+  view.append(actions);
   return view;
 }
 
 function renderUsersView() {
   const view = create('div', 'users-view');
+  const filterPanel = panel('筛选', 'toolbar-panel');
+  const filters = create('form', 'inline-form user-filters') as HTMLFormElement;
+  filters.innerHTML = `
+    <label>搜索<input name="query" value="${state.userQuery}" placeholder="账号、昵称、备注"></label>
+    <label>角色<select name="role"><option value="">全部</option><option value="admin">管理员</option><option value="user">普通用户</option></select></label>
+    <label>状态<select name="status"><option value="">全部</option><option value="enabled">启用</option><option value="disabled">禁用</option><option value="locked">锁定</option></select></label>
+    <button type="submit">筛选</button>
+  `;
+  (filters.elements.namedItem('role') as HTMLSelectElement).value = state.userRole;
+  (filters.elements.namedItem('status') as HTMLSelectElement).value = state.userStatus;
+  filters.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    state.userQuery = formValue(filters, 'query');
+    state.userRole = formValue(filters, 'role');
+    state.userStatus = formValue(filters, 'status');
+    await loadUsers();
+  });
+  filterPanel.append(filters);
+  const createPanel = panel('新增用户', 'toolbar-panel');
   const form = create('form', 'inline-form user-create') as HTMLFormElement;
   form.innerHTML = `
     <label>账号<input name="username" minlength="3" maxlength="64" required></label>
+    <label>昵称<input name="displayName" maxlength="80"></label>
     <label>密码<input name="password" type="password" minlength="8" required></label>
     <label>角色<select name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></label>
+    <label>备注<input name="note" maxlength="500"></label>
     <button type="submit">新增用户</button>
   `;
   form.addEventListener('submit', async (event) => {
@@ -487,8 +655,10 @@ function renderUsersView() {
     try {
       await api('/api/users', jsonBody({
         username: formValue(form, 'username'),
+        displayName: formValue(form, 'displayName'),
         password: formValue(form, 'password'),
-        role: formValue(form, 'role') || 'user'
+        role: formValue(form, 'role') || 'user',
+        note: formValue(form, 'note')
       }));
       form.reset();
       await loadUsers();
@@ -496,9 +666,12 @@ function renderUsersView() {
       setFeedback(errorMessage(error), 'error');
     }
   });
+  createPanel.append(form);
+  const listPanel = panel('用户列表', 'list-panel');
   const table = create('div', 'user-table');
   table.id = 'userTable';
-  view.append(form, table);
+  listPanel.append(table);
+  view.append(filterPanel, createPanel, listPanel);
   renderUserTable(table);
   return view;
 }
@@ -512,8 +685,17 @@ function renderUserTable(container: HTMLElement) {
   for (const user of state.users) {
     const row = create('article', 'user-row');
     const info = create('div');
-    info.append(create('strong', '', user.username), create('span', 'muted', `${user.role === 'admin' ? '管理员' : '普通用户'} · ${user.disabled ? '已禁用' : '启用'}`));
+    const status = user.locked ? '锁定' : user.disabled ? '已禁用' : '启用';
+    info.append(
+      create('strong', '', `${displayName(user)} (${user.username})`),
+      create('span', 'muted', `${user.role === 'admin' ? '管理员' : '普通用户'} · ${status} · 授权 ${user.steamAccountCount || 0} 个 Steam 账户`),
+      create('span', 'muted', `最近登录 ${dateTime(user.lastLoginAt)} · IP ${user.lastLoginIp || '无'} · 活跃 ${dateTime(user.lastSeenAt)}`),
+      create('span', 'muted', user.note ? `备注：${user.note}` : '无备注')
+    );
     const actions = create('div', 'row-actions');
+    const profile = create('button', 'ghost-btn', '编辑资料');
+    profile.type = 'button';
+    profile.addEventListener('click', () => editUserProfile(user));
     const role = create('button', 'ghost-btn', user.role === 'admin' ? '降为用户' : '设为管理员');
     role.type = 'button';
     role.disabled = user.id === state.me?.id;
@@ -525,26 +707,99 @@ function renderUserTable(container: HTMLElement) {
     const password = create('button', 'ghost-btn', '重置密码');
     password.type = 'button';
     password.addEventListener('click', () => resetUserPassword(user.id));
+    const forcePassword = create('button', 'ghost-btn', user.forcePasswordChange ? '取消强制改密' : '要求改密');
+    forcePassword.type = 'button';
+    forcePassword.addEventListener('click', () => patchUser(user.id, { forcePasswordChange: !user.forcePasswordChange }));
+    const sessions = create('button', 'ghost-btn', '会话');
+    sessions.type = 'button';
+    sessions.addEventListener('click', () => loadUserSessions(user.id));
+    const grants = create('button', 'ghost-btn', '授权');
+    grants.type = 'button';
+    grants.addEventListener('click', () => loadUserSteamAccounts(user.id));
     const remove = create('button', 'danger-btn', '删除');
     remove.type = 'button';
     remove.disabled = user.id === state.me?.id;
     remove.addEventListener('click', () => deleteUser(user.id));
-    actions.append(role, disabled, password, remove);
+    actions.append(profile, role, disabled, password, forcePassword, sessions, grants, remove);
     row.append(info, actions);
+    const detail = renderUserDetail(user);
+    if (detail) row.append(detail);
     container.append(row);
   }
 }
 
+function renderUserDetail(user: User): HTMLElement | null {
+  const sessions = state.userSessions[user.id];
+  const grants = state.userSteamAccounts[user.id];
+  if (!sessions && !grants) return null;
+  const detail = create('div', 'user-detail');
+  if (sessions) {
+    const block = create('section', 'detail-block');
+    const revokeAll = create('button', 'danger-btn', '踢下线全部会话');
+    revokeAll.type = 'button';
+    revokeAll.addEventListener('click', () => revokeUserSessions(user.id));
+    block.append(create('h3', '', '会话'), revokeAll);
+    if (!sessions.length) block.append(create('div', 'empty small', '暂无活动会话'));
+    for (const session of sessions) {
+      const row = create('div', 'session-row');
+      row.append(create('span', '', `${dateTime(session.lastSeenAt)} · ${session.ip || '未知 IP'}`), create('span', 'muted', session.userAgent || '无 User-Agent'));
+      const revoke = create('button', 'danger-btn', '踢下线');
+      revoke.type = 'button';
+      revoke.addEventListener('click', () => revokeSession(user.id, session.id));
+      row.append(revoke);
+      block.append(row);
+    }
+    detail.append(block);
+  }
+  if (grants) {
+    const form = create('form', 'grant-grid') as HTMLFormElement;
+    form.append(create('h3', '', 'Steam 授权'));
+    if (!state.steamAccounts.length) form.append(create('div', 'empty small', '暂无 Steam 账户'));
+    for (const account of state.steamAccounts) {
+      const label = create('label', 'check-row');
+      const input = create('input') as HTMLInputElement;
+      input.type = 'checkbox';
+      input.name = 'steamAccountIds';
+      input.value = String(account.id);
+      input.checked = grants.some((item) => item.id === account.id);
+      label.append(input, create('span', '', `${account.label || account.steamId} · ${account.enabled ? '启用' : '禁用'}`));
+      form.append(label);
+    }
+    const save = create('button', 'primary-btn', '保存授权');
+    save.type = 'submit';
+    form.append(save);
+    form.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const ids = [...form.querySelectorAll<HTMLInputElement>('input[name="steamAccountIds"]:checked')].map((input) => Number(input.value));
+      await saveUserSteamAccounts(user.id, ids);
+    });
+    detail.append(form);
+  }
+  return detail;
+}
+
 async function loadUsers() {
-  if (state.me?.role !== 'admin') return;
+  if (!hasPermission('user.manage')) return;
   try {
-    const payload = await api('/api/users');
+    const params = new URLSearchParams();
+    if (state.userQuery) params.set('query', state.userQuery);
+    if (state.userRole) params.set('role', state.userRole);
+    if (state.userStatus) params.set('status', state.userStatus);
+    const payload = await api(`/api/users${params.size ? `?${params}` : ''}`);
     state.users = isRecord(payload) && Array.isArray(payload.users) ? payload.users as User[] : [];
     const table = document.querySelector<HTMLElement>('#userTable');
     if (table) renderUserTable(table);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
+}
+
+async function editUserProfile(user: User) {
+  const display = window.prompt('昵称', user.displayName);
+  if (display === null) return;
+  const note = window.prompt('备注', user.note);
+  if (note === null) return;
+  await patchUser(user.id, { displayName: display, note });
 }
 
 async function patchUser(id: number, patch: Record<string, unknown>) {
@@ -563,9 +818,65 @@ async function patchUser(id: number, patch: Record<string, unknown>) {
 async function resetUserPassword(id: number) {
   const password = window.prompt('输入新密码，至少 8 位');
   if (!password) return;
+  const forcePasswordChange = window.confirm('要求该用户下次登录后修改密码？');
   try {
-    await api(`/api/users/${id}/password`, jsonBody({ password }));
+    await api(`/api/users/${id}/password`, jsonBody({ password, forcePasswordChange }));
     setFeedback('密码已重置', 'ok');
+    await loadUsers();
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  }
+}
+
+async function loadUserSessions(id: number) {
+  try {
+    const payload = await api(`/api/users/${id}/sessions`);
+    state.userSessions[id] = isRecord(payload) && Array.isArray(payload.sessions) ? payload.sessions as UserSession[] : [];
+    renderShell();
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  }
+}
+
+async function revokeSession(userId: number, sessionId: string) {
+  try {
+    await api(`/api/users/${userId}/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
+    await loadUserSessions(userId);
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  }
+}
+
+async function revokeUserSessions(userId: number) {
+  try {
+    await api(`/api/users/${userId}/sessions`, { method: 'DELETE' });
+    await loadUserSessions(userId);
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  }
+}
+
+async function loadUserSteamAccounts(id: number) {
+  try {
+    await loadSteamAccounts();
+    const payload = await api(`/api/users/${id}/steam-accounts`);
+    state.userSteamAccounts[id] = isRecord(payload) && Array.isArray(payload.steamAccounts) ? payload.steamAccounts as SteamAccount[] : [];
+    renderShell();
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  }
+}
+
+async function saveUserSteamAccounts(id: number, steamAccountIds: number[]) {
+  try {
+    const payload = await api(`/api/users/${id}/steam-accounts`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ steamAccountIds })
+    });
+    state.userSteamAccounts[id] = isRecord(payload) && Array.isArray(payload.steamAccounts) ? payload.steamAccounts as SteamAccount[] : [];
+    setFeedback('授权已保存', 'ok');
+    await loadUsers();
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
@@ -581,7 +892,207 @@ async function deleteUser(id: number) {
   }
 }
 
+function renderSteamAccountsView() {
+  const view = create('div', 'steam-accounts-view');
+  if (hasPermission('steam.manage')) {
+    const loginPanel = panel('登录新账户', 'toolbar-panel');
+    const loginForm = create('form', 'inline-form steam-account-login') as HTMLFormElement;
+    loginForm.innerHTML = `
+      <label>显示名称<input name="label" maxlength="80"></label>
+      <label>Steam 账号<input name="accountName" autocomplete="username" required></label>
+      <label>Steam 密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <label>Logon ID<input name="logonID" inputmode="numeric"></label>
+      <button type="submit">登录新账户</button>
+    `;
+    loginForm.addEventListener('submit', async (event) => {
+      event.preventDefault();
+      const rawLogonID = formValue(loginForm, 'logonID').trim();
+      try {
+        const status = await api('/api/steam/accounts/login', jsonBody({
+          label: formValue(loginForm, 'label'),
+          accountName: formValue(loginForm, 'accountName'),
+          password: formValue(loginForm, 'password'),
+          ...(rawLogonID ? { logonID: Number(rawLogonID) } : {})
+        }));
+        updateSteamStatus(status as SteamStatus);
+        loginForm.reset();
+        await loadSteamAccounts();
+      } catch (error) {
+        setFeedback(errorMessage(error), 'error');
+      }
+    });
+    loginPanel.append(loginForm);
+    view.append(loginPanel);
+  }
+  const listPanel = panel('账户列表', 'list-panel');
+  const list = create('div', 'account-table');
+  list.id = 'steamAccountTable';
+  listPanel.append(list);
+  view.append(listPanel);
+  renderSteamAccountTable(list);
+  return view;
+}
+
+function renderSteamAccountTable(container: HTMLElement) {
+  clear(container);
+  if (!state.steamAccounts.length) {
+    container.append(create('div', 'empty', '暂无 Steam 账户'));
+    return;
+  }
+  for (const account of state.steamAccounts) {
+    const row = create('article', 'account-row');
+    const info = create('div');
+    info.append(
+      create('strong', '', account.label || account.steamId),
+      create('span', 'muted', `${account.steamId} · ${account.active ? '当前活动' : '未连接'} · ${account.enabled ? '启用' : '禁用'} · 授权 ${account.authorizedUserCount || 0} 人`),
+      create('span', 'muted', `最近登录 ${dateTime(account.lastLoginAt)} · 活跃 ${dateTime(account.lastActiveAt)} · token ${dateTime(account.refreshTokenUpdatedAt)}`),
+      create('span', 'muted', account.accountNameHint ? `账号提示：${account.accountNameHint}` : '无账号提示')
+    );
+    const actions = create('div', 'row-actions');
+    const connect = create('button', 'ghost-btn', '连接');
+    connect.type = 'button';
+    connect.disabled = account.active || !account.enabled;
+    connect.addEventListener('click', () => connectSteamAccount(account.id));
+    const edit = create('button', 'ghost-btn', '编辑');
+    edit.type = 'button';
+    edit.addEventListener('click', () => editSteamAccount(account));
+    const toggle = create('button', 'ghost-btn', account.enabled ? '禁用' : '启用');
+    toggle.type = 'button';
+    toggle.addEventListener('click', () => patchSteamAccount(account.id, { enabled: !account.enabled }));
+    const logout = create('button', 'ghost-btn', '退出');
+    logout.type = 'button';
+    logout.disabled = !account.active;
+    logout.addEventListener('click', () => logoutSteamAccount(account.id));
+    const remove = create('button', 'danger-btn', '删除');
+    remove.type = 'button';
+    remove.addEventListener('click', () => deleteSteamAccount(account.id));
+    actions.append(connect, edit, toggle, logout, remove);
+    row.append(info, actions);
+    container.append(row);
+  }
+}
+
+async function loadSteamAccounts() {
+  try {
+    const payload = await api('/api/steam/accounts');
+    state.steamAccounts = isRecord(payload) && Array.isArray(payload.steamAccounts) ? payload.steamAccounts as SteamAccount[] : [];
+    const table = document.querySelector<HTMLElement>('#steamAccountTable');
+    if (table) renderSteamAccountTable(table);
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  }
+}
+
+async function connectSteamAccount(id: number) {
+  try {
+    const status = await api(`/api/steam/accounts/${id}/connect`, { method: 'POST' });
+    updateSteamStatus(status as SteamStatus);
+    await loadSteamAccounts();
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  }
+}
+
+async function editSteamAccount(account: SteamAccount) {
+  const label = window.prompt('显示名称', account.label);
+  if (label === null) return;
+  const accountNameHint = window.prompt('账号提示', account.accountNameHint);
+  if (accountNameHint === null) return;
+  await patchSteamAccount(account.id, { label, accountNameHint });
+}
+
+async function patchSteamAccount(id: number, patch: Record<string, unknown>) {
+  try {
+    await api(`/api/steam/accounts/${id}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(patch)
+    });
+    await loadSteamAccounts();
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  }
+}
+
+async function logoutSteamAccount(id: number) {
+  try {
+    const status = await api(`/api/steam/accounts/${id}/logout`, { method: 'POST' });
+    updateSteamStatus(status as SteamStatus);
+    await loadSteamAccounts();
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  }
+}
+
+async function deleteSteamAccount(id: number) {
+  if (!window.confirm('确认删除该 Steam 账户资料和授权关系？')) return;
+  try {
+    await api(`/api/steam/accounts/${id}`, { method: 'DELETE' });
+    await loadSteamAccounts();
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  }
+}
+
+function renderAuditView() {
+  const view = create('div', 'audit-view');
+  const filterPanel = panel('筛选', 'toolbar-panel');
+  const filters = create('form', 'inline-form audit-filters') as HTMLFormElement;
+  filters.innerHTML = `
+    <label>动作<input name="action" value="${state.auditAction}" placeholder="例如 user.update"></label>
+    <label>目标类型<input name="targetType" value="${state.auditTargetType}" placeholder="user / steam_account"></label>
+    <button type="submit">筛选</button>
+  `;
+  filters.addEventListener('submit', async (event) => {
+    event.preventDefault();
+    state.auditAction = formValue(filters, 'action');
+    state.auditTargetType = formValue(filters, 'targetType');
+    await loadAuditLogs();
+  });
+  filterPanel.append(filters);
+  const listPanel = panel('日志列表', 'list-panel');
+  const table = create('div', 'audit-table');
+  table.id = 'auditTable';
+  listPanel.append(table);
+  view.append(filterPanel, listPanel);
+  renderAuditTable(table);
+  return view;
+}
+
+function renderAuditTable(container: HTMLElement) {
+  clear(container);
+  if (!state.auditLogs.length) {
+    container.append(create('div', 'empty', '暂无审计日志'));
+    return;
+  }
+  for (const item of state.auditLogs) {
+    const row = create('article', 'audit-row');
+    row.append(
+      create('strong', '', `${dateTime(item.createdAt)} · ${item.action}`),
+      create('span', 'muted', `操作者 ${item.actorUsername || item.actorUserId || '系统'} · ${item.targetType}:${item.targetId} · ${item.ip || '无 IP'}`),
+      create('code', '', compactJson(item.detail))
+    );
+    container.append(row);
+  }
+}
+
+async function loadAuditLogs() {
+  try {
+    const params = new URLSearchParams();
+    if (state.auditAction) params.set('action', state.auditAction);
+    if (state.auditTargetType) params.set('targetType', state.auditTargetType);
+    const payload = await api(`/api/audit-logs${params.size ? `?${params}` : ''}`);
+    state.auditLogs = isRecord(payload) && Array.isArray(payload.auditLogs) ? payload.auditLogs as AuditLog[] : [];
+    const table = document.querySelector<HTMLElement>('#auditTable');
+    if (table) renderAuditTable(table);
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  }
+}
+
 function renderAccountView() {
+  const view = create('div', 'account-view');
+  const accountPanel = panel('修改密码', 'form-panel');
   const form = create('form', 'stack-form narrow-form') as HTMLFormElement;
   form.innerHTML = `
     <label>当前密码<input name="oldPassword" type="password" autocomplete="current-password" required></label>
@@ -601,7 +1112,9 @@ function renderAccountView() {
       setFeedback(errorMessage(error), 'error');
     }
   });
-  return form;
+  accountPanel.append(form);
+  view.append(accountPanel);
+  return view;
 }
 
 function renderChatView() {
@@ -739,18 +1252,31 @@ function renderComposer() {
 }
 
 function updateChatAvailability() {
-  const disabled = !steamOnline();
+  const disabled = !steamOnline() || !steamAccessAllowed();
   for (const selector of ['#messageInput', '#sendButton', '#pickerToggle', '#fileButton', '.image-url-form input', '.image-url-form button']) {
     document.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>(selector).forEach((node) => {
       node.disabled = disabled;
     });
   }
   const note = document.querySelector<HTMLElement>('#offlineNote');
-  if (note) note.hidden = !disabled;
+  if (note) {
+    note.textContent = !steamAccessAllowed() ? '当前账号未被授权访问活动 Steam 账户。' : 'Steam 未在线，聊天发送和素材操作不可用。';
+    note.hidden = !disabled;
+  }
 }
 
 async function refreshChatData() {
   if (!state.me) return;
+  if (!steamAccessAllowed()) {
+    state.conversations = [];
+    state.friends = [];
+    state.groups = [];
+    state.emoticons = [];
+    state.stickers = [];
+    updateChatLists();
+    updateChatAvailability();
+    return;
+  }
   try {
     const conversations = await api(`/conversations?limit=${state.historyLimit}`);
     state.conversations = asListEntries(conversations);
@@ -976,7 +1502,7 @@ function renderPicker(container: HTMLElement) {
 }
 
 function ensureWebSocket() {
-  if (!state.me || state.ws || state.reconnectTimer) return;
+  if (!state.me || !steamAccessAllowed() || state.ws || state.reconnectTimer) return;
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${protocol}//${location.host}${state.wsPath}`);
   state.ws = ws;
@@ -1053,6 +1579,7 @@ async function logoutApp() {
   stopStatusPolling();
   stopWebSocket();
   state.me = null;
+  state.permissions = [];
   renderLogin();
 }
 
@@ -1060,6 +1587,7 @@ async function bootstrap() {
   const mePayload = await api('/api/auth/me') as MeResponse;
   state.needsSetup = Boolean(mePayload.needsSetup);
   state.me = mePayload.user || null;
+  state.permissions = Array.isArray(mePayload.permissions) ? mePayload.permissions : [];
   updateSteamStatus(mePayload.steam || defaultSteamStatus);
   if (state.needsSetup) {
     renderSetup();

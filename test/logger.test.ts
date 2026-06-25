@@ -126,3 +126,41 @@ test('appendLog and buildConversations generate previews and newest-first summar
   assert.equal(conversations[0].preview, '[图片]');
   assert.equal(conversations[1].preview, '[贴纸] happy');
 });
+
+test('readHistory and buildConversations filter by steam account and keep legacy rows admin-only', async () => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'steam-chat-log-'));
+  const logPath = path.join(dir, 'chat.jsonl');
+  await appendLog({
+    steamAccountId: '76561198000000000',
+    id: '1',
+    name: 'Alice',
+    message: 'account one',
+    ordinal: 1,
+    date: '2026-06-23 10:00:00.000'
+  }, { logPath });
+  await appendLog({
+    steamAccountId: '76561198000000001',
+    id: '1',
+    name: 'Alice',
+    message: 'account two',
+    ordinal: 1,
+    date: '2026-06-23 10:01:00.000'
+  }, { logPath });
+  await appendLog({
+    id: '2',
+    name: 'Legacy',
+    message: 'legacy',
+    ordinal: 1,
+    date: '2026-06-23 10:02:00.000'
+  }, { logPath });
+
+  const accountHistory = await readHistory({ logPath, steamAccountId: '76561198000000000', limit: 10 });
+  assert.deepEqual(accountHistory.map((item: { message: string }) => item.message), ['account one']);
+
+  const adminHistory = await readHistory({ logPath, steamAccountId: '76561198000000000', includeLegacy: true, limit: 10 });
+  assert.deepEqual(adminHistory.map((item: { message: string }) => item.message), ['account one', 'legacy']);
+
+  const conversations = await buildConversations({ logPath, steamAccountId: '76561198000000001' });
+  assert.equal(conversations.length, 1);
+  assert.equal(conversations[0].preview, 'account two');
+});
