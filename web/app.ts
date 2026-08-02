@@ -108,6 +108,13 @@ type MessageItem = ListEntry & {
   ordinal?: string | number | null;
 };
 
+type OpenGraphPreview = {
+  url: string;
+  imageUrl: string;
+  title: string;
+  description: string;
+};
+
 type InventoryItem = Record<string, unknown> & {
   name?: string;
   use_count?: number | string;
@@ -1363,6 +1370,190 @@ function renderMessage(item: MessageItem) {
 }
 
 function appendMessageText(container: HTMLElement, text: string) {
+  const lowerText = text.toLowerCase();
+  let lastIndex = 0;
+  while (lastIndex < text.length) {
+    const start = findOpenGraphStart(lowerText, lastIndex);
+    if (start < 0) break;
+    if (start > lastIndex) appendInlineMessageText(container, text.slice(lastIndex, start));
+
+    const openEnd = findOpenGraphTagEnd(text, start + 3);
+    if (openEnd < 0) {
+      appendInlineMessageText(container, text.slice(start));
+      return;
+    }
+    const closeStart = lowerText.indexOf('[/og]', openEnd + 1);
+    if (closeStart < 0) {
+      appendInlineMessageText(container, text.slice(start));
+      return;
+    }
+
+    const blockEnd = closeStart + '[/og]'.length;
+    const preview = parseOpenGraphPreview(text.slice(start + 3, openEnd));
+    if (preview) {
+      container.append(openGraphNode(preview));
+      const body = text.slice(openEnd + 1, closeStart);
+      if (body.trim() !== preview.url) appendInlineMessageText(container, body);
+    } else {
+      appendInlineMessageText(container, text.slice(start, blockEnd));
+    }
+    lastIndex = blockEnd;
+  }
+  if (lastIndex < text.length) appendInlineMessageText(container, text.slice(lastIndex));
+}
+
+function findOpenGraphStart(lowerText: string, fromIndex: number): number {
+  let start = lowerText.indexOf('[og', fromIndex);
+  while (start >= 0) {
+    const next = lowerText[start + 3];
+    if (next === ']' || /\s/.test(next)) return start;
+    start = lowerText.indexOf('[og', start + 3);
+  }
+  return -1;
+}
+
+function findOpenGraphTagEnd(text: string, fromIndex: number): number {
+  let quote = '';
+  for (let index = fromIndex; index < text.length; index += 1) {
+    const character = text[index];
+    if (quote) {
+      if (character === '\\' && index + 1 < text.length) index += 1;
+      else if (character === quote) quote = '';
+    } else if (character === '"' || character === "'") {
+      quote = character;
+    } else if (character === ']') {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function parseOpenGraphPreview(attributes: string): OpenGraphPreview | null {
+  const values = parseOpenGraphAttributes(attributes);
+  if (!values) return null;
+  const url = httpUrl(values.url);
+  if (!url) return null;
+  return {
+    url,
+    imageUrl: httpUrl(values.img),
+    title: values.title || '',
+    description: values.desc || ''
+  };
+}
+
+function parseOpenGraphAttributes(source: string): Record<string, string> | null {
+  const values: Record<string, string> = {};
+  const allowed = new Set(['url', 'img', 'title', 'desc']);
+  let index = 0;
+  while (index < source.length) {
+    while (index < source.length && /\s/.test(source[index])) index += 1;
+    if (index >= source.length) break;
+    if (!/[a-z_]/i.test(source[index])) return null;
+
+    const nameStart = index;
+    index += 1;
+    while (index < source.length && /[a-z0-9_-]/i.test(source[index])) index += 1;
+    const name = source.slice(nameStart, index).toLowerCase();
+    if (!allowed.has(name) || Object.hasOwn(values, name)) return null;
+
+    while (index < source.length && /\s/.test(source[index])) index += 1;
+    if (source[index] !== '=') return null;
+    index += 1;
+    while (index < source.length && /\s/.test(source[index])) index += 1;
+    const quote = source[index];
+    if (quote !== '"' && quote !== "'") return null;
+    index += 1;
+
+    let value = '';
+    let closed = false;
+    while (index < source.length) {
+      const character = source[index];
+      if (character === quote) {
+        closed = true;
+        index += 1;
+        break;
+      }
+      if (character === '\\' && index + 1 < source.length && (source[index + 1] === quote || source[index + 1] === '\\')) {
+        value += source[index + 1];
+        index += 2;
+      } else {
+        value += character;
+        index += 1;
+      }
+    }
+    if (!closed) return null;
+    values[name] = value;
+  }
+  return values;
+}
+
+function httpUrl(value: unknown): string {
+  const source = typeof value === 'string' ? value.trim() : '';
+  if (!source) return '';
+  try {
+    const parsed = new URL(source);
+    return parsed.protocol === 'http:' || parsed.protocol === 'https:' ? source : '';
+  } catch (_) {
+    return '';
+  }
+}
+
+function externalLink(className: string, url: string, text = '') {
+  const link = create('a', className, text);
+  link.href = url;
+  link.target = '_blank';
+  link.rel = 'noopener noreferrer';
+  return link;
+}
+
+function openGraphNode(preview: OpenGraphPreview) {
+  const card = create('section', 'og-card');
+  const main = create('div', 'og-main');
+
+  if (preview.imageUrl) {
+    const imageLink = externalLink('og-image-link', preview.url);
+    const image = document.createElement('img');
+    image.className = 'og-image';
+    image.src = `/proxy/image?url=${encodeURIComponent(preview.imageUrl)}`;
+    image.alt = preview.title || '链接预览';
+    image.loading = 'lazy';
+    image.addEventListener('error', () => {
+      imageLink.hidden = true;
+    });
+    imageLink.append(image);
+    main.append(imageLink);
+  }
+
+  const body = create('div', 'og-body');
+  if (preview.title) body.append(externalLink('og-title', preview.url, preview.title));
+  if (preview.description) body.append(create('p', 'og-description', preview.description));
+  main.append(body);
+
+  const footer = create('div', 'og-footer');
+  const domain = externalLink('og-domain', preview.url, new URL(preview.url).hostname.replace(/^www\./i, '').toUpperCase());
+  domain.title = preview.url;
+  const copyButton = create('button', 'og-copy-button');
+  copyButton.type = 'button';
+  copyButton.title = '复制链接';
+  copyButton.setAttribute('aria-label', '复制链接');
+  copyButton.append(create('span', 'og-copy-icon'));
+  copyButton.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(preview.url);
+      copyButton.title = '已复制';
+      setTimeout(() => {
+        copyButton.title = '复制链接';
+      }, 1500);
+    } catch (_) {
+      setFeedback('复制链接失败', 'error');
+    }
+  });
+  footer.append(domain, copyButton);
+  card.append(main, footer);
+  return card;
+}
+
+function appendInlineMessageText(container: HTMLElement, text: string) {
   const pattern = /\[sticker\s+type=["']?([^"'\]\s]+)["']?[^\]]*\]\s*\[\/sticker\]|:([A-Za-z0-9_+\-.]+):|(https?:\/\/[^\s<>"']+)/gi;
   let lastIndex = 0;
   for (const match of text.matchAll(pattern)) {
@@ -1380,11 +1571,7 @@ function appendMessageText(container: HTMLElement, text: string) {
       image.alt = `:${match[2]}:`;
       container.append(image);
     } else if (match[3]) {
-      const link = create('a', '', match[3]);
-      link.href = match[3];
-      link.target = '_blank';
-      link.rel = 'noopener noreferrer';
-      container.append(link);
+      container.append(externalLink('', match[3], match[3]));
     }
     lastIndex = match.index + match[0].length;
   }

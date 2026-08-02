@@ -707,6 +707,123 @@ nav button.is-active {
   color: var(--brand);
 }
 
+.og-card {
+  width: min(640px, 100%);
+  max-width: 100%;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface-muted);
+  margin: 4px 0;
+  overflow: hidden;
+  white-space: normal;
+}
+
+.og-main {
+  display: flow-root;
+  padding: 8px;
+}
+
+.og-image-link {
+  display: block;
+  float: left;
+  width: min(256px, 42%);
+  aspect-ratio: 16 / 9;
+  margin: 0 12px 8px 0;
+  border-radius: 6px;
+  background: var(--soft);
+  overflow: hidden;
+}
+
+.og-image {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+
+.og-title {
+  display: block;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+  text-decoration: none;
+}
+
+.og-title:hover {
+  color: var(--brand);
+  text-decoration: underline;
+}
+
+.og-description {
+  margin: 6px 0 0;
+  color: var(--muted);
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.og-footer {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  gap: 6px;
+  border-top: 1px solid var(--line);
+  background: var(--soft);
+  padding: 4px 6px 4px 8px;
+}
+
+.og-domain {
+  min-width: 0;
+  flex: 1;
+  overflow: hidden;
+  color: var(--brand);
+  font-size: 12px;
+  letter-spacing: 0;
+  text-decoration: none;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.og-copy-button {
+  display: grid;
+  width: 28px;
+  height: 28px;
+  flex: 0 0 28px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  place-items: center;
+}
+
+.og-copy-button:hover,
+.og-copy-button:focus-visible {
+  background: var(--brand-soft);
+  color: var(--brand);
+  outline: none;
+}
+
+.og-copy-icon {
+  position: relative;
+  display: block;
+  width: 11px;
+  height: 11px;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+  transform: translate(2px, 2px);
+}
+
+.og-copy-icon::before {
+  position: absolute;
+  top: -5px;
+  left: -5px;
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid currentColor;
+  border-radius: 2px;
+  background: var(--soft);
+  content: '';
+}
+
 .emoticon {
   width: 28px;
   height: 28px;
@@ -991,5 +1108,11 @@ nav button.is-active {
   .audit-row {
     grid-template-columns: 1fr;
     padding: 12px;
+  }
+
+  .og-image-link {
+    float: none;
+    width: 100%;
+    margin: 0 0 8px;
   }
 }
