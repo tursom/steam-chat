@@ -115,6 +115,19 @@ type OpenGraphPreview = {
   description: string;
 };
 
+const supportedBbcodeTags = ['og', 'url', 'img', 'emoticon', 'sticker'] as const;
+type SupportedBbcodeTag = (typeof supportedBbcodeTags)[number];
+const supportedBbcodeTagSet = new Set<string>(supportedBbcodeTags);
+const supportedBbcodePattern = new RegExp(`\\[(${supportedBbcodeTags.join('|')})(?=[\\s=\\]])`, 'gi');
+
+type SteamImagePreview = {
+  sourceUrl: string;
+  displayUrl: string;
+  sourceSet: string;
+  width: number;
+  height: number;
+};
+
 type InventoryItem = Record<string, unknown> & {
   name?: string;
   use_count?: number | string;
@@ -1373,28 +1386,27 @@ function appendMessageText(container: HTMLElement, text: string) {
   const lowerText = text.toLowerCase();
   let lastIndex = 0;
   while (lastIndex < text.length) {
-    const start = findOpenGraphStart(lowerText, lastIndex);
-    if (start < 0) break;
+    const block = findSupportedBbcodeStart(text, lastIndex);
+    if (!block) break;
+    const { start, tag } = block;
     if (start > lastIndex) appendInlineMessageText(container, text.slice(lastIndex, start));
 
-    const openEnd = findOpenGraphTagEnd(text, start + 3);
+    const openEnd = findBbcodeTagEnd(text, start + tag.length + 1);
     if (openEnd < 0) {
       appendInlineMessageText(container, text.slice(start));
       return;
     }
-    const closeStart = lowerText.indexOf('[/og]', openEnd + 1);
+    const closeTag = `[/${tag}]`;
+    const closeStart = lowerText.indexOf(closeTag, openEnd + 1);
     if (closeStart < 0) {
       appendInlineMessageText(container, text.slice(start));
       return;
     }
 
-    const blockEnd = closeStart + '[/og]'.length;
-    const preview = parseOpenGraphPreview(text.slice(start + 3, openEnd));
-    if (preview) {
-      container.append(openGraphNode(preview));
-      const body = text.slice(openEnd + 1, closeStart);
-      if (body.trim() !== preview.url) appendInlineMessageText(container, body);
-    } else {
+    const blockEnd = closeStart + closeTag.length;
+    const attributes = text.slice(start + tag.length + 1, openEnd);
+    const body = text.slice(openEnd + 1, closeStart);
+    if (!appendSupportedBbcode(container, tag, attributes, body)) {
       appendInlineMessageText(container, text.slice(start, blockEnd));
     }
     lastIndex = blockEnd;
@@ -1402,17 +1414,18 @@ function appendMessageText(container: HTMLElement, text: string) {
   if (lastIndex < text.length) appendInlineMessageText(container, text.slice(lastIndex));
 }
 
-function findOpenGraphStart(lowerText: string, fromIndex: number): number {
-  let start = lowerText.indexOf('[og', fromIndex);
-  while (start >= 0) {
-    const next = lowerText[start + 3];
-    if (next === ']' || /\s/.test(next)) return start;
-    start = lowerText.indexOf('[og', start + 3);
-  }
-  return -1;
+function findSupportedBbcodeStart(text: string, fromIndex: number): { start: number; tag: SupportedBbcodeTag } | null {
+  supportedBbcodePattern.lastIndex = fromIndex;
+  const match = supportedBbcodePattern.exec(text);
+  const tag = match?.[1].toLowerCase() || '';
+  return match && isSupportedBbcodeTag(tag) ? { start: match.index, tag } : null;
 }
 
-function findOpenGraphTagEnd(text: string, fromIndex: number): number {
+function isSupportedBbcodeTag(value: string): value is SupportedBbcodeTag {
+  return supportedBbcodeTagSet.has(value);
+}
+
+function findBbcodeTagEnd(text: string, fromIndex: number): number {
   let quote = '';
   for (let index = fromIndex; index < text.length; index += 1) {
     const character = text[index];
@@ -1428,8 +1441,56 @@ function findOpenGraphTagEnd(text: string, fromIndex: number): number {
   return -1;
 }
 
+function appendSupportedBbcode(
+  container: HTMLElement,
+  tag: SupportedBbcodeTag,
+  attributes: string,
+  body: string
+): boolean {
+  if (tag === 'og') {
+    const preview = parseOpenGraphPreview(attributes);
+    if (!preview) return false;
+    container.append(openGraphNode(preview));
+    if (body.trim() !== preview.url) appendInlineMessageText(container, body);
+    return true;
+  }
+
+  if (tag === 'url') {
+    const url = parseUrlTarget(attributes, body);
+    if (!url) return false;
+    container.append(externalLink('', url, body.trim() ? body : url));
+    return true;
+  }
+
+  if (tag === 'emoticon') {
+    const name = body.trim();
+    if (attributes.trim() || !/^[A-Za-z0-9_+\-.]+$/.test(name)) return false;
+    container.append(emoticonNode(name));
+    return true;
+  }
+
+  if (tag === 'sticker') {
+    const values = parseBbcodeAttributes(attributes, new Set(['type', 'limit']));
+    const type = values?.type?.trim() || '';
+    if (!values || !type || body.trim()) return false;
+    container.append(stickerNode(type));
+    return true;
+  }
+
+  const preview = parseSteamImagePreview(attributes, body);
+  if (!preview) return false;
+  container.append(steamImageNode(preview));
+  return true;
+}
+
+function parseUrlTarget(attributes: string, body: string): string {
+  if (!attributes.trim()) return httpUrl(body);
+  const values = parseBbcodeAttributes(`href${attributes}`, new Set(['href']));
+  return values ? httpUrl(values.href) : '';
+}
+
 function parseOpenGraphPreview(attributes: string): OpenGraphPreview | null {
-  const values = parseOpenGraphAttributes(attributes);
+  const values = parseBbcodeAttributes(attributes, new Set(['url', 'img', 'title', 'desc']), true);
   if (!values) return null;
   const url = httpUrl(values.url);
   if (!url) return null;
@@ -1441,9 +1502,8 @@ function parseOpenGraphPreview(attributes: string): OpenGraphPreview | null {
   };
 }
 
-function parseOpenGraphAttributes(source: string): Record<string, string> | null {
+function parseBbcodeAttributes(source: string, allowed: Set<string>, requireQuoted = false): Record<string, string> | null {
   const values: Record<string, string> = {};
-  const allowed = new Set(['url', 'img', 'title', 'desc']);
   let index = 0;
   while (index < source.length) {
     while (index < source.length && /\s/.test(source[index])) index += 1;
@@ -1461,30 +1521,92 @@ function parseOpenGraphAttributes(source: string): Record<string, string> | null
     index += 1;
     while (index < source.length && /\s/.test(source[index])) index += 1;
     const quote = source[index];
-    if (quote !== '"' && quote !== "'") return null;
-    index += 1;
+    if (requireQuoted && quote !== '"' && quote !== "'") return null;
 
     let value = '';
-    let closed = false;
-    while (index < source.length) {
-      const character = source[index];
-      if (character === quote) {
-        closed = true;
-        index += 1;
-        break;
+    const quoted = quote === '"' || quote === "'";
+    if (quoted) {
+      index += 1;
+      let closed = false;
+      while (index < source.length) {
+        const character = source[index];
+        if (character === quote) {
+          closed = true;
+          index += 1;
+          break;
+        }
+        if (character === '\\' && index + 1 < source.length && (source[index + 1] === quote || source[index + 1] === '\\')) {
+          value += source[index + 1];
+          index += 2;
+        } else {
+          value += character;
+          index += 1;
+        }
       }
-      if (character === '\\' && index + 1 < source.length && (source[index + 1] === quote || source[index + 1] === '\\')) {
-        value += source[index + 1];
-        index += 2;
-      } else {
-        value += character;
-        index += 1;
-      }
+      if (!closed) return null;
+    } else {
+      const valueStart = index;
+      while (index < source.length && !/\s/.test(source[index])) index += 1;
+      value = source.slice(valueStart, index);
     }
-    if (!closed) return null;
+    if (!value && !quoted) return null;
     values[name] = value;
   }
   return values;
+}
+
+function parseSteamImagePreview(attributes: string, body: string): SteamImagePreview | null {
+  const values = parseBbcodeAttributes(attributes, new Set(['src', 'thumbnail_src', 'srcset', 'width', 'height']));
+  if (!values) return null;
+  const sourceUrl = httpUrl(values.src);
+  if (!sourceUrl || !imageBodyMatchesSource(body, sourceUrl)) return null;
+  return {
+    sourceUrl,
+    displayUrl: httpUrl(values.thumbnail_src) || sourceUrl,
+    sourceSet: proxyImageSourceSet(values.srcset),
+    width: positiveInteger(values.width),
+    height: positiveInteger(values.height)
+  };
+}
+
+function imageBodyMatchesSource(body: string, sourceUrl: string): boolean {
+  const trimmed = body.trim();
+  if (!/^\[url(?=[=\]])/i.test(trimmed)) return false;
+  const openEnd = findBbcodeTagEnd(trimmed, 4);
+  if (openEnd < 0) return false;
+  const closeStart = trimmed.toLowerCase().indexOf('[/url]', openEnd + 1);
+  if (closeStart < 0 || closeStart + '[/url]'.length !== trimmed.length) return false;
+  const linkBody = trimmed.slice(openEnd + 1, closeStart);
+  const target = parseUrlTarget(trimmed.slice(4, openEnd), linkBody);
+  return target === sourceUrl && linkBody.trim() === sourceUrl;
+}
+
+function positiveInteger(value: unknown): number {
+  const source = typeof value === 'string' ? value.trim() : '';
+  if (!/^[1-9]\d*$/.test(source)) return 0;
+  const parsed = Number(source);
+  return Number.isSafeInteger(parsed) ? parsed : 0;
+}
+
+function proxyImageSourceSet(value: unknown): string {
+  const source = typeof value === 'string' ? value.trim() : '';
+  if (!source) return '';
+  const candidates: string[] = [];
+  for (const candidate of source.split(',')) {
+    const parts = candidate.trim().split(/\s+/);
+    if (!parts[0] || parts.length > 2) return '';
+    const url = httpUrl(parts[0]);
+    const descriptor = parts[1] || '';
+    if (!url || (descriptor && !validSourceSetDescriptor(descriptor))) return '';
+    candidates.push(`${proxiedImageUrl(url)}${descriptor ? ` ${descriptor}` : ''}`);
+  }
+  return candidates.join(', ');
+}
+
+function validSourceSetDescriptor(value: string): boolean {
+  if (/^[1-9]\d*w$/.test(value)) return true;
+  const match = value.match(/^(\d+(?:\.\d+)?|\.\d+)x$/);
+  return Boolean(match && Number(match[1]) > 0);
 }
 
 function httpUrl(value: unknown): string {
@@ -1496,6 +1618,10 @@ function httpUrl(value: unknown): string {
   } catch (_) {
     return '';
   }
+}
+
+function proxiedImageUrl(url: string): string {
+  return `/proxy/image?url=${encodeURIComponent(url)}`;
 }
 
 function externalLink(className: string, url: string, text = '') {
@@ -1514,7 +1640,7 @@ function openGraphNode(preview: OpenGraphPreview) {
     const imageLink = externalLink('og-image-link', preview.url);
     const image = document.createElement('img');
     image.className = 'og-image';
-    image.src = `/proxy/image?url=${encodeURIComponent(preview.imageUrl)}`;
+    image.src = proxiedImageUrl(preview.imageUrl);
     image.alt = preview.title || '链接预览';
     image.loading = 'lazy';
     image.addEventListener('error', () => {
@@ -1553,25 +1679,59 @@ function openGraphNode(preview: OpenGraphPreview) {
   return card;
 }
 
+function emoticonNode(name: string) {
+  const image = document.createElement('img');
+  image.className = 'emoticon';
+  image.src = `https://community.cloudflare.steamstatic.com/economy/emoticon/${encodeURIComponent(name)}`;
+  image.alt = `:${name}:`;
+  return image;
+}
+
+function stickerNode(type: string) {
+  const image = document.createElement('img');
+  image.className = 'sticker';
+  image.src = `/proxy/sticker/${encodeURIComponent(type)}`;
+  image.alt = type;
+  return image;
+}
+
+function steamImageNode(preview: SteamImagePreview) {
+  const shell = create('span', 'bbcode-image-shell');
+  const button = create('button', 'image-button bbcode-image-button');
+  button.type = 'button';
+  button.title = '查看大图';
+  button.setAttribute('aria-label', '查看大图');
+  if (preview.width && preview.height) {
+    button.style.aspectRatio = `${preview.width} / ${preview.height}`;
+    button.style.width = `${Math.max(1, Math.min(420, Math.floor((420 * preview.width) / preview.height)))}px`;
+  }
+
+  const image = document.createElement('img');
+  image.className = 'bbcode-image';
+  image.src = proxiedImageUrl(preview.displayUrl);
+  if (preview.sourceSet) image.srcset = preview.sourceSet;
+  image.alt = '图片';
+  image.loading = 'lazy';
+  image.addEventListener('error', () => {
+    const fallback = externalLink('bbcode-image-fallback', preview.sourceUrl, preview.sourceUrl);
+    fallback.title = '图片加载失败';
+    shell.replaceChildren(fallback);
+  });
+  button.addEventListener('click', () => openLightbox(proxiedImageUrl(preview.sourceUrl)));
+  button.append(image);
+  shell.append(button);
+  return shell;
+}
+
 function appendInlineMessageText(container: HTMLElement, text: string) {
-  const pattern = /\[sticker\s+type=["']?([^"'\]\s]+)["']?[^\]]*\]\s*\[\/sticker\]|:([A-Za-z0-9_+\-.]+):|(https?:\/\/[^\s<>"']+)/gi;
+  const pattern = /:([A-Za-z0-9_+\-.]+):|(https?:\/\/[^\s<>"'\[\]]+)/gi;
   let lastIndex = 0;
   for (const match of text.matchAll(pattern)) {
     if (match.index > lastIndex) container.append(document.createTextNode(text.slice(lastIndex, match.index)));
     if (match[1]) {
-      const image = document.createElement('img');
-      image.className = 'sticker';
-      image.src = `/proxy/sticker/${encodeURIComponent(match[1])}`;
-      image.alt = match[1];
-      container.append(image);
+      container.append(emoticonNode(match[1]));
     } else if (match[2]) {
-      const image = document.createElement('img');
-      image.className = 'emoticon';
-      image.src = `https://community.cloudflare.steamstatic.com/economy/emoticon/${encodeURIComponent(match[2])}`;
-      image.alt = `:${match[2]}:`;
-      container.append(image);
-    } else if (match[3]) {
-      container.append(externalLink('', match[3], match[3]));
+      container.append(externalLink('', match[2], match[2]));
     }
     lastIndex = match.index + match[0].length;
   }
@@ -1582,7 +1742,7 @@ function imageNode(sourceUrl: string) {
   const shell = create('button', 'image-button', '加载图片');
   shell.type = 'button';
   const image = document.createElement('img');
-  image.src = `/proxy/image?url=${encodeURIComponent(sourceUrl)}`;
+  image.src = proxiedImageUrl(sourceUrl);
   image.alt = '图片';
   image.onload = () => shell.replaceChildren(image);
   image.onerror = () => shell.textContent = '图片加载失败';
