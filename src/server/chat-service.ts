@@ -355,6 +355,7 @@ function isStaticRequest(pathname: string) {
     || pathname === '/index.html'
     || pathname === '/style.css'
     || pathname === '/app.js'
+    || pathname.startsWith('/icons/')
     || pathname === '/favicon.ico';
 }
 

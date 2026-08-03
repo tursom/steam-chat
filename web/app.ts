@@ -1,6 +1,9 @@
 type Role = 'admin' | 'user';
 type View = 'steam' | 'chat' | 'users' | 'steamAccounts' | 'audit' | 'account';
 type Tone = 'muted' | 'ok' | 'warn' | 'error';
+type ChatListTab = 'recent' | 'friends' | 'groups';
+type ChatPanel = 'list' | 'thread';
+type ChatIconName = 'arrow-left' | 'image' | 'link' | 'paperclip' | 'plus' | 'search' | 'send' | 'smile' | 'x';
 type Permission =
   | 'user.manage'
   | 'session.manage'
@@ -163,6 +166,9 @@ type AppState = {
   stickers: InventoryItem[];
   activeId: string;
   activeName: string;
+  chatListTab: ChatListTab;
+  chatQuery: string;
+  chatPanel: ChatPanel;
   historyLimit: number;
   wsPath: string;
   ws: WebSocket | null;
@@ -191,6 +197,7 @@ const defaultSteamStatus: SteamStatus = {
 
 const root = document.querySelector<HTMLElement>('#app');
 if (!root) throw new Error('Missing app root');
+let feedbackTimer: ReturnType<typeof setTimeout> | null = null;
 
 const state: AppState = {
   me: null,
@@ -210,6 +217,9 @@ const state: AppState = {
   stickers: [],
   activeId: localStorage.getItem('steam-chat.target') || '',
   activeName: '',
+  chatListTab: 'recent',
+  chatQuery: '',
+  chatPanel: 'list',
   historyLimit: clampLimit(localStorage.getItem('steam-chat.history-limit') || 100),
   wsPath: '/ws',
   ws: null,
@@ -233,6 +243,21 @@ function create<K extends keyof HTMLElementTagNameMap>(tag: K, className = '', t
   if (className) node.className = className;
   if (text) node.textContent = text;
   return node;
+}
+
+function chatIcon(name: ChatIconName) {
+  const node = create('span', `ui-icon icon-${name}`);
+  node.setAttribute('aria-hidden', 'true');
+  return node;
+}
+
+function chatIconButton(name: ChatIconName, label: string, className = 'icon-btn') {
+  const button = create('button', className);
+  button.type = 'button';
+  button.title = label;
+  button.setAttribute('aria-label', label);
+  button.append(chatIcon(name));
+  return button;
 }
 
 function clear(node: HTMLElement) {
@@ -267,13 +292,33 @@ function asInventory(value: unknown): InventoryItem[] {
 }
 
 function setFeedback(text: string, tone: Tone = 'muted') {
+  if (feedbackTimer) clearTimeout(feedbackTimer);
+  feedbackTimer = null;
   state.feedback = text;
   state.feedbackTone = tone;
   const node = document.querySelector<HTMLElement>('#feedback');
   if (node) {
-    node.textContent = text;
+    const content = node.querySelector<HTMLElement>('#feedbackText');
+    if (content) content.textContent = text;
+    else node.textContent = text;
     node.dataset.tone = tone;
+    node.setAttribute('aria-live', tone === 'error' ? 'assertive' : 'polite');
+    if (state.view === 'chat') presentChatFeedback(node, tone);
   }
+}
+
+function presentChatFeedback(node: HTMLElement, tone: Tone) {
+  node.hidden = tone === 'muted';
+  if (tone === 'muted' || tone === 'error') return;
+  feedbackTimer = setTimeout(() => dismissChatFeedback(node), tone === 'warn' ? 4000 : 2400);
+}
+
+function dismissChatFeedback(node = document.querySelector<HTMLElement>('#feedback')) {
+  if (feedbackTimer) clearTimeout(feedbackTimer);
+  feedbackTimer = null;
+  state.feedback = '就绪';
+  state.feedbackTone = 'muted';
+  if (node) node.hidden = true;
 }
 
 function steamLabel(status = state.steam.status): string {
@@ -467,7 +512,7 @@ function renderShell() {
   }
   if (state.me.role !== 'admin' && ['users', 'steamAccounts', 'audit'].includes(state.view)) state.view = 'steam';
   clear(root);
-  const shell = create('div', 'admin-shell');
+  const shell = create('div', `admin-shell${state.view === 'chat' ? ' is-chat' : ''}`);
   const sidebar = create('aside', 'admin-sidebar');
   const brand = create('div', 'brand');
   brand.append(create('strong', '', 'Steam Chat'), create('span', '', state.me.username));
@@ -497,11 +542,21 @@ function renderShell() {
   logout.addEventListener('click', () => logoutApp());
   status.append(badge, hint, logout);
   top.append(title, status);
-  const content = create('section', 'content');
+  const content = create('section', `content${state.view === 'chat' ? ' chat-content' : ''}`);
   content.append(renderCurrentView());
-  const feedback = create('div', 'feedback', state.feedback);
+  const feedback = create('div', `feedback${state.view === 'chat' ? ' chat-toast' : ''}`);
   feedback.id = 'feedback';
   feedback.dataset.tone = state.feedbackTone;
+  feedback.setAttribute('aria-live', state.feedbackTone === 'error' ? 'assertive' : 'polite');
+  const feedbackText = create('span', '', state.feedback);
+  feedbackText.id = 'feedbackText';
+  feedback.append(feedbackText);
+  if (state.view === 'chat') {
+    const dismiss = chatIconButton('x', '关闭提示', 'toast-close');
+    dismiss.addEventListener('click', () => dismissChatFeedback(feedback));
+    feedback.append(dismiss);
+    feedback.hidden = state.feedbackTone === 'muted';
+  }
   main.append(top, content, feedback);
   shell.append(sidebar, main);
   root.append(shell);
@@ -1139,31 +1194,98 @@ function renderAccountView() {
 
 function renderChatView() {
   const view = create('div', 'chat-layout');
+  view.id = 'chatLayout';
+  view.dataset.mobilePanel = state.chatPanel;
   const lists = create('aside', 'chat-lists');
-  const openForm = create('form', 'open-chat-form') as HTMLFormElement;
+  lists.setAttribute('aria-label', '会话列表');
+
+  const listHead = create('header', 'chat-list-head');
+  const titleRow = create('div', 'chat-list-title');
+  titleRow.append(create('h2', '', '会话'));
+  const newConversation = create('button', 'new-chat-btn');
+  newConversation.type = 'button';
+  newConversation.append(chatIcon('plus'), create('span', '', '新建'));
+  titleRow.append(newConversation);
+
+  const search = create('label', 'chat-search');
+  search.append(chatIcon('search'));
+  const searchInput = create('input') as HTMLInputElement;
+  searchInput.type = 'search';
+  searchInput.placeholder = '搜索会话';
+  searchInput.value = state.chatQuery;
+  searchInput.setAttribute('aria-label', '搜索当前分类');
+  searchInput.addEventListener('input', () => {
+    state.chatQuery = searchInput.value;
+    updateChatLists();
+  });
+  search.append(searchInput);
+
+  const tabList = create('div', 'chat-tabs');
+  tabList.setAttribute('role', 'tablist');
+  const tabLabels: Array<[ChatListTab, string]> = [['recent', '最近'], ['friends', '好友'], ['groups', '群组']];
+  for (const [tab, label] of tabLabels) {
+    const button = create('button', state.chatListTab === tab ? 'is-active' : '', label);
+    button.type = 'button';
+    button.dataset.chatTab = tab;
+    button.setAttribute('role', 'tab');
+    button.setAttribute('aria-controls', 'chatListSections');
+    button.setAttribute('aria-selected', String(state.chatListTab === tab));
+    button.addEventListener('click', () => {
+      state.chatListTab = tab;
+      updateChatTabs();
+      updateChatLists();
+    });
+    tabList.append(button);
+  }
+  listHead.append(titleRow, search, tabList);
+
+  const listBody = create('div', 'conversation-list');
+  listBody.id = 'chatListSections';
+  listBody.setAttribute('role', 'tabpanel');
+  renderChatListSections(listBody);
+
+  const dialog = create('dialog', 'new-chat-dialog') as HTMLDialogElement;
   const targetInput = create('input') as HTMLInputElement;
   targetInput.name = 'target';
   targetInput.inputMode = 'numeric';
   targetInput.autocomplete = 'off';
   targetInput.placeholder = 'SteamID64';
-  targetInput.value = state.activeId;
-  const openButton = create('button', '', '打开');
+  targetInput.pattern = '[0-9]+';
+  targetInput.required = true;
+  const dialogHead = create('div', 'dialog-head');
+  dialogHead.append(create('h2', '', '新建会话'));
+  const closeDialog = chatIconButton('x', '关闭', 'dialog-close');
+  closeDialog.addEventListener('click', () => dialog.close());
+  dialogHead.append(closeDialog);
+  const openForm = create('form', 'new-chat-form') as HTMLFormElement;
+  const targetLabel = create('label', '', 'SteamID64');
+  targetLabel.append(targetInput);
+  const openButton = create('button', 'primary-btn', '打开会话');
   openButton.type = 'submit';
-  openForm.append(targetInput, openButton);
+  openForm.append(targetLabel, openButton);
   openForm.addEventListener('submit', (event) => {
     event.preventDefault();
+    dialog.close();
     openConversation(formValue(openForm, 'target'));
   });
-  const tabs = create('div', 'list-sections');
-  tabs.id = 'chatListSections';
-  renderChatListSections(tabs);
-  lists.append(openForm, tabs);
+  dialog.append(dialogHead, openForm);
+  dialog.addEventListener('click', (event) => {
+    if (event.target === dialog) dialog.close();
+  });
+  newConversation.addEventListener('click', () => {
+    targetInput.value = '';
+    dialog.showModal();
+    targetInput.focus();
+  });
+  lists.append(listHead, listBody, dialog);
 
   const thread = create('section', 'thread');
   const head = create('header', 'thread-head');
-  head.append(create('div', '', state.activeName || state.activeId || '未选择会话'), create('span', 'muted', state.activeId || '选择好友、群组或输入 SteamID64'));
+  head.id = 'threadHead';
+  renderThreadHeader(head);
   const messages = create('div', 'messages');
   messages.id = 'messages';
+  messages.setAttribute('aria-live', 'polite');
   const composer = renderComposer();
   thread.append(head, messages, composer);
   view.append(lists, thread);
@@ -1177,40 +1299,88 @@ function renderChatView() {
 
 function renderChatListSections(container: HTMLElement) {
   clear(container);
-  container.append(renderListSection('最近', state.conversations), renderListSection('好友', state.friends), renderListSection('群组', state.groups));
+  const items = filterChatEntries(chatEntriesForActiveTab(), state.chatQuery);
+  if (!items.length) {
+    container.append(create('div', 'conversation-empty', state.chatQuery.trim() ? '没有匹配的会话' : '暂无会话'));
+    return;
+  }
+  for (const item of items) container.append(renderListItem(item));
+}
+
+function filterChatEntries(items: ListEntry[], query: string): ListEntry[] {
+  const normalized = query.trim().toLocaleLowerCase('zh-CN');
+  if (!normalized) return items;
+  return items.filter((item) => [item.name, item.id, item.preview]
+    .some((value) => String(value || '').toLocaleLowerCase('zh-CN').includes(normalized)));
+}
+
+function chatEntriesForActiveTab() {
+  if (state.chatListTab === 'friends') return state.friends;
+  if (state.chatListTab === 'groups') return state.groups;
+  return state.conversations;
+}
+
+function updateChatTabs() {
+  document.querySelectorAll<HTMLButtonElement>('[data-chat-tab]').forEach((button) => {
+    const active = button.dataset.chatTab === state.chatListTab;
+    button.classList.toggle('is-active', active);
+    button.setAttribute('aria-selected', String(active));
+  });
 }
 
 function updateChatLists() {
-  const tabs = document.querySelector<HTMLElement>('#chatListSections');
-  if (tabs) renderChatListSections(tabs);
+  const list = document.querySelector<HTMLElement>('#chatListSections');
+  if (list) renderChatListSections(list);
 }
 
-function renderListSection(title: string, items: ListEntry[]) {
-  const section = create('section', 'list-section');
-  section.append(create('h2', '', title));
-  const body = create('div');
-  if (!items.length) {
-    body.append(create('div', 'empty small', '暂无数据'));
-  } else {
-    for (const item of items) body.append(renderListItem(item));
-  }
-  section.append(body);
-  return section;
-}
-
-function renderListItem(item: ListEntry) {
-  const button = create('button', `list-item${item.id === state.activeId ? ' is-active' : ''}`);
-  button.type = 'button';
-  const avatar = create('span', 'avatar', String(item.name || item.id || '?').slice(0, 1).toUpperCase());
-  if (item.avatar) {
+function renderAvatar(item: ListEntry | null, name: string, className = 'avatar') {
+  const avatar = create('span', className, String(name || '?').slice(0, 1).toUpperCase());
+  if (item?.avatar) {
     const image = document.createElement('img');
     image.src = item.avatar;
     image.alt = '';
     avatar.replaceChildren(image);
   }
+  if (item?.online) avatar.append(create('span', 'online-dot'));
+  return avatar;
+}
+
+function activeChatEntry() {
+  return [...state.conversations, ...state.friends, ...state.groups].find((item) => item.id === state.activeId) || null;
+}
+
+function renderThreadHeader(container: HTMLElement) {
+  clear(container);
+  const back = chatIconButton('arrow-left', '返回会话列表', 'thread-back');
+  back.addEventListener('click', showChatList);
+  const item = activeChatEntry();
+  const name = state.activeName || item?.name || state.activeId || '未选择会话';
+  const identity = create('div', 'thread-identity');
+  identity.append(create('strong', '', name), create('span', 'muted', state.activeId || 'Steam Chat'));
+  container.append(back, renderAvatar(item, name, 'thread-avatar'), identity);
+}
+
+function formatConversationTime(value: unknown) {
+  if (!value) return '';
+  const date = new Date(String(value));
+  if (Number.isNaN(date.getTime())) return '';
+  const now = new Date();
+  if (date.toDateString() === now.toDateString()) {
+    return date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' });
+  }
+  return date.toLocaleDateString('zh-CN', { month: '2-digit', day: '2-digit' });
+}
+
+function renderListItem(item: ListEntry) {
+  const button = create('button', `list-item${item.id === state.activeId ? ' is-active' : ''}`);
+  button.type = 'button';
+  button.setAttribute('aria-current', item.id === state.activeId ? 'true' : 'false');
+  const name = item.name || item.id;
   const body = create('span', 'item-body');
-  body.append(create('strong', '', item.name || item.id), create('span', 'muted', item.preview || item.gameName || item.clanId || item.clanid || item.id));
-  button.append(avatar, body);
+  const title = create('span', 'item-title');
+  title.append(create('strong', '', name), create('time', '', formatConversationTime(item.updatedAt)));
+  body.append(title, create('span', 'item-preview', item.preview || item.gameName || item.clanId || item.clanid || item.id));
+  button.append(renderAvatar(item, name), body);
   button.addEventListener('click', () => openConversation(item.id, item.name || item.id));
   return button;
 }
@@ -1222,66 +1392,138 @@ function renderComposer() {
   const picker = create('div', 'picker');
   picker.id = 'picker';
   picker.hidden = true;
+  picker.setAttribute('role', 'dialog');
+  picker.setAttribute('aria-label', '表情和贴纸');
   const row = create('div', 'compose-row');
-  const pickerButton = create('button', 'icon-btn', '素材');
+  const pickerButton = chatIconButton('smile', '表情和贴纸', 'composer-tool');
   pickerButton.id = 'pickerToggle';
-  pickerButton.type = 'button';
+  const pickerControls = bindFloatingPanel(pickerButton, picker);
   pickerButton.addEventListener('click', () => {
-    picker.hidden = !picker.hidden;
-    renderPicker(picker);
+    attachmentControls.close();
+    if (picker.hidden) renderPicker(picker);
+    pickerControls.toggle();
   });
-  const fileButton = create('button', 'icon-btn', '图片');
-  fileButton.id = 'fileButton';
-  fileButton.type = 'button';
+
+  const attachment = create('div', 'attachment-shell');
+  const attachmentButton = chatIconButton('paperclip', '添加图片', 'composer-tool');
+  attachmentButton.id = 'attachmentToggle';
+  const attachmentMenu = create('div', 'attachment-menu');
+  attachmentMenu.id = 'attachmentMenu';
+  attachmentMenu.hidden = true;
+  attachmentMenu.setAttribute('role', 'dialog');
+  attachmentMenu.setAttribute('aria-label', '添加图片');
   const fileInput = create('input') as HTMLInputElement;
   fileInput.type = 'file';
   fileInput.accept = 'image/*';
   fileInput.multiple = true;
   fileInput.hidden = true;
-  fileButton.addEventListener('click', () => fileInput.click());
+  const uploadButton = create('button', 'attachment-action');
+  uploadButton.type = 'button';
+  uploadButton.append(chatIcon('image'), create('span', '', '上传图片'));
+  const urlButton = create('button', 'attachment-action');
+  urlButton.type = 'button';
+  urlButton.append(chatIcon('link'), create('span', '', '图片 URL'));
+  const imageForm = create('form', 'image-url-form') as HTMLFormElement;
+  imageForm.hidden = true;
+  imageForm.innerHTML = '<input name="url" type="url" placeholder="https://..." aria-label="图片 URL" required><button type="submit">发送</button>';
+  const attachmentControls = bindFloatingPanel(attachmentButton, attachmentMenu);
+  attachmentButton.addEventListener('click', () => {
+    pickerControls.close();
+    if (attachmentMenu.hidden) imageForm.hidden = true;
+    attachmentControls.toggle();
+  });
+  uploadButton.addEventListener('click', () => {
+    attachmentControls.close();
+    fileInput.click();
+  });
+  urlButton.addEventListener('click', () => {
+    imageForm.hidden = !imageForm.hidden;
+    if (!imageForm.hidden) imageForm.querySelector<HTMLInputElement>('input')?.focus();
+  });
   fileInput.addEventListener('change', () => {
     sendFiles(fileInput.files);
     fileInput.value = '';
   });
+  imageForm.addEventListener('submit', (event) => {
+    event.preventDefault();
+    const url = formValue(imageForm, 'url').trim();
+    if (!url) return;
+    imageForm.reset();
+    attachmentControls.close();
+    void sendImage({ url });
+  });
+  attachmentMenu.append(uploadButton, urlButton, imageForm);
+  attachment.append(attachmentButton, attachmentMenu, fileInput);
+
   const input = create('textarea') as HTMLTextAreaElement;
   input.id = 'messageInput';
   input.rows = 1;
   input.placeholder = '发送消息';
+  input.setAttribute('aria-label', '消息');
+  input.addEventListener('input', () => resizeComposerInput(input));
   input.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
       event.preventDefault();
       void sendText();
     }
   });
-  const send = create('button', 'primary-btn', '发送');
+  const send = chatIconButton('send', '发送消息', 'send-btn');
   send.id = 'sendButton';
-  send.type = 'button';
   send.addEventListener('click', () => sendText());
-  row.append(pickerButton, fileButton, fileInput, input, send);
-  const imageForm = create('form', 'image-url-form') as HTMLFormElement;
-  imageForm.innerHTML = '<input name="url" type="url" placeholder="图片 URL"><button type="submit">发送图片</button>';
-  imageForm.addEventListener('submit', (event) => {
-    event.preventDefault();
-    const url = formValue(imageForm, 'url').trim();
-    if (!url) return;
-    imageForm.reset();
-    void sendImage({ url });
+  row.append(pickerButton, attachment, input, send);
+  shell.append(disabledNote, picker, row);
+  shell.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>('button, input, textarea').forEach((node) => {
+    node.dataset.chatControl = '';
   });
-  shell.append(disabledNote, picker, row, imageForm);
   return shell;
 }
 
+function bindFloatingPanel(trigger: HTMLButtonElement, panel: HTMLElement) {
+  const close = () => {
+    panel.hidden = true;
+    trigger.setAttribute('aria-expanded', 'false');
+    document.removeEventListener('pointerdown', handlePointerDown);
+    document.removeEventListener('keydown', handleKeyDown);
+  };
+  const handlePointerDown = (event: PointerEvent) => {
+    if (event.target instanceof Node && !panel.contains(event.target) && !trigger.contains(event.target)) close();
+  };
+  const handleKeyDown = (event: KeyboardEvent) => {
+    if (event.key === 'Escape') {
+      close();
+      trigger.focus();
+    }
+  };
+  const toggle = () => {
+    if (!panel.hidden) {
+      close();
+      return;
+    }
+    panel.hidden = false;
+    trigger.setAttribute('aria-expanded', 'true');
+    document.addEventListener('pointerdown', handlePointerDown);
+    document.addEventListener('keydown', handleKeyDown);
+  };
+  trigger.setAttribute('aria-haspopup', 'dialog');
+  trigger.setAttribute('aria-expanded', 'false');
+  return { close, toggle };
+}
+
+function resizeComposerInput(input: HTMLTextAreaElement) {
+  input.style.height = 'auto';
+  input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
+}
+
 function updateChatAvailability() {
-  const disabled = !steamOnline() || !steamAccessAllowed();
-  for (const selector of ['#messageInput', '#sendButton', '#pickerToggle', '#fileButton', '.image-url-form input', '.image-url-form button']) {
-    document.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>(selector).forEach((node) => {
-      node.disabled = disabled;
-    });
-  }
+  const unavailable = !steamOnline() || !steamAccessAllowed();
+  const disabled = unavailable || !state.activeId;
+  document.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>('[data-chat-control]').forEach((node) => {
+    node.disabled = disabled;
+  });
   const note = document.querySelector<HTMLElement>('#offlineNote');
   if (note) {
     note.textContent = !steamAccessAllowed() ? '当前账号未被授权访问活动 Steam 账户。' : 'Steam 未在线，聊天发送和素材操作不可用。';
-    note.hidden = !disabled;
+    note.hidden = !unavailable;
   }
 }
 
@@ -1318,6 +1560,9 @@ async function refreshChatData() {
     }
     if (state.view === 'chat') {
       updateChatLists();
+      if (!state.activeName) state.activeName = activeChatEntry()?.name || '';
+      const head = document.querySelector<HTMLElement>('#threadHead');
+      if (head) renderThreadHeader(head);
       updateChatAvailability();
     }
   } catch (error) {
@@ -1331,10 +1576,33 @@ function openConversation(id: unknown, name = '') {
     setFeedback('请输入 SteamID64', 'warn');
     return;
   }
+  const alreadyActive = target === state.activeId;
   state.activeId = target;
   state.activeName = name || target;
+  state.chatPanel = 'thread';
   localStorage.setItem('steam-chat.target', state.activeId);
-  if (state.view === 'chat') renderShell();
+  if (state.view !== 'chat') return;
+  const layout = document.querySelector<HTMLElement>('#chatLayout');
+  if (!layout) {
+    renderShell();
+    return;
+  }
+  syncChatPanel();
+  updateChatLists();
+  const head = document.querySelector<HTMLElement>('#threadHead');
+  if (head) renderThreadHeader(head);
+  updateChatAvailability();
+  if (!alreadyActive) void loadHistory();
+}
+
+function showChatList() {
+  state.chatPanel = 'list';
+  syncChatPanel();
+}
+
+function syncChatPanel() {
+  const layout = document.querySelector<HTMLElement>('#chatLayout');
+  if (layout) layout.dataset.mobilePanel = state.chatPanel;
 }
 
 async function loadHistory() {
@@ -1344,10 +1612,13 @@ async function loadHistory() {
     renderHistory([]);
     return;
   }
+  const target = state.activeId;
   try {
-    const history = await api(`/history?id=${encodeURIComponent(state.activeId)}&limit=${state.historyLimit}`);
+    const history = await api(`/history?id=${encodeURIComponent(target)}&limit=${state.historyLimit}`);
+    if (target !== state.activeId) return;
     renderHistory(asMessages(history));
   } catch (error) {
+    if (target !== state.activeId) return;
     setFeedback(errorMessage(error), 'error');
   }
 }
@@ -1357,7 +1628,9 @@ function renderHistory(items: MessageItem[]) {
   if (!messages) return;
   clear(messages);
   if (!items.length) {
-    messages.append(create('div', 'empty', '暂无消息'));
+    const empty = create('div', 'thread-empty');
+    empty.append(create('strong', '', state.activeId ? '暂无消息' : '未选择会话'));
+    messages.append(empty);
     return;
   }
   for (const item of items) messages.append(renderMessage(item));
@@ -1774,7 +2047,10 @@ async function sendText() {
   if (!id || !msg) return;
   try {
     await api('/message', jsonBody({ id, msg }));
-    if (input) input.value = '';
+    if (input) {
+      input.value = '';
+      resizeComposerInput(input);
+    }
     await loadHistory();
     setFeedback('已发送', 'ok');
   } catch (error) {
@@ -1874,6 +2150,7 @@ function ensureWebSocket() {
       };
       if (item.id === state.activeId) {
         const messages = document.querySelector<HTMLElement>('#messages');
+        messages?.querySelector('.thread-empty')?.remove();
         messages?.append(renderMessage(item));
         if (messages) messages.scrollTop = messages.scrollHeight;
       }
@@ -1969,11 +2246,11 @@ document.querySelector('#lightboxClose')?.addEventListener('click', () => {
 });
 
 document.addEventListener('dragover', (event) => {
-  if (state.view === 'chat' && steamOnline()) event.preventDefault();
+  if (state.view === 'chat' && steamOnline() && steamAccessAllowed() && state.activeId) event.preventDefault();
 });
 
 document.addEventListener('drop', (event) => {
-  if (state.view !== 'chat' || !steamOnline()) return;
+  if (state.view !== 'chat' || !steamOnline() || !steamAccessAllowed() || !state.activeId) return;
   const files = event.dataTransfer?.files || null;
   if (files && files.length) {
     event.preventDefault();

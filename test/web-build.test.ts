@@ -11,3 +11,14 @@ test('web app build emits a browser-compatible script', () => {
 
   assert.doesNotMatch(appSource, /\bexports\b|module\.exports|require\(/);
 });
+
+test('web app build emits the local chat icon assets', () => {
+  const iconDir = path.resolve(__dirname, '../web/icons');
+  const icons = ['arrow-left', 'image', 'link', 'paperclip', 'plus', 'search', 'send', 'smile', 'x'];
+
+  for (const icon of icons) {
+    const source = fs.readFileSync(path.join(iconDir, `${icon}.svg`), 'utf8');
+    assert.match(source, /@license lucide-static/);
+    assert.match(source, /<svg\b/);
+  }
+});

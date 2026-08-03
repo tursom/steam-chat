@@ -8,7 +8,7 @@ const path = require('node:path');
 const test = require('node:test');
 const vm = require('node:vm');
 
-type Listener = (event: { currentTarget: FakeElement; target: FakeElement }) => unknown;
+type Listener = (event: Record<string, unknown> & { currentTarget: FakeElement; target: FakeElement }) => unknown;
 
 class FakeElement {
   tagName: string;
@@ -25,6 +25,11 @@ class FakeElement {
   type = '';
   alt = '';
   hidden = false;
+  disabled = false;
+  id = '';
+  value = '';
+  open = false;
+  scrollHeight = 42;
   attributes: Record<string, string> = {};
   private ownText = '';
   private listeners = new Map<string, Listener[]>();
@@ -52,11 +57,27 @@ class FakeElement {
     this.attributes[name] = value;
   }
 
-  async dispatch(type: string) {
+  async dispatch(type: string, init: Record<string, unknown> = {}) {
     for (const listener of this.listeners.get(type) || []) {
-      await listener({ currentTarget: this, target: this });
+      await listener({ preventDefault() {}, ...init, currentTarget: this, target: (init.target as FakeElement) || this });
     }
   }
+
+  focus() {}
+
+  showModal() {
+    this.open = true;
+  }
+
+  close() {
+    this.open = false;
+  }
+
+  contains(node: FakeElement): boolean {
+    return node === this || this.children.some((child) => child.contains(node));
+  }
+
+  remove() {}
 
   get textContent(): string {
     return this.ownText + this.children.map((child) => child.textContent).join('');
@@ -71,6 +92,15 @@ class FakeElement {
     if (this.className.split(/\s+/).includes(className)) return this;
     for (const child of this.children) {
       const found = child.findByClass(className);
+      if (found) return found;
+    }
+    return null;
+  }
+
+  findById(id: string): FakeElement | null {
+    if (this.id === id) return this;
+    for (const child of this.children) {
+      const found = child.findById(id);
       if (found) return found;
     }
     return null;
@@ -94,16 +124,49 @@ class FakeElement {
     const matches: FakeElement[] = this.tagName === tagName.toUpperCase() ? [this] : [];
     return matches.concat(...this.children.map((child) => child.findAllByTag(tagName)));
   }
+
+  querySelector(selector: string): FakeElement | null {
+    if (selector.startsWith('#')) return this.findById(selector.slice(1));
+    if (selector.startsWith('.')) return this.findByClass(selector.slice(1));
+    return this.findByTag(selector);
+  }
+
+  querySelectorAll(selector: string): FakeElement[] {
+    return selector.split(',').flatMap((part) => this.findAllByTag(part.trim()));
+  }
+
+  get classList() {
+    return {
+      toggle: (name: string, force?: boolean) => {
+        const names = new Set(this.className.split(/\s+/).filter(Boolean));
+        const enabled = force === undefined ? !names.has(name) : force;
+        if (enabled) names.add(name);
+        else names.delete(name);
+        this.className = [...names].join(' ');
+      }
+    };
+  }
 }
 
 type WebTestApi = {
   renderMessage: (item: Record<string, unknown>) => FakeElement;
+  filterChatEntries: (items: Record<string, unknown>[], query: string) => Record<string, unknown>[];
+  openConversation: (id: unknown, name?: string) => void;
+  showChatList: () => void;
+  getChatState: () => { activeId: string; activeName: string; chatPanel: string };
+  setChatAvailability: (online: boolean, accessAllowed: boolean, activeId: string) => void;
+  renderChatList: (container: FakeElement) => void;
+  setChatListState: (recent: Record<string, unknown>[], friends: Record<string, unknown>[], groups: Record<string, unknown>[], tab: string, query: string, activeId: string) => void;
+  renderChatView: () => FakeElement;
 };
 
 function loadWebTestApi(): WebTestApi & {
   clipboardWrites: string[];
   lightbox: FakeElement;
   lightboxImage: FakeElement;
+  offlineNote: FakeElement;
+  chatControls: FakeElement[];
+  dispatchDocument: (type: string, init: Record<string, unknown>) => Promise<void>;
 } {
   const appPath = path.resolve(__dirname, '../web/app.js');
   const appSource = fs.readFileSync(appPath, 'utf8');
@@ -114,6 +177,14 @@ function loadWebTestApi(): WebTestApi & {
   const lightbox = new FakeElement('div');
   lightbox.hidden = true;
   const lightboxImage = new FakeElement('img');
+  const offlineNote = new FakeElement('div');
+  const chatControls = ['textarea', 'button', 'button', 'button', 'input', 'button'].map((tag) => new FakeElement(tag));
+  const documentListeners = new Map<string, Listener[]>();
+  const dispatchDocument = async (type: string, init: Record<string, unknown>) => {
+    for (const listener of documentListeners.get(type) || []) {
+      await listener({ preventDefault() {}, ...init, currentTarget: appRoot, target: (init.target as FakeElement) || appRoot });
+    }
+  };
   const clipboardWrites: string[] = [];
   const sandbox: Context & { __webTest?: WebTestApi } = {
     console,
@@ -122,7 +193,11 @@ function loadWebTestApi(): WebTestApi & {
         if (selector === '#app') return appRoot;
         if (selector === '#lightbox') return lightbox;
         if (selector === '#lightboxImage') return lightboxImage;
+        if (selector === '#offlineNote') return offlineNote;
         return null;
+      },
+      querySelectorAll(selector: string) {
+        return selector === '[data-chat-control]' ? chatControls : [];
       },
       createElement(tagName: string) {
         return new FakeElement(tagName);
@@ -132,11 +207,19 @@ function loadWebTestApi(): WebTestApi & {
         node.textContent = text;
         return node;
       },
-      addEventListener() {}
+      addEventListener(type: string, listener: Listener) {
+        const listeners = documentListeners.get(type) || [];
+        listeners.push(listener);
+        documentListeners.set(type, listeners);
+      },
+      removeEventListener(type: string, listener: Listener) {
+        documentListeners.set(type, (documentListeners.get(type) || []).filter((item) => item !== listener));
+      }
     },
     localStorage: { getItem(): null { return null; }, setItem(): void {} },
     navigator: { clipboard: { async writeText(value: string) { clipboardWrites.push(value); } } },
     location: { protocol: 'http:', host: 'localhost' },
+    Node: FakeElement,
     URL,
     Headers,
     FormData,
@@ -149,10 +232,10 @@ function loadWebTestApi(): WebTestApi & {
     setInterval,
     clearInterval
   };
-  const testSource = `${appSource.slice(0, bootstrapIndex)}\n;globalThis.__webTest = { renderMessage };`;
+  const testSource = `${appSource.slice(0, bootstrapIndex)}\n;globalThis.__webTest = { renderMessage, filterChatEntries, openConversation, showChatList, getChatState: () => ({ activeId: state.activeId, activeName: state.activeName, chatPanel: state.chatPanel }), setChatAvailability: (online, accessAllowed, activeId) => { state.steam.status = online ? 'online' : 'logged_out'; state.steam.accessAllowed = accessAllowed; state.activeId = activeId; updateChatAvailability(); }, renderChatList: renderChatListSections, setChatListState: (recent, friends, groups, tab, query, activeId) => { state.conversations = recent; state.friends = friends; state.groups = groups; state.chatListTab = tab; state.chatQuery = query; state.activeId = activeId; }, renderChatView };`;
   vm.runInNewContext(testSource, sandbox);
   assert.ok(sandbox.__webTest);
-  return { ...sandbox.__webTest, clipboardWrites, lightbox, lightboxImage };
+  return { ...sandbox.__webTest, clipboardWrites, lightbox, lightboxImage, offlineNote, chatControls, dispatchDocument };
 }
 
 test('web chat renders Steam OpenGraph messages as preview cards', async () => {
@@ -399,4 +482,115 @@ test('web chat handles long unclosed supported BBCode without blocking', () => {
 
   assert.ok(performance.now() - startedAt < 250, 'unclosed markup should be handled in linear time');
   assert.equal(rendered.textContent, `Alice${message}`);
+});
+
+test('web chat filters the selected conversation group by name, SteamID, and preview', () => {
+  const { filterChatEntries } = loadWebTestApi();
+  const entries = [
+    { id: '76561198000000001', name: 'Alice', preview: '今晚开黑' },
+    { id: '76561198000000002', name: 'Bob', preview: 'Trade offer received' },
+    { id: '103582791429000001', name: 'CS2 Group', preview: '赛事通知' }
+  ];
+
+  assert.deepEqual(filterChatEntries(entries, 'alice').map((item) => item.id), ['76561198000000001']);
+  assert.deepEqual(filterChatEntries(entries, '00000002').map((item) => item.id), ['76561198000000002']);
+  assert.deepEqual(filterChatEntries(entries, 'trade OFFER').map((item) => item.id), ['76561198000000002']);
+  assert.deepEqual(filterChatEntries(entries, '  赛事  ').map((item) => item.id), ['103582791429000001']);
+  assert.deepEqual(filterChatEntries(entries, '').map((item) => item.id), entries.map((item) => item.id));
+});
+
+test('web chat renders the selected conversation group, empty results, and active state', () => {
+  const { renderChatList, setChatListState } = loadWebTestApi();
+  const recent = [{ id: 'recent-1', name: 'Recent Alice', preview: '最近消息' }];
+  const friends = [{ id: 'friend-1', name: 'Friend Bob', preview: '好友消息' }];
+  const groups = [{ id: 'group-1', name: 'Group CS2', preview: '群组消息' }];
+  const container = new FakeElement('div');
+
+  for (const [tab, expected] of [['recent', 'Recent Alice'], ['friends', 'Friend Bob'], ['groups', 'Group CS2']]) {
+    setChatListState(recent, friends, groups, tab, '', tab === 'friends' ? 'friend-1' : '');
+    renderChatList(container);
+    assert.equal(container.children.length, 1);
+    assert.match(container.textContent, new RegExp(expected));
+    if (tab === 'friends') {
+      assert.match(container.children[0].className, /\bis-active\b/);
+      assert.equal(container.children[0].attributes['aria-current'], 'true');
+    }
+  }
+
+  setChatListState(recent, friends, groups, 'groups', 'not-found', '');
+  renderChatList(container);
+  assert.equal(container.textContent, '没有匹配的会话');
+});
+
+test('web chat enters a conversation and returns to the list without losing the selection', () => {
+  const { openConversation, showChatList, getChatState } = loadWebTestApi();
+
+  openConversation('76561198000000001', 'Alice');
+  assert.equal(getChatState().activeId, '76561198000000001');
+  assert.equal(getChatState().activeName, 'Alice');
+  assert.equal(getChatState().chatPanel, 'thread');
+
+  showChatList();
+  assert.equal(getChatState().activeId, '76561198000000001');
+  assert.equal(getChatState().activeName, 'Alice');
+  assert.equal(getChatState().chatPanel, 'list');
+});
+
+test('web chat disables composer controls until a usable conversation is selected', () => {
+  const { setChatAvailability, chatControls, offlineNote } = loadWebTestApi();
+  const controls = chatControls;
+
+  setChatAvailability(true, true, '76561198000000001');
+  assert.ok(controls.every((node) => !node.disabled));
+  assert.equal(offlineNote.hidden, true);
+
+  setChatAvailability(true, true, '');
+  assert.ok(controls.every((node) => node.disabled));
+  assert.equal(offlineNote.hidden, true);
+
+  setChatAvailability(false, true, '76561198000000001');
+  assert.ok(controls.every((node) => node.disabled));
+  assert.equal(offlineNote.hidden, false);
+  assert.match(offlineNote.textContent, /Steam 未在线/);
+
+  setChatAvailability(true, false, '76561198000000001');
+  assert.ok(controls.every((node) => node.disabled));
+  assert.equal(offlineNote.hidden, false);
+  assert.match(offlineNote.textContent, /未被授权/);
+});
+
+test('web chat opens and closes the new conversation dialog', async () => {
+  const { renderChatView } = loadWebTestApi();
+  const view = renderChatView();
+  const openButton = view.findByClass('new-chat-btn');
+  const dialog = view.findByClass('new-chat-dialog');
+  const closeButton = view.findByClass('dialog-close');
+
+  assert.ok(openButton);
+  assert.ok(dialog);
+  assert.ok(closeButton);
+  assert.equal(dialog.open, false);
+  await openButton.dispatch('click');
+  assert.equal(dialog.open, true);
+  await closeButton.dispatch('click');
+  assert.equal(dialog.open, false);
+});
+
+test('web chat closes the attachment menu with Escape or an outside click', async () => {
+  const { renderChatView, dispatchDocument } = loadWebTestApi();
+  const view = renderChatView();
+  const trigger = view.findById('attachmentToggle');
+  const menu = view.findById('attachmentMenu');
+
+  assert.ok(trigger);
+  assert.ok(menu);
+  await trigger.dispatch('click');
+  assert.equal(menu.hidden, false);
+  await dispatchDocument('keydown', { key: 'Escape', target: trigger });
+  assert.equal(menu.hidden, true);
+
+  await trigger.dispatch('click');
+  assert.equal(menu.hidden, false);
+  await dispatchDocument('pointerdown', { target: new FakeElement('div') });
+  assert.equal(menu.hidden, true);
 });
