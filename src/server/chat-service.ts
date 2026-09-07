@@ -1,5 +1,8 @@
 'use strict';
 
+import { settleMetadata } from '../steam/metadata';
+import { steamEventKey } from '../storage/history-message';
+import type { HistoryStorage } from '../storage/history-storage';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
 import type { RawData, WebSocket as WsConnection, WebSocketServer as WsServer } from 'ws';
@@ -93,6 +96,7 @@ type GetEmoticonsOptions = {
 };
 
 type ChatServiceOptions = {
+  historyStorage?: HistoryStorage;
   config?: unknown;
   chatConfig?: unknown;
   logger?: LoggerLike;
@@ -105,7 +109,7 @@ type ChatServiceOptions = {
   steamWebLoginPromise?: Waiter;
   refreshWebSession?: () => Promise<unknown> | unknown;
   getUserInfo?: (value: unknown) => Promise<Persona>;
-  getSelfName?: () => Promise<string>;
+  getSelfName?: (steamAccountId?: string) => Promise<string>;
   getEmoticons?: (options: GetEmoticonsOptions) => Promise<EmoticonPayload>;
   fetchImpl?: typeof fetch;
   server?: Server;
@@ -438,6 +442,14 @@ function createChatService(options: ChatServiceOptions = {}) {
     ? options.config.chat
     : options.chatConfig ?? options.config ?? true;
   const config = normalizeChatConfig(rawConfig);
+  const historyStorage = options.historyStorage;
+  const pending = new Set<Promise<unknown>>();
+  let stopping = false;
+  function track<T>(task: Promise<T>): Promise<T> {
+    pending.add(task);
+    void task.finally(() => pending.delete(task)).catch(() => {});
+    return task;
+  }
   const logger = options.logger || console;
   const logPath = options.logPath || DEFAULT_LOG_PATH;
   const steamUser = options.steamUser;
@@ -458,7 +470,9 @@ function createChatService(options: ChatServiceOptions = {}) {
   const recentSentText = new Map<string, number>();
   let disposeSteamEvents = () => {};
 
-  const server: Server = options.server || http.createServer(handleHttpRequest);
+  const server: Server = options.server || http.createServer((req: IncomingMessage, res: ServerResponse) => {
+    void track(handleHttpRequest(req, res));
+  });
   const wss: WsServer = new WebSocketServer({ noServer: true });
 
   function remember(map: Map<string, number>, key: string, ttl = 30 * 1000) {
@@ -540,7 +554,7 @@ function createChatService(options: ChatServiceOptions = {}) {
       return {
         session,
         activeAccount: active,
-        steamAccountId: active?.steamId,
+        steamAccountId: active?.steamId || currentSteamStatus().steamId || undefined,
         includeLegacy: true
       };
     }
@@ -564,7 +578,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (needsOnline) requireSteamOnline();
     if (!sessionManager || !authStore) {
       const active = ensureActiveSteamAccount();
-      return { session, activeAccount: active, steamAccountId: active?.steamId, includeLegacy: true };
+      return { session, activeAccount: active, steamAccountId: active?.steamId || currentSteamStatus().steamId || undefined, includeLegacy: true };
     }
     const status = currentSteamStatus();
     const active = ensureActiveSteamAccount(status);
@@ -934,7 +948,53 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
   }
 
+  // First version is active-account-only; a caller-supplied account is never authority.
+  function historyAccount(access: SteamAccessContext, requested?: unknown): string {
+    if (!access.steamAccountId) throw steamAccountUnavailable();
+    if (requested != null && requested !== '' && requested !== access.steamAccountId) {
+      throw Object.assign(new Error('Only the active Steam account is supported'), { statusCode: 403 });
+    }
+    return access.steamAccountId;
+  }
+
+  function historyQuery(access: SteamAccessContext, input: UnknownRecord) {
+    const steamAccountId = historyAccount(access, input.steamAccountId);
+    if (!input.id) throw Object.assign(new Error('id is required'), { statusCode: 400 });
+    return { steamAccountId, id: String(input.id), limit: input.limit == null ? undefined : Number(input.limit),
+      before: input.before == null ? undefined : String(input.before),
+      after: input.after == null ? undefined : String(input.after),
+      at: input.at == null ? undefined : Number(input.at) };
+  }
+
+  function checkSend(steamAccountId?: string) {
+    if (stopping || (historyStorage && !historyStorage.canSend())) {
+      throw Object.assign(new Error('History storage unavailable for sending'), { statusCode: 503 });
+    }
+    if (historyStorage && !steamAccountId) throw steamAccountUnavailable();
+    const currentAccount = ensureActiveSteamAccount()?.steamId || currentSteamStatus().steamId;
+    if (historyStorage && currentAccount && currentAccount !== steamAccountId) {
+      throw Object.assign(new Error('Steam account changed before sending'), { statusCode: 409 });
+    }
+  }
+
+  async function persistSent(record: HistoryRecordInput): Promise<HistoryItem> {
+    if (!historyStorage) {
+      const item = await appendLog(record, { logPath });
+      broadcast({ type: 'message', ...item });
+      return item;
+    }
+    try { return historyStorage.append(record); }
+    catch (error) {
+      // Steam already accepted this send. A persistence failure must not invite a retry.
+      logger.error?.('Sent message persistence failed', { error: errorMessage(error) });
+      return { ...normalizeHistoryItem(record), persistence: { jsonl: 'failed', rocksdb: 'failed' } };
+    }
+  }
+
   async function sendTextMessage(id: unknown, msg: unknown, steamAccountId?: string): Promise<HistoryItem> {
+    steamAccountId = steamAccountId || ensureActiveSteamAccount()?.steamId || currentSteamStatus().steamId || undefined;
+    checkSend(steamAccountId);
+    const selfName = settleMetadata(getSelfName(steamAccountId), 'Me');
     if (!id || !String(msg || '').trim()) {
       throw Object.assign(new Error('id and msg are required'), { statusCode: 400 });
     }
@@ -943,6 +1003,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
     const message = String(msg);
     const result = await withSteamRetry(() => {
+      checkSend(steamAccountId);
       const sender = steamUser.chat?.sendFriendMessage || steamUser.sendFriendMessage;
       const context = steamUser.chat?.sendFriendMessage ? steamUser.chat : steamUser;
       if (!sender) throw new Error('Steam chat sender is unavailable');
@@ -954,19 +1015,21 @@ function createChatService(options: ChatServiceOptions = {}) {
       echo: true,
       steamAccountId,
       id,
-      name: await getSelfName(),
+      name: await selfName,
       message
     };
     if (isRecord(result)) {
       if (typeof result.ordinal === 'string' || typeof result.ordinal === 'number') record.ordinal = result.ordinal;
       if (result.server_timestamp instanceof Date) record.sentAt = result.server_timestamp.toISOString();
+      record.steamEventKey = steamEventKey(steamAccountId, String(id), true, message, result.server_timestamp, result.ordinal);
     }
-    const item = await appendLog(record, { logPath });
-    broadcast({ type: 'message', ...item });
-    return item;
+    return persistSent(record);
   }
 
   async function sendImageMessage(id: unknown, body: ImageBody, steamAccountId?: string): Promise<HistoryItem> {
+    steamAccountId = steamAccountId || ensureActiveSteamAccount()?.steamId || currentSteamStatus().steamId || undefined;
+    checkSend(steamAccountId);
+    const selfName = settleMetadata(getSelfName(steamAccountId), 'Me');
     if (!id) throw Object.assign(new Error('id is required'), { statusCode: 400 });
     if (!steamCommunity || typeof steamCommunity.sendImageToUser !== 'function') {
       throw new Error('Steam image sender is unavailable');
@@ -982,24 +1045,29 @@ function createChatService(options: ChatServiceOptions = {}) {
       throw Object.assign(new Error('img or url is required'), { statusCode: 400 });
     }
     const imageArgs = steamCommunity.sendImageToUser.length >= 4 ? [id, imageBuffer, 'image.png'] : [id, imageBuffer];
-    const result = await withSteamRetry(() => callMaybeCallback(steamCommunity.sendImageToUser, steamCommunity, imageArgs), true);
+    const result = await withSteamRetry(() => {
+      checkSend(steamAccountId);
+      return callMaybeCallback(steamCommunity.sendImageToUser!, steamCommunity, imageArgs);
+    }, true);
     if (!message && isRecord(result) && typeof result.url === 'string') message = result.url;
-    const item = normalizeHistoryItem({
-      type: 'message',
+    const record: HistoryRecordInput = {
+      type: historyStorage ? 'image' : 'message',
       echo: true,
       steamAccountId,
       id,
-      name: await getSelfName(),
+      name: await selfName,
       message,
-      ordinal: isRecord(result) && (typeof result.ordinal === 'string' || typeof result.ordinal === 'number') ? result.ordinal : 0
-    });
-    return item;
+      sentAt: isRecord(result) && result.server_timestamp instanceof Date ? result.server_timestamp.toISOString() : undefined,
+      ordinal: isRecord(result) && (typeof result.ordinal === 'string' || typeof result.ordinal === 'number') ? result.ordinal : 0,
+      steamEventKey: isRecord(result) ? steamEventKey(steamAccountId, String(id), true, message, result.server_timestamp, result.ordinal) : undefined
+    };
+    return historyStorage ? persistSent(record) : normalizeHistoryItem(record);
   }
 
   async function handleSteamIncoming(event: SteamFriendMessageEvent) {
     const id = event.id;
-    const info = await getUserInfo(event.steamID || id).catch((): Persona => ({ player_name: id }));
     const active = ensureActiveSteamAccount();
+    const info = await getUserInfo(event.steamID || id).catch((): Persona => ({ player_name: id }));
     const item = normalizeHistoryItem({
       type: 'message',
       steamAccountId: active?.steamId,
@@ -1032,6 +1100,10 @@ function createChatService(options: ChatServiceOptions = {}) {
   async function handleHttpRequest(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
     try {
+      if (stopping) {
+        jsonResponse(res, 503, { error: 'Service is stopping' });
+        return;
+      }
       if (req.method === 'GET' && url.pathname === '/healthz') {
         jsonResponse(res, 200, { ok: true });
         return;
@@ -1067,6 +1139,24 @@ function createChatService(options: ChatServiceOptions = {}) {
         if (url.pathname === '/api/groups') {
           requireSteamAccountAccess(req, true);
           jsonResponse(res, 200, await listGroups(steamUser));
+          return;
+        }
+        if (url.pathname === '/api/history/status') {
+          if (!historyStorage) throw Object.assign(new Error('History storage unavailable'), { statusCode: 503 });
+          const { jsonl, rocksdb } = historyStorage.status();
+          const { lastError: _jsonlError, ...safeJsonl } = jsonl;
+          const { lastError: _dbError, ...safeDb } = rocksdb;
+          jsonResponse(res, 200, { jsonl: safeJsonl, rocksdb: safeDb });
+          return;
+        }
+        if (historyStorage && ['/history', '/api/history', '/conversations', '/api/conversations'].includes(url.pathname)) {
+          const access = requireSteamAccountAccess(req, false);
+          const input = Object.fromEntries(url.searchParams);
+          const page = url.pathname.endsWith('/history')
+            ? await historyStorage.history(historyQuery(access, input))
+            : await historyStorage.conversations({ steamAccountId: historyAccount(access, input.steamAccountId),
+              limit: input.limit == null ? undefined : Number(input.limit), before: input.before });
+          jsonResponse(res, 200, url.pathname.startsWith('/api/') ? page : page.items);
           return;
         }
         if (url.pathname === '/history') {
@@ -1113,16 +1203,16 @@ function createChatService(options: ChatServiceOptions = {}) {
       }
 
       if (req.method === 'POST' && (url.pathname === '/' || url.pathname === '/message')) {
-        const body = await readJsonBody(req);
         const access = requireSteamAccountAccess(req, true);
+        const body = await readJsonBody(req);
         const item = await sendTextMessage(body.id, body.msg, access.steamAccountId);
         jsonResponse(res, 200, { ok: true, item });
         return;
       }
 
       if (req.method === 'POST' && (url.pathname === '/image' || url.pathname === '/img')) {
-        const body = await readJsonBody(req);
         const access = requireSteamAccountAccess(req, true);
+        const body = await readJsonBody(req);
         const item = await sendImageMessage(body.id, body, access.steamAccountId);
         jsonResponse(res, 200, { ok: true, item });
         return;
@@ -1162,6 +1252,19 @@ function createChatService(options: ChatServiceOptions = {}) {
         const access = wsAccessContext(ws, true);
         const item = await sendImageMessage(payload.id, payload, access.steamAccountId);
         reply({ type: 'image_sent', item });
+        return;
+      }
+      if (historyStorage && ['get_history', 'history', 'get_history_page', 'get_conversations', 'conversations', 'get_conversations_page'].includes(String(type))) {
+        const access = wsAccessContext(ws, false);
+        const isHistory = String(type).includes('history');
+        const page = isHistory
+          ? await historyStorage.history(historyQuery(access, payload))
+          : await historyStorage.conversations({ steamAccountId: historyAccount(access, payload.steamAccountId),
+            limit: payload.limit == null ? undefined : Number(payload.limit),
+            before: payload.before == null ? undefined : String(payload.before) });
+        reply(String(type).endsWith('_page')
+          ? { type: isHistory ? 'history_page' : 'conversations_page', ...page }
+          : isHistory ? { type: 'history', items: page.items } : { type: 'conversations', conversations: page.items });
         return;
       }
       if (type === 'get_history' || type === 'history') {
@@ -1252,7 +1355,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
     clients.add(ws);
     sendWs(ws, { type: 'ready', wsPath: config.wsPath });
-    ws.on('message', (raw: RawData) => handleWsMessage(ws, raw));
+    ws.on('message', (raw: RawData) => { if (!stopping) void track(handleWsMessage(ws, raw)); });
     ws.on('close', () => {
       clients.delete(ws);
       wsSessions.delete(ws);
@@ -1263,7 +1366,19 @@ function createChatService(options: ChatServiceOptions = {}) {
     });
   });
 
-  if (steamUser) {
+  const disposeStorageMessages = historyStorage?.onMessage((item) => {
+    for (const ws of clients) {
+      if (sessionManager && authStore) {
+        const session = wsSessions.get(ws);
+        if (!session) continue;
+        const account = authStore.listSteamAccountsForUser(session.user.id).find((account) => account.steamId === item.steamAccountId);
+        if (!account || !authStore.canAccessSteamAccount(session.user.id, account.id)) continue;
+      }
+      sendWs(ws, { type: 'message', ...item });
+    }
+  });
+
+  if (steamUser && !historyStorage) {
     disposeSteamEvents = subscribeFriendMessageEvents(steamUser as SteamFriendMessageEventUser, (event: SteamFriendMessageEvent) => {
       const task = event.echo ? handleSteamEcho(event) : handleSteamIncoming(event);
       task.catch((error) => {
@@ -1284,16 +1399,20 @@ function createChatService(options: ChatServiceOptions = {}) {
       });
       return server;
     },
-    stop() {
+    async stop() {
+      stopping = true;
       disposeSteamEvents();
-      for (const ws of clients) ws.close();
+      for (const ws of clients) ws.terminate();
       wss.close();
-      return new Promise<void>((resolve, reject) => {
+      await new Promise<void>((resolve, reject) => {
+        if (!server.listening) return resolve();
         server.close((error) => (error ? reject(error) : resolve()));
       });
+      while (pending.size) await Promise.allSettled([...pending]);
+      disposeStorageMessages?.();
     },
-    sendTextMessage,
-    sendImageMessage,
+    sendTextMessage: (...args: Parameters<typeof sendTextMessage>) => track(sendTextMessage(...args)),
+    sendImageMessage: (...args: Parameters<typeof sendImageMessage>) => track(sendImageMessage(...args)),
     broadcast,
     handleHttpRequest,
     handleWsMessage

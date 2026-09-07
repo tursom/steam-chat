@@ -7,6 +7,7 @@
   "scripts": {
     "build": "tsc -p tsconfig.json && tsc -p tsconfig.web.json && mkdir -p dist/web && cp web/index.html web/style.css dist/web/ && cp -R web/icons dist/web/",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json --noEmit",
+    "history:maintain": "npm run build && node dist/src/storage/history-maintenance.js",
     "start": "npm run build && node dist/src/index.js",
     "test": "npm run build && STEAM_CHAT_DISABLE_AUTOSTART=1 node --test dist/test/*.test.js"
   },
@@ -18,6 +19,7 @@
   "author": "",
   "license": "GPL-3.0",
   "dependencies": {
+    "@harperfast/rocksdb-js": "^2.8.0",
     "steam-user": "^5.0.8",
     "steamcommunity": "^3.48.2",
     "winston": "^3.12.0",

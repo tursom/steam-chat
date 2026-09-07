@@ -149,7 +149,12 @@ class FakeElement {
 }
 
 type WebTestApi = {
+  pageSubtitle: () => string;
+  renderSteamView: () => FakeElement;
   renderMessage: (item: Record<string, unknown>) => FakeElement;
+  renderPicker: (container: FakeElement) => void;
+  createElement: (tag: string) => FakeElement;
+  setMediaInventory: (emoticons: Record<string, unknown>[], stickers: Record<string, unknown>[]) => void;
   filterChatEntries: (items: Record<string, unknown>[], query: string) => Record<string, unknown>[];
   openConversation: (id: unknown, name?: string) => void;
   showChatList: () => void;
@@ -158,6 +163,10 @@ type WebTestApi = {
   renderChatList: (container: FakeElement) => void;
   setChatListState: (recent: Record<string, unknown>[], friends: Record<string, unknown>[], groups: Record<string, unknown>[], tab: string, query: string, activeId: string) => void;
   renderChatView: () => FakeElement;
+  mountChatView: () => FakeElement;
+  setFriendDetailsOpen: (open: boolean) => void;
+  updateSteamStatus: (status: Record<string, unknown>) => void;
+  renderFriendDetails: (container: FakeElement) => void;
 };
 
 function loadWebTestApi(): WebTestApi & {
@@ -194,7 +203,7 @@ function loadWebTestApi(): WebTestApi & {
         if (selector === '#lightbox') return lightbox;
         if (selector === '#lightboxImage') return lightboxImage;
         if (selector === '#offlineNote') return offlineNote;
-        return null;
+        return selector.startsWith('#') ? appRoot.findById(selector.slice(1)) : null;
       },
       querySelectorAll(selector: string) {
         return selector === '[data-chat-control]' ? chatControls : [];
@@ -232,7 +241,7 @@ function loadWebTestApi(): WebTestApi & {
     setInterval,
     clearInterval
   };
-  const testSource = `${appSource.slice(0, bootstrapIndex)}\n;globalThis.__webTest = { renderMessage, filterChatEntries, openConversation, showChatList, getChatState: () => ({ activeId: state.activeId, activeName: state.activeName, chatPanel: state.chatPanel }), setChatAvailability: (online, accessAllowed, activeId) => { state.steam.status = online ? 'online' : 'logged_out'; state.steam.accessAllowed = accessAllowed; state.activeId = activeId; updateChatAvailability(); }, renderChatList: renderChatListSections, setChatListState: (recent, friends, groups, tab, query, activeId) => { state.conversations = recent; state.friends = friends; state.groups = groups; state.chatListTab = tab; state.chatQuery = query; state.activeId = activeId; }, renderChatView };`;
+  const testSource = `${appSource.slice(0, bootstrapIndex)}\n;globalThis.__webTest = { pageSubtitle: () => { state.view = 'chat'; return pageSubtitle(); }, renderSteamView, renderMessage, renderPicker, createElement: (tag) => document.createElement(tag), setMediaInventory: (emoticons, stickers) => { state.emoticons = emoticons; state.stickers = stickers; }, filterChatEntries, openConversation, showChatList, getChatState: () => ({ activeId: state.activeId, activeName: state.activeName, chatPanel: state.chatPanel }), setChatAvailability: (online, accessAllowed, activeId) => { state.steam.status = online ? 'online' : 'logged_out'; state.steam.accessAllowed = accessAllowed; state.activeId = activeId; updateChatAvailability(); }, renderChatList: renderChatListSections, setChatListState: (recent, friends, groups, tab, query, activeId) => { state.conversations = recent; state.friends = friends; state.groups = groups; state.chatListTab = tab; state.chatQuery = query; state.activeId = activeId; }, renderChatView, mountChatView: () => { state.view = 'chat'; const view = renderChatView(); document.querySelector('#app').replaceChildren(view); return view; }, setFriendDetailsOpen, updateSteamStatus, renderFriendDetails };`;
   vm.runInNewContext(testSource, sandbox);
   assert.ok(sandbox.__webTest);
   return { ...sandbox.__webTest, clipboardWrites, lightbox, lightboxImage, offlineNote, chatControls, dispatchDocument };
@@ -367,7 +376,7 @@ test('web chat renders both Steam URL BBCode forms without leaking markup', () =
 test('web chat renders Steam emoticon BBCode and complete sticker types', () => {
   const { renderMessage } = loadWebTestApi();
   const message = [
-    '[emoticon]steamfacepalm[/emoticon]',
+    '[emoticon]steamhappy[/emoticon]',
     '[sticker type="show love" limit="0"][/sticker]',
     '[sticker type="伊埃斯跳舞" limit="0"][/sticker]'
   ].join(' ');
@@ -378,11 +387,24 @@ test('web chat renders Steam emoticon BBCode and complete sticker types', () => 
 
   assert.doesNotMatch(rendered.textContent, /\[\/?(?:emoticon|sticker)\b/i);
   assert.equal(emoticons.length, 1);
-  assert.equal(emoticons[0].src, 'https://community.cloudflare.steamstatic.com/economy/emoticon/steamfacepalm');
+  assert.equal(emoticons[0].src, `/proxy/image?url=${encodeURIComponent('https://community.cloudflare.steamstatic.com/economy/emoticon/steamhappy')}`);
   assert.deepEqual(stickers.map((sticker) => sticker.src), [
     '/proxy/sticker/show%20love',
     `/proxy/sticker/${encodeURIComponent('伊埃斯跳舞')}`
   ]);
+});
+
+test('web chat proxies emoticon picker thumbnails', () => {
+  const { createElement, renderPicker, setMediaInventory } = loadWebTestApi();
+  setMediaInventory([{ name: 'steamhappy' }], []);
+
+  const picker = createElement('div');
+  renderPicker(picker);
+
+  assert.equal(
+    picker.findByTag('img')?.src,
+    `/proxy/image?url=${encodeURIComponent('https://community.cloudflare.steamstatic.com/economy/emoticon/steamhappy')}`
+  );
 });
 
 test('web chat renders HAR-style Steam image BBCode with proxying, aspect ratio, and lightbox', async () => {
@@ -557,6 +579,81 @@ test('web chat disables composer controls until a usable conversation is selecte
   assert.ok(controls.every((node) => node.disabled));
   assert.equal(offlineNote.hidden, false);
   assert.match(offlineNote.textContent, /未被授权/);
+});
+
+test('web chat shows disconnected status instead of denied access without a Steam session', () => {
+  const { setChatAvailability, chatControls, offlineNote, pageSubtitle, renderSteamView } = loadWebTestApi();
+  setChatAvailability(false, false, '76561198000000001');
+  assert.ok(chatControls.every((node) => node.disabled));
+  assert.equal(offlineNote.hidden, false);
+  assert.match(offlineNote.textContent, /Steam 未在线/);
+  assert.doesNotMatch(offlineNote.textContent, /未被授权/);
+  assert.match(pageSubtitle(), /Steam 未在线/);
+  assert.doesNotMatch(renderSteamView().textContent, /未被授权/);
+
+  setChatAvailability(true, false, '76561198000000001');
+  assert.match(pageSubtitle(), /未被授权/);
+  assert.match(renderSteamView().textContent, /未被授权/);
+});
+
+test('friend details merge live friend data with recent conversation and collapse without losing selection', async () => {
+  const api = loadWebTestApi();
+  const id = '76561198000000001';
+  api.setChatAvailability(true, true, id);
+  api.setChatListState([{ id, name: 'Old name', preview: 'Hello' }], [{ id, name: 'Alice', avatar: 'https://example.com/avatar.png', online: true, gameName: 'Dota 2' }], [], 'recent', '', id);
+  const view = api.mountChatView();
+  const details = view.findById('friendDetails');
+  const toggle = view.findById('friendDetailsToggle');
+  assert.ok(details);
+  assert.ok(toggle);
+  assert.equal(details.hidden, true);
+  await toggle.dispatch('click');
+  assert.equal(details.hidden, false);
+  assert.equal(toggle.attributes['aria-expanded'], 'true');
+  assert.match(details.textContent, /Alice/);
+  assert.match(details.textContent, /Dota 2/);
+  assert.doesNotMatch(details.textContent, /Old name/);
+  assert.equal(details.findByTag('img')?.src, 'https://example.com/avatar.png');
+  assert.equal(details.findByTag('a')?.href, `https://steamcommunity.com/profiles/${id}`);
+  assert.equal(details.findByTag('a')?.rel, 'noopener noreferrer');
+  await api.dispatchDocument('keydown', { key: 'Escape' });
+  assert.equal(details.hidden, true);
+  assert.equal(toggle.attributes['aria-expanded'], 'false');
+  assert.equal(api.getChatState().activeId, id);
+  await toggle.dispatch('click');
+  await view.findById('friendDetailsBackdrop')?.dispatch('click');
+  assert.equal(details.hidden, true);
+});
+
+test('friend details follow conversation selection, clear on permission loss and never invent unknown status', () => {
+  const api = loadWebTestApi();
+  const first = '76561198000000001';
+  const second = '76561198000000002';
+  api.setChatAvailability(true, true, first);
+  api.setChatListState([{ id: first, name: 'Alice' }, { id: second, name: 'Bob' }], [], [], 'recent', '', first);
+  const view = api.mountChatView();
+  api.setFriendDetailsOpen(true);
+  const details = view.findById('friendDetails');
+  assert.ok(details);
+  assert.match(details.textContent, /状态未知/);
+  api.openConversation(second, 'Bob');
+  assert.match(details.textContent, /Bob/);
+  assert.doesNotMatch(details.textContent, /Alice/);
+  api.updateSteamStatus({ status: 'online', accessAllowed: false });
+  assert.equal(details.hidden, true);
+  assert.doesNotMatch(details.textContent, /Bob/);
+  assert.equal(view.findById('friendDetailsToggle')?.disabled, true);
+});
+
+test('friend details omit profile links for invalid identifiers and close on returning to the list', () => {
+  const api = loadWebTestApi();
+  api.setChatAvailability(true, true, 'not-a-steamid');
+  const view = api.mountChatView();
+  api.setFriendDetailsOpen(true);
+  assert.equal(view.findById('friendDetails')?.findByTag('a'), null);
+  api.showChatList();
+  assert.equal(view.findById('friendDetails')?.hidden, true);
+  assert.equal(api.getChatState().chatPanel, 'list');
 });
 
 test('web chat opens and closes the new conversation dialog', async () => {

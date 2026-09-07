@@ -1,5 +1,6 @@
 'use strict';
 
+import { createHistoryStorage } from './storage/history-storage';
 import type { CallbackStyleFunction, Persona, UnknownRecord } from './types';
 import type { IncomingMessage } from 'node:http';
 import { errorMessage, isRecord } from './types';
@@ -55,6 +56,8 @@ type SteamUserConstructor = new (options: { renewRefreshTokens: boolean }) => St
 type SteamCommunityConstructor = new () => SteamCommunityMain;
 type ChatServiceRuntime = {
   start: () => unknown;
+  stop: () => Promise<void>;
+  server: { closeAllConnections: () => void };
 };
 type LogInfo = {
   timestamp?: string;
@@ -88,6 +91,8 @@ const logger = winston.createLogger({
     new winston.transports.Console()
   ]
 });
+
+const historyStorage = createHistoryStorage({ logger });
 
 function getPersonaFromCache(id: string) {
   return users[id] || steamUser.users?.[id] || null;
@@ -125,8 +130,8 @@ async function getUserInfo(value: unknown): Promise<Persona> {
   return { player_name: 'Unknown' };
 }
 
-async function getSelfName() {
-  const selfId = steamIdToString(steamUser.steamID || config.steamID);
+async function getSelfName(steamAccountId?: string) {
+  const selfId = steamAccountId || steamIdToString(steamUser.steamID || config.steamID);
   if (!selfId) return 'Me';
   const info = await getUserInfo(selfId);
   return info.player_name || info.personaName || 'Me';
@@ -160,11 +165,12 @@ const lifecycle = createSteamLoginService({
   }
 });
 
-createSteamMessageLogger({
+const messageLogger = createSteamMessageLogger({
+  historyStorage,
   steamUser,
   getUserInfo,
   getSelfName,
-  getSteamAccountId: () => authStore.getActiveSteamAccount(false)?.steamId || steamIdToString(steamUser.steamID || ''),
+  getSteamAccountId: () => steamIdToString(steamUser.steamID || '') || authStore.getActiveSteamAccount(false)?.steamId,
   logger
 });
 
@@ -180,6 +186,7 @@ function start() {
   steamLoginPromise = lifecycle.waitForLogin();
   steamWebLoginPromise = lifecycle.waitForWebSession();
   chatService = createChatService({
+    historyStorage,
     config,
     steamUser,
     steamCommunity,
@@ -203,7 +210,43 @@ if (process.env.STEAM_CHAT_DISABLE_AUTOSTART !== '1') {
   });
 }
 
+let shutdownPromise: Promise<void> | undefined;
+function shutdown() {
+  return shutdownPromise ||= (async () => {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      messageLogger();
+      await Promise.race([
+        chatService?.stop(),
+        new Promise<void>((resolve) => { timer = setTimeout(() => {
+          logger.warn('Chat shutdown deadline reached');
+          chatService?.server.closeAllConnections();
+          resolve();
+        }, 5000); })
+      ]);
+    } finally {
+      if (timer) clearTimeout(timer);
+      try { await messageLogger.close(); }
+      finally {
+        lifecycle.stop();
+        await historyStorage.close();
+        authStore.close();
+      }
+    }
+  })();
+}
+for (const signal of ['SIGINT', 'SIGTERM'] as const) {
+  process.once(signal, () => {
+    void shutdown().catch((error: unknown) => {
+      logger.error('Steam shutdown failed', { error: errorMessage(error) });
+      process.exitCode = 1;
+    });
+  });
+}
+
 module.exports = {
+  historyStorage,
+  shutdown,
   authStore,
   chatService,
   config,

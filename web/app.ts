@@ -3,7 +3,8 @@ type View = 'steam' | 'chat' | 'users' | 'steamAccounts' | 'audit' | 'account';
 type Tone = 'muted' | 'ok' | 'warn' | 'error';
 type ChatListTab = 'recent' | 'friends' | 'groups';
 type ChatPanel = 'list' | 'thread';
-type ChatIconName = 'arrow-left' | 'image' | 'link' | 'paperclip' | 'plus' | 'search' | 'send' | 'smile' | 'x';
+type ChatIconName = 'arrow-left' | 'image' | 'link' | 'paperclip' | 'plus' | 'search' | 'send' | 'smile' | 'x'
+  | 'panel-right' | 'messages-square' | 'gamepad-2' | 'users' | 'settings-2' | 'shield' | 'scroll-text' | 'log-out' | 'external-link' | 'copy';
 type Permission =
   | 'user.manage'
   | 'session.manage'
@@ -103,6 +104,7 @@ type ListEntry = Record<string, unknown> & {
 };
 
 type MessageItem = ListEntry & {
+  eventId?: string;
   type?: string;
   echo?: boolean;
   date?: string;
@@ -169,6 +171,7 @@ type AppState = {
   chatListTab: ChatListTab;
   chatQuery: string;
   chatPanel: ChatPanel;
+  friendDetailsOpen: boolean;
   historyLimit: number;
   wsPath: string;
   ws: WebSocket | null;
@@ -220,6 +223,7 @@ const state: AppState = {
   chatListTab: 'recent',
   chatQuery: '',
   chatPanel: 'list',
+  friendDetailsOpen: false,
   historyLimit: clampLimit(localStorage.getItem('steam-chat.history-limit') || 100),
   wsPath: '/ws',
   ws: null,
@@ -233,6 +237,46 @@ const state: AppState = {
   feedback: '就绪',
   feedbackTone: 'muted'
 };
+
+let chatEpoch = 0;
+let historyRequest = 0;
+let listRequest = 0;
+let healthRequest = 0;
+let historyItems: MessageItem[] = [];
+let historyBefore = '';
+let historyAfter = '';
+let historyAt = '';
+let historyBusy = false;
+let historyDetached = false;
+let historyLive: MessageItem[] = [];
+let conversationsBefore = '';
+let conversationsBusy = false;
+let storageHealth: unknown = null;
+
+function chatContext() {
+  return `${chatEpoch}|${state.me?.id || ''}|${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}|${steamAccessAllowed()}`;
+}
+
+function resetHistory() {
+  historyRequest += 1;
+  historyItems = [];
+  historyLive = [];
+  historyBefore = historyAfter = historyAt = '';
+  historyBusy = historyDetached = false;
+  renderHistory([]);
+  updateHistoryControls();
+}
+
+function invalidateChat() {
+  chatEpoch += 1;
+  listRequest += 1;
+  healthRequest += 1;
+  conversationsBefore = '';
+  conversationsBusy = false;
+  storageHealth = null;
+  resetHistory();
+  updateStorageHealth();
+}
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === 'object';
@@ -276,7 +320,7 @@ function clampLimit(value: unknown): number {
 
 function normalizeView(value: unknown): View {
   const view = String(value || '');
-  return view === 'steam' || view === 'chat' || view === 'users' || view === 'steamAccounts' || view === 'audit' || view === 'account' ? view : 'steam';
+  return view === 'steam' || view === 'chat' || view === 'users' || view === 'steamAccounts' || view === 'audit' || view === 'account' ? view : 'chat';
 }
 
 function asListEntries(value: unknown): ListEntry[] {
@@ -381,7 +425,20 @@ function steamStatusSignature(status = state.steam) {
 }
 
 function updateSteamStatus(status: SteamStatus) {
+  const previousSignature = steamStatusSignature();
+  const previousAccess = steamAccessAllowed();
+  const previousAccount = `${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}`;
   state.steam = { ...defaultSteamStatus, ...status };
+  const accountChanged = previousAccount !== `${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}`;
+  if (accountChanged || !steamAccessAllowed()) {
+    invalidateChat();
+    stopWebSocket();
+    state.activeName = '';
+    state.friendDetailsOpen = false;
+    state.friends = [];
+    state.groups = [];
+    state.conversations = [];
+  }
   const badge = document.querySelector<HTMLElement>('#steamBadge');
   if (badge) {
     badge.textContent = steamLabel();
@@ -391,7 +448,22 @@ function updateSteamStatus(status: SteamStatus) {
   if (hint) hint.textContent = state.steam.error || (state.steam.steamId ? `SteamID ${state.steam.steamId}` : '后台服务已启动');
   const subtitle = document.querySelector<HTMLElement>('#pageSubtitle');
   if (subtitle) subtitle.textContent = pageSubtitle();
+  const accountStatus = document.querySelector<HTMLElement>('#chatAccountStatus');
+  if (accountStatus) {
+    accountStatus.textContent = chatAccountLabel();
+    accountStatus.dataset.status = state.steam.status;
+  }
+  if (steamStatusSignature() !== previousSignature) {
+    const head = document.querySelector<HTMLElement>('#threadHead');
+    if (head) renderThreadHeader(head);
+    syncFriendDetails();
+  }
   updateChatAvailability();
+  if ((accountChanged || previousAccess !== steamAccessAllowed()) && state.me && state.view === 'chat') {
+    updateChatLists();
+    void loadHistory();
+    ensureWebSocket();
+  }
 }
 
 async function api(path: string, options: RequestInit = {}): Promise<unknown> {
@@ -430,6 +502,7 @@ function formValue(form: HTMLFormElement, name: string): string {
 }
 
 function authPage(title: string, subtitle: string, form: HTMLElement) {
+  invalidateChat();
   stopStatusPolling();
   stopWebSocket();
   clear(root);
@@ -489,8 +562,9 @@ function renderLogin() {
 }
 
 function navButton(view: View, label: string) {
-  const button = create('button', state.view === view ? 'is-active' : '', label);
-  button.type = 'button';
+  const icons: Record<View, ChatIconName> = { steam: 'gamepad-2', chat: 'messages-square', users: 'users', steamAccounts: 'shield', audit: 'scroll-text', account: 'settings-2' };
+  const button = chatIconButton(icons[view], label, state.view === view ? 'is-active' : '');
+  button.append(create('span', 'nav-label', label));
   button.addEventListener('click', () => {
     state.view = view;
     localStorage.setItem('steam-chat.view', view);
@@ -515,7 +589,8 @@ function renderShell() {
   const shell = create('div', `admin-shell${state.view === 'chat' ? ' is-chat' : ''}`);
   const sidebar = create('aside', 'admin-sidebar');
   const brand = create('div', 'brand');
-  brand.append(create('strong', '', 'Steam Chat'), create('span', '', state.me.username));
+  brand.title = `Steam Chat · ${state.me.username}`;
+  brand.append(chatIcon('gamepad-2'), create('strong', '', 'Steam Chat'), create('span', '', state.me.username));
   const nav = create('nav');
   nav.append(navButton('steam', 'Steam 连接'), navButton('chat', '聊天'));
   if (hasPermission('user.manage')) nav.append(navButton('users', '用户管理'));
@@ -523,6 +598,11 @@ function renderShell() {
   if (hasPermission('audit.view')) nav.append(navButton('audit', '审计日志'));
   nav.append(navButton('account', '账号'));
   sidebar.append(brand, nav);
+  if (state.view === 'chat') {
+    const railLogout = chatIconButton('log-out', '退出后台', 'rail-logout');
+    railLogout.addEventListener('click', () => logoutApp());
+    sidebar.append(railLogout);
+  }
 
   const main = create('main', 'workspace');
   const top = create('header', 'topbar');
@@ -582,8 +662,8 @@ function pageTitle() {
 
 function pageSubtitle() {
   if (state.view === 'chat') {
-    if (!steamAccessAllowed()) return '当前后台用户未被授权访问活动 Steam 账户';
-    return steamOnline() ? '好友、群组、历史和实时消息' : 'Steam 未在线，聊天操作已禁用';
+    if (!steamOnline()) return 'Steam 未在线，聊天操作已禁用';
+    return steamAccessAllowed() ? '好友、群组、历史和实时消息' : '当前后台用户未被授权访问活动 Steam 账户';
   }
   if (state.view === 'users') return '后台用户、会话、角色、资料和 Steam 授权';
   if (state.view === 'steamAccounts') return 'Steam 账户资料、连接状态和授权计数';
@@ -614,7 +694,11 @@ function renderSteamView() {
 
   if (state.me?.role !== 'admin') {
     const access = panel('访问状态', 'status-note-panel');
-    access.append(create('p', state.steam.accessAllowed === false ? 'warn-text' : 'muted', state.steam.accessAllowed === false ? '当前账号未被授权访问活动 Steam 账户。' : '普通用户只能在 Steam 在线且被授权后使用聊天。'));
+    const accessDenied = steamOnline() && !steamAccessAllowed();
+    const accessText = !steamOnline()
+      ? 'Steam 未在线，等待管理员连接 Steam。'
+      : accessDenied ? '当前账号未被授权访问活动 Steam 账户。' : '普通用户只能在 Steam 在线且被授权后使用聊天。';
+    access.append(create('p', accessDenied ? 'warn-text' : 'muted', accessText));
     view.append(access);
     return view;
   }
@@ -1200,8 +1284,25 @@ function renderChatView() {
   lists.setAttribute('aria-label', '会话列表');
 
   const listHead = create('header', 'chat-list-head');
+  const account = create('button', 'chat-account');
+  account.type = 'button';
+  account.title = 'Steam 连接';
+  const accountCopy = create('span', 'chat-account-copy');
+  const accountName = create('strong', '', 'Steam Chat');
+  accountName.id = 'chatAccountName';
+  const accountStatus = create('span');
+  accountStatus.id = 'chatAccountStatus';
+  accountStatus.textContent = chatAccountLabel();
+  accountStatus.dataset.status = state.steam.status;
+  accountCopy.append(accountName, accountStatus);
+  account.append(chatIcon('gamepad-2'), accountCopy);
+  account.addEventListener('click', () => {
+    state.view = 'steam';
+    localStorage.setItem('steam-chat.view', 'steam');
+    renderShell();
+  });
   const titleRow = create('div', 'chat-list-title');
-  titleRow.append(create('h2', '', '会话'));
+  titleRow.append(create('h2', '', '消息'));
   const newConversation = create('button', 'new-chat-btn');
   newConversation.type = 'button';
   newConversation.append(chatIcon('plus'), create('span', '', '新建'));
@@ -1237,7 +1338,7 @@ function renderChatView() {
     });
     tabList.append(button);
   }
-  listHead.append(titleRow, search, tabList);
+  listHead.append(account, titleRow, search, tabList);
 
   const listBody = create('div', 'conversation-list');
   listBody.id = 'chatListSections';
@@ -1287,12 +1388,29 @@ function renderChatView() {
   messages.id = 'messages';
   messages.setAttribute('aria-live', 'polite');
   const composer = renderComposer();
-  thread.append(head, messages, composer);
-  view.append(lists, thread);
+  thread.append(head, renderHistoryTools(), messages, composer);
+  const detailsBackdrop = create('button', 'friend-details-backdrop');
+  detailsBackdrop.id = 'friendDetailsBackdrop';
+  detailsBackdrop.type = 'button';
+  detailsBackdrop.hidden = true;
+  detailsBackdrop.setAttribute('aria-label', '关闭会话资料');
+  detailsBackdrop.addEventListener('click', () => setFriendDetailsOpen(false));
+  const details = create('aside', 'friend-details');
+  details.id = 'friendDetails';
+  details.setAttribute('aria-label', '会话资料');
+  details.hidden = true;
+  view.append(lists, thread, detailsBackdrop, details);
+  renderFriendDetails(details);
+  view.dataset.detailsOpen = String(state.friendDetailsOpen && Boolean(state.activeId));
+  details.hidden = !state.friendDetailsOpen || !state.activeId;
+  detailsBackdrop.hidden = details.hidden;
   setTimeout(() => {
     if (state.activeId) void loadHistory();
     else renderHistory([]);
     updateChatAvailability();
+    updateHistoryControls();
+    updateStorageHealth();
+    void loadStorageHealth();
   }, 0);
   return view;
 }
@@ -1302,9 +1420,15 @@ function renderChatListSections(container: HTMLElement) {
   const items = filterChatEntries(chatEntriesForActiveTab(), state.chatQuery);
   if (!items.length) {
     container.append(create('div', 'conversation-empty', state.chatQuery.trim() ? '没有匹配的会话' : '暂无会话'));
-    return;
   }
   for (const item of items) container.append(renderListItem(item));
+  if (state.chatListTab === 'recent' && conversationsBefore) {
+    const more = create('button', 'ghost-btn conversations-more', conversationsBusy ? '加载中…' : '加载更多会话');
+    more.type = 'button';
+    more.disabled = conversationsBusy;
+    more.addEventListener('click', () => void loadConversations(true));
+    container.append(more);
+  }
 }
 
 function filterChatEntries(items: ListEntry[], query: string): ListEntry[] {
@@ -1345,8 +1469,79 @@ function renderAvatar(item: ListEntry | null, name: string, className = 'avatar'
   return avatar;
 }
 
-function activeChatEntry() {
-  return [...state.conversations, ...state.friends, ...state.groups].find((item) => item.id === state.activeId) || null;
+function activeChatEntry(): ListEntry | null {
+  const recent = state.conversations.find((item) => item.id === state.activeId);
+  const persona = state.friends.find((item) => item.id === state.activeId)
+    || state.groups.find((item) => item.id === state.activeId);
+  return recent || persona ? { ...recent, ...persona, id: state.activeId } : null;
+}
+
+function chatAccountLabel() {
+  const account = state.steam.activeAccount;
+  return `${account?.label || account?.steamId || 'Steam'} · ${steamLabel()}`;
+}
+
+function friendStatusLabel(item: ListEntry | null) {
+  if (!steamOnline()) return `Steam ${steamLabel()}`;
+  if (!steamAccessAllowed()) return '无账户访问权限';
+  if (item?.gameName) return `正在玩 ${item.gameName}`;
+  const personaLabels: Record<number, string> = { 0: '离线', 1: '在线', 2: '忙碌', 3: '离开', 4: '打盹', 5: '想交易', 6: '想玩游戏' };
+  if (typeof item?.personaState === 'number' && personaLabels[item.personaState]) return personaLabels[item.personaState];
+  if (typeof item?.online !== 'boolean') return '状态未知';
+  return item.online ? '在线' : '离线';
+}
+
+function setFriendDetailsOpen(open: boolean, restoreFocus = true) {
+  state.friendDetailsOpen = open && Boolean(state.activeId) && steamAccessAllowed();
+  syncFriendDetails();
+  if (state.friendDetailsOpen) document.querySelector<HTMLButtonElement>('#friendDetailsClose')?.focus();
+  else if (restoreFocus) document.querySelector<HTMLButtonElement>('#friendDetailsToggle')?.focus();
+}
+
+function syncFriendDetails() {
+  const open = state.friendDetailsOpen && Boolean(state.activeId) && steamAccessAllowed();
+  const focusedClose = document.activeElement?.id === 'friendDetailsClose';
+  const layout = document.querySelector<HTMLElement>('#chatLayout');
+  if (layout) layout.dataset.detailsOpen = String(open);
+  const details = document.querySelector<HTMLElement>('#friendDetails');
+  if (details) {
+    details.hidden = !open;
+    renderFriendDetails(details);
+    if (open && focusedClose) details.querySelector<HTMLButtonElement>('#friendDetailsClose')?.focus();
+  }
+  const backdrop = document.querySelector<HTMLElement>('#friendDetailsBackdrop');
+  if (backdrop) backdrop.hidden = !open;
+  const toggle = document.querySelector<HTMLButtonElement>('#friendDetailsToggle');
+  if (toggle) toggle.setAttribute('aria-expanded', String(open));
+}
+
+function renderFriendDetails(container: HTMLElement) {
+  clear(container);
+  const head = create('header', 'friend-details-head');
+  head.append(create('h2', '', '会话资料'));
+  const close = chatIconButton('x', '关闭会话资料', 'icon-btn');
+  close.id = 'friendDetailsClose';
+  close.addEventListener('click', () => setFriendDetailsOpen(false));
+  head.append(close);
+  container.append(head);
+  if (!state.activeId || !steamAccessAllowed()) return;
+  const item = activeChatEntry();
+  const name = item?.name || state.activeName || state.activeId;
+  const isGroup = state.groups.some((entry) => entry.id === state.activeId);
+  const profile = create('div', 'friend-profile');
+  profile.append(renderAvatar(item, name, 'friend-avatar'), create('h3', '', name), create('p', 'muted', friendStatusLabel(item)));
+  const facts = create('dl', 'friend-facts');
+  const fact = (label: string, value: string) => facts.append(create('dt', '', label), create('dd', '', value));
+  fact('SteamID', state.activeId);
+  fact('关系', isGroup ? '群组' : state.friends.some((entry) => entry.id === state.activeId) ? 'Steam 好友' : '会话联系人');
+  if (item?.gameName && steamOnline()) fact('正在游戏', item.gameName);
+  if (state.steam.activeAccount) fact('当前账户', state.steam.activeAccount.label || state.steam.activeAccount.steamId);
+  container.append(profile, facts);
+  if (/^\d{17}$/.test(state.activeId)) {
+    const profileLink = externalLink('friend-profile-link', `https://steamcommunity.com/${isGroup ? 'gid' : 'profiles'}/${state.activeId}`, 'Steam 主页');
+    profileLink.append(chatIcon('external-link'));
+    container.append(profileLink);
+  }
 }
 
 function renderThreadHeader(container: HTMLElement) {
@@ -1354,10 +1549,18 @@ function renderThreadHeader(container: HTMLElement) {
   const back = chatIconButton('arrow-left', '返回会话列表', 'thread-back');
   back.addEventListener('click', showChatList);
   const item = activeChatEntry();
-  const name = state.activeName || item?.name || state.activeId || '未选择会话';
+  const name = item?.name || state.activeName || state.activeId || '未选择会话';
   const identity = create('div', 'thread-identity');
-  identity.append(create('strong', '', name), create('span', 'muted', state.activeId || 'Steam Chat'));
-  container.append(back, renderAvatar(item, name, 'thread-avatar'), identity);
+  identity.append(create('strong', '', name), create('span', 'muted', state.activeId ? friendStatusLabel(item) : 'Steam Chat'));
+  const actions = create('div', 'thread-actions');
+  const toggle = chatIconButton('panel-right', '会话资料', 'icon-btn details-toggle');
+  toggle.id = 'friendDetailsToggle';
+  toggle.disabled = !state.activeId || !steamAccessAllowed();
+  toggle.setAttribute('aria-controls', 'friendDetails');
+  toggle.setAttribute('aria-expanded', String(state.friendDetailsOpen));
+  toggle.addEventListener('click', () => setFriendDetailsOpen(!state.friendDetailsOpen));
+  actions.append(toggle);
+  container.append(back, renderAvatar(item, name, 'thread-avatar'), identity, actions);
 }
 
 function formatConversationTime(value: unknown) {
@@ -1380,7 +1583,8 @@ function renderListItem(item: ListEntry) {
   const title = create('span', 'item-title');
   title.append(create('strong', '', name), create('time', '', formatConversationTime(item.updatedAt)));
   body.append(title, create('span', 'item-preview', item.preview || item.gameName || item.clanId || item.clanid || item.id));
-  button.append(renderAvatar(item, name), body);
+  const persona = state.friends.find((friend) => friend.id === item.id);
+  button.append(renderAvatar(persona || item, name), body);
   button.addEventListener('click', () => openConversation(item.id, item.name || item.id));
   return button;
 }
@@ -1470,7 +1674,9 @@ function renderComposer() {
   const send = chatIconButton('send', '发送消息', 'send-btn');
   send.id = 'sendButton';
   send.addEventListener('click', () => sendText());
-  row.append(pickerButton, attachment, input, send);
+  const tools = create('div', 'composer-tools');
+  tools.append(pickerButton, attachment);
+  row.append(input, tools, send);
   shell.append(disabledNote, picker, row);
   shell.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>('button, input, textarea').forEach((node) => {
     node.dataset.chatControl = '';
@@ -1522,7 +1728,7 @@ function updateChatAvailability() {
   });
   const note = document.querySelector<HTMLElement>('#offlineNote');
   if (note) {
-    note.textContent = !steamAccessAllowed() ? '当前账号未被授权访问活动 Steam 账户。' : 'Steam 未在线，聊天发送和素材操作不可用。';
+    note.textContent = !steamOnline() ? 'Steam 未在线，聊天发送和素材操作不可用。' : '当前账号未被授权访问活动 Steam 账户。';
     note.hidden = !unavailable;
   }
 }
@@ -1539,15 +1745,18 @@ async function refreshChatData() {
     updateChatAvailability();
     return;
   }
+  const context = chatContext();
+  const request = ++listRequest;
   try {
-    const conversations = await api(`/conversations?limit=${state.historyLimit}`);
-    state.conversations = asListEntries(conversations);
+    await loadConversations();
+    if (context !== chatContext() || request !== listRequest) return;
     if (steamOnline()) {
       const [friends, groups, inventory] = await Promise.all([
         api('/api/friends'),
         api('/api/groups'),
         api('/api/emoticons')
       ]);
+      if (context !== chatContext() || request !== listRequest) return;
       state.friends = asListEntries(friends);
       state.groups = asListEntries(groups);
       state.emoticons = isRecord(inventory) ? asInventory(inventory.emoticons) : [];
@@ -1563,10 +1772,11 @@ async function refreshChatData() {
       if (!state.activeName) state.activeName = activeChatEntry()?.name || '';
       const head = document.querySelector<HTMLElement>('#threadHead');
       if (head) renderThreadHeader(head);
+      syncFriendDetails();
       updateChatAvailability();
     }
   } catch (error) {
-    setFeedback(errorMessage(error), 'error');
+    if (context === chatContext() && request === listRequest) setFeedback('会话列表暂时无法加载，请稍后重试。', 'warn');
   }
 }
 
@@ -1578,6 +1788,7 @@ function openConversation(id: unknown, name = '') {
   }
   const alreadyActive = target === state.activeId;
   state.activeId = target;
+  if (!alreadyActive) resetHistory();
   state.activeName = name || target;
   state.chatPanel = 'thread';
   localStorage.setItem('steam-chat.target', state.activeId);
@@ -1591,12 +1802,14 @@ function openConversation(id: unknown, name = '') {
   updateChatLists();
   const head = document.querySelector<HTMLElement>('#threadHead');
   if (head) renderThreadHeader(head);
+  syncFriendDetails();
   updateChatAvailability();
   if (!alreadyActive) void loadHistory();
 }
 
 function showChatList() {
   state.chatPanel = 'list';
+  setFriendDetailsOpen(false, false);
   syncChatPanel();
 }
 
@@ -1605,22 +1818,214 @@ function syncChatPanel() {
   if (layout) layout.dataset.mobilePanel = state.chatPanel;
 }
 
-async function loadHistory() {
+function pageCursor(payload: unknown, key = 'nextCursor'): string {
+  return isRecord(payload) && typeof payload[key] === 'string' ? payload[key] as string : '';
+}
+
+let conversationRequest = 0;
+async function loadConversations(more = false) {
+  if (!state.me || !steamAccessAllowed() || (more && (conversationsBusy || !conversationsBefore))) return;
+  const context = chatContext();
+  const request = ++conversationRequest;
+  const params = new URLSearchParams({ limit: String(state.historyLimit) });
+  if (more) params.set('before', conversationsBefore);
+  conversationsBusy = true;
+  updateChatLists();
+  try {
+    const payload = await api(`/api/conversations?${params}`);
+    if (context !== chatContext() || request !== conversationRequest) return;
+    const items = asListEntries(isRecord(payload) ? payload.items : payload);
+    const merged = new Map((more ? state.conversations : []).map((item) => [item.id, item]));
+    for (const item of items) if (!more || !merged.has(item.id)) merged.set(item.id, item);
+    state.conversations = [...merged.values()];
+    conversationsBefore = pageCursor(payload);
+  } catch (_) {
+    if (context === chatContext() && request === conversationRequest) setFeedback('会话列表暂时无法加载，请稍后重试。', 'warn');
+  } finally {
+    if (context === chatContext() && request === conversationRequest) {
+      conversationsBusy = false;
+      updateChatLists();
+    }
+  }
+}
+
+function renderHistoryTools() {
+  const tools = create('div', 'history-tools');
+  tools.id = 'historyTools';
+  const actions = create('form', 'history-actions');
+  const older = create('button', 'ghost-btn', '更早消息');
+  older.id = 'historyOlder';
+  older.type = 'button';
+  older.addEventListener('click', () => void loadHistory('older'));
+  const date = create('input');
+  date.type = 'datetime-local';
+  date.id = 'historyDate';
+  date.setAttribute('aria-label', '消息日期和时间');
+  date.value = historyAt;
+  const jump = chatIconButton('search', '查询日期');
+  jump.id = 'historyJump';
+  jump.type = 'submit';
+  actions.addEventListener('submit', (event) => {
+    event.preventDefault();
+    if (!date.value || !Number.isFinite(new Date(date.value).getTime())) {
+      setFeedback('请选择有效的日期和时间。', 'warn');
+      return;
+    }
+    void loadHistory('date', date.value);
+  });
+  const newer = create('button', 'ghost-btn', '较新消息');
+  newer.id = 'historyNewer';
+  newer.type = 'button';
+  newer.addEventListener('click', () => void loadHistory('newer'));
+  const latest = create('button', 'ghost-btn', '返回最新');
+  latest.id = 'historyLatest';
+  latest.type = 'button';
+  latest.addEventListener('click', () => void loadHistory());
+  actions.append(older, date, jump, newer, latest);
+  const health = create('div', 'storage-health');
+  health.id = 'storageHealth';
+  health.setAttribute('role', 'status');
+  health.setAttribute('aria-live', 'polite');
+  tools.append(actions, health);
+  return tools;
+}
+
+function updateHistoryControls() {
+  for (const [id, disabled, hidden] of [
+    ['historyOlder', historyBusy || !historyBefore, false],
+    ['historyNewer', historyBusy || !historyAfter, !historyDetached],
+    ['historyJump', false, false],
+    ['historyLatest', false, !historyDetached]
+  ] as Array<[string, boolean, boolean]>) {
+    const button = document.querySelector<HTMLButtonElement>(`#${id}`);
+    if (button) {
+      button.disabled = disabled || !state.activeId || !steamAccessAllowed();
+      button.hidden = hidden;
+    }
+  }
+  const older = document.querySelector<HTMLElement>('#historyOlder');
+  if (older) older.textContent = historyBusy ? '加载中…' : '更早消息';
+  document.querySelector('#historyTools')?.setAttribute('aria-busy', String(historyBusy));
+}
+
+function storageHealthText(payload: unknown): string {
+  if (!isRecord(payload)) return '消息存储状态暂不可用';
+  return [['jsonl', '消息归档'], ['rocksdb', '历史索引']].map(([key, label]) => {
+    const health = payload[key];
+    if (!isRecord(health)) return `${label}：状态未知`;
+    const labels: Record<string, string> = { healthy: '正常', failed: '暂时异常', lagging: '正在同步', closed: '已关闭' };
+    const notes = [labels[String(health.state)] || '状态未知'];
+    if (health.writable === false) notes.push('暂不可写入');
+    if (health.durable === false) notes.push('尚未持久保存');
+    if (typeof health.queued === 'number' && health.queued > 0) notes.push(`${health.queued} 条待处理`);
+    if (typeof health.missed === 'number' && health.missed > 0) notes.push(`${health.missed} 条未写入`);
+    return `${label}：${notes.join('，')}`;
+  }).join(' · ');
+}
+
+function updateStorageHealth() {
+  const node = document.querySelector<HTMLElement>('#storageHealth');
+  const text = storageHealthText(storageHealth);
+  if (node && node.textContent !== text) node.textContent = text;
+}
+
+async function loadStorageHealth() {
+  if (!state.me || !steamAccessAllowed()) return;
+  const context = chatContext();
+  const request = ++healthRequest;
+  try {
+    const payload = await api('/api/history/status');
+    if (context !== chatContext() || request !== healthRequest) return;
+    storageHealth = payload;
+  } catch (_) {
+    if (context !== chatContext() || request !== healthRequest) return;
+    storageHealth = null;
+  }
+  updateStorageHealth();
+}
+
+function uniqueMessages(items: MessageItem[]): MessageItem[] {
+  const seen = new Set<string>();
+  return items.filter((item) => {
+    if (!item.eventId) return true;
+    if (seen.has(item.eventId)) return false;
+    seen.add(item.eventId);
+    return true;
+  });
+}
+
+async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest', date = '') {
+  const messages = document.querySelector<HTMLElement>('#messages');
+  if (!messages || !state.activeId || !steamAccessAllowed()) return;
+  if ((mode === 'older' || mode === 'newer') && (historyBusy || !(mode === 'older' ? historyBefore : historyAfter))) return;
+  const target = state.activeId;
+  const context = chatContext();
+  const request = ++historyRequest;
+  const current = () => request === historyRequest && target === state.activeId && context === chatContext() && messages === document.querySelector('#messages');
+  historyBusy = true;
+  updateHistoryControls();
+  try {
+    const params = new URLSearchParams({ id: target, limit: String(state.historyLimit) });
+    if (mode === 'older') params.set('before', historyBefore);
+    if (mode === 'newer') params.set('after', historyAfter);
+    if (mode === 'date') params.set('at', String(new Date(date).getTime()));
+    const payload = await api(`/api/history?${params}`);
+    if (!current()) return;
+    const items = uniqueMessages(asMessages(isRecord(payload) ? payload.items : payload));
+    const confirmed = new Set(items.map((item) => item.eventId).filter(Boolean));
+    historyLive = historyLive.filter((item) => !item.eventId || !confirmed.has(item.eventId));
+    if (mode === 'older' || mode === 'newer') {
+      const seen = new Set(historyItems.map((item) => item.eventId).filter(Boolean));
+      const additions = items.filter((item) => !item.eventId || !seen.has(item.eventId));
+      const top = messages.scrollTop;
+      const height = messages.scrollHeight;
+      messages.querySelector('.thread-empty')?.remove();
+      if (mode === 'older') {
+        messages.prepend(...additions.map(renderMessage));
+        historyItems = [...additions, ...historyItems];
+        messages.scrollTop = top + messages.scrollHeight - height;
+        historyBefore = pageCursor(payload);
+      } else {
+        messages.append(...additions.map(renderMessage));
+        historyItems.push(...additions);
+        messages.scrollTop = top;
+        historyAfter = pageCursor(payload, 'previousCursor');
+      }
+    } else {
+      historyDetached = mode === 'date';
+      historyAt = mode === 'date' ? date : '';
+      historyItems = uniqueMessages([...items, ...(historyDetached ? [] : historyLive)]).sort((left, right) => {
+        const difference = Date.parse(left.sentAt || left.date || '') - Date.parse(right.sentAt || right.date || '');
+        return (Number.isFinite(difference) ? difference : 0) || Number(left.ordinal || 0) - Number(right.ordinal || 0);
+      });
+      historyBefore = pageCursor(payload);
+      historyAfter = pageCursor(payload, 'previousCursor');
+      renderHistory(historyItems);
+      if (historyDetached) messages.scrollTop = 0;
+      const input = document.querySelector<HTMLInputElement>('#historyDate');
+      if (input) input.value = historyAt;
+    }
+  } catch (_) {
+    if (current()) setFeedback('历史消息暂时无法加载，请重试。', 'warn');
+  } finally {
+    if (current()) {
+      historyBusy = false;
+      updateHistoryControls();
+    }
+  }
+}
+
+function receiveHistoryMessage(item: MessageItem) {
+  if (item.id !== state.activeId || !steamAccessAllowed()) return;
+  historyLive = uniqueMessages([...historyLive, item]).slice(-500);
+  if (historyDetached || (item.eventId && historyItems.some((entry) => entry.eventId === item.eventId))) return;
+  historyItems.push(item);
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages) return;
-  if (!state.activeId) {
-    renderHistory([]);
-    return;
-  }
-  const target = state.activeId;
-  try {
-    const history = await api(`/history?id=${encodeURIComponent(target)}&limit=${state.historyLimit}`);
-    if (target !== state.activeId) return;
-    renderHistory(asMessages(history));
-  } catch (error) {
-    if (target !== state.activeId) return;
-    setFeedback(errorMessage(error), 'error');
-  }
+  const atBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48;
+  messages.querySelector('.thread-empty')?.remove();
+  messages.append(renderMessage(item));
+  if (atBottom) messages.scrollTop = messages.scrollHeight;
 }
 
 function renderHistory(items: MessageItem[]) {
@@ -1639,6 +2044,7 @@ function renderHistory(items: MessageItem[]) {
 
 function renderMessage(item: MessageItem) {
   const row = create('article', `msg-row${item.echo ? ' is-self' : ''}`);
+  if (item.eventId) row.dataset.eventId = item.eventId;
   const bubble = create('div', 'bubble');
   const meta = create('div', 'meta');
   meta.append(create('span', '', item.name || (item.echo ? '我' : item.id)), create('span', '', formatTime(item.sentAt || item.date)));
@@ -1955,9 +2361,13 @@ function openGraphNode(preview: OpenGraphPreview) {
 function emoticonNode(name: string) {
   const image = document.createElement('img');
   image.className = 'emoticon';
-  image.src = `https://community.cloudflare.steamstatic.com/economy/emoticon/${encodeURIComponent(name)}`;
+  image.src = emoticonImageUrl(name);
   image.alt = `:${name}:`;
   return image;
+}
+
+function emoticonImageUrl(name: string): string {
+  return proxiedImageUrl(`https://community.cloudflare.steamstatic.com/economy/emoticon/${encodeURIComponent(name)}`);
 }
 
 function stickerNode(type: string) {
@@ -2045,8 +2455,11 @@ async function sendText() {
   const input = document.querySelector<HTMLTextAreaElement>('#messageInput');
   const msg = input?.value.trim() || '';
   if (!id || !msg) return;
+  const context = chatContext();
   try {
-    await api('/message', jsonBody({ id, msg }));
+    const response = await api('/message', jsonBody({ id, msg }));
+    if (context !== chatContext() || id !== state.activeId) return;
+    if (isRecord(response)) for (const item of asMessages([response.item])) receiveHistoryMessage(item);
     if (input) {
       input.value = '';
       resizeComposerInput(input);
@@ -2061,8 +2474,11 @@ async function sendText() {
 async function sendImage(payload: Record<string, string>) {
   const id = activeIdOrWarn();
   if (!id) return;
+  const context = chatContext();
   try {
-    await api('/image', jsonBody({ id, ...payload }));
+    const response = await api('/image', jsonBody({ id, ...payload }));
+    if (context !== chatContext() || id !== state.activeId) return;
+    if (isRecord(response)) for (const item of asMessages([response.item])) receiveHistoryMessage(item);
     await loadHistory();
     setFeedback('图片已发送', 'ok');
   } catch (error) {
@@ -2102,7 +2518,7 @@ function renderPicker(container: HTMLElement) {
       button.type = 'button';
       const image = document.createElement('img');
       image.src = type === 'emoticons'
-        ? `https://community.cloudflare.steamstatic.com/economy/emoticon/${encodeURIComponent(name)}`
+        ? emoticonImageUrl(name)
         : `/proxy/sticker/${encodeURIComponent(name)}`;
       image.alt = name;
       button.append(image, create('span', '', name));
@@ -2129,12 +2545,20 @@ function ensureWebSocket() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${protocol}//${location.host}${state.wsPath}`);
   state.ws = ws;
+  const context = chatContext();
   ws.addEventListener('message', (event) => {
+    if (state.ws !== ws || context !== chatContext()) return;
     let payload: WsPayload;
     try {
       const parsed: unknown = JSON.parse(String(event.data));
       payload = isRecord(parsed) ? parsed : {};
     } catch {
+      return;
+    }
+    if (payload.type === 'storage_status') {
+      healthRequest += 1;
+      storageHealth = isRecord(payload.status) ? payload.status : payload;
+      updateStorageHealth();
       return;
     }
     if (payload.type === 'message' || payload.type === 'image') {
@@ -2148,15 +2572,11 @@ function ensureWebSocket() {
         date: typeof payload.date === 'string' ? payload.date : undefined,
         sentAt: typeof payload.sentAt === 'string' ? payload.sentAt : undefined
       };
-      if (item.id === state.activeId) {
-        const messages = document.querySelector<HTMLElement>('#messages');
-        messages?.querySelector('.thread-empty')?.remove();
-        messages?.append(renderMessage(item));
-        if (messages) messages.scrollTop = messages.scrollHeight;
-      }
+      receiveHistoryMessage(item);
     }
   });
   ws.addEventListener('close', () => {
+    if (state.ws !== ws) return;
     state.ws = null;
     if (state.me) {
       state.reconnectTimer = setTimeout(() => {
@@ -2170,15 +2590,21 @@ function ensureWebSocket() {
 function stopWebSocket() {
   if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
   state.reconnectTimer = null;
-  if (state.ws) state.ws.close();
+  const ws = state.ws;
   state.ws = null;
+  ws?.close();
 }
 
 function startStatusPolling() {
   if (state.statusTimer || !state.me) return;
+  let polling = false;
   state.statusTimer = setInterval(async () => {
+    if (polling) return;
+    polling = true;
+    const context = chatContext();
     try {
       const status = await api('/api/steam/status');
+      if (context !== chatContext() || !state.me) return;
       const previousSignature = steamStatusSignature();
       const wasOnline = steamOnline();
       updateSteamStatus(status as SteamStatus);
@@ -2186,9 +2612,13 @@ function startStatusPolling() {
         renderShell();
         return;
       }
-      if (state.view === 'chat' && steamOnline() !== wasOnline) await refreshChatData();
+      if (state.view === 'chat') await loadStorageHealth();
+      ensureWebSocket();
+      if (state.view === 'chat' && (steamOnline() !== wasOnline || steamStatusSignature() !== previousSignature)) await refreshChatData();
     } catch (_) {
       // Authentication errors are handled by api().
+    } finally {
+      polling = false;
     }
   }, 3000);
 }
@@ -2255,6 +2685,26 @@ document.addEventListener('drop', (event) => {
   if (files && files.length) {
     event.preventDefault();
     sendFiles(files);
+  }
+});
+
+document.addEventListener('keydown', (event) => {
+  if (state.view !== 'chat' || !state.friendDetailsOpen) return;
+  if (event.key === 'Escape') {
+    setFriendDetailsOpen(false);
+  }
+  if (event.key === 'Tab' && typeof matchMedia === 'function' && matchMedia('(max-width: 1100px)').matches) {
+    const controls = document.querySelector<HTMLElement>('#friendDetails')?.querySelectorAll<HTMLElement>('button:not(:disabled), a[href]');
+    if (!controls?.length) return;
+    const first = controls[0];
+    const last = controls[controls.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
   }
 });
 

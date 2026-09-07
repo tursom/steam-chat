@@ -41,6 +41,7 @@ export type AuthConfig = {
 };
 
 export type HistoryRecordInput = UnknownRecord & {
+  eventId?: string;
   type?: string;
   date?: string;
   echo?: boolean;
@@ -54,6 +55,8 @@ export type HistoryRecordInput = UnknownRecord & {
 };
 
 export type HistoryItem = {
+  eventId?: string;
+  persistence?: { jsonl: string; rocksdb: string };
   type: string;
   date: string;
   echo: boolean;
