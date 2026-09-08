@@ -11,6 +11,28 @@ export function steamEventKey(account: string | undefined, peer: string, echo: b
   return createHash('sha256').update(JSON.stringify([account, peer, echo, message, at.getTime(), sequence])).digest('hex');
 }
 
+// Only the upload callback and a complete realtime image echo may be paired.
+export function imageEchoIdentity(input: HistoryRecordInput) {
+  const source = input.imageSendSource;
+  if (!input.echo || (source !== 'upload' && source !== 'echo')) return undefined;
+  let raw = input.message || '';
+  if (source === 'echo') {
+    const tag = /^\[img\b([^\]]*)\]([\s\S]*)\[\/img\]$/i.exec(raw);
+    if (!tag || /\[\/?img\b/i.test(tag[2])) return undefined;
+    const src = /\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s\]]+))/i.exec(tag[1]);
+    if (!src) return undefined;
+    raw = src[1] || src[2] || src[3];
+  }
+  try {
+    const url = new URL(raw);
+    if (url.protocol !== 'https:' && url.protocol !== 'http:') return undefined;
+    const at = input.sentAt ? Date.parse(input.sentAt) : input.date ? Date.parse(input.date.replace(' ', 'T')) : Date.now();
+    if (!Number.isFinite(at)) return undefined;
+    return { source, at, paired: false,
+      key: createHash('sha256').update(JSON.stringify([input.steamAccountId, String(input.id), url.href])).digest('hex') };
+  } catch { return undefined; }
+}
+
 export function normalizeStoredMessage(input: HistoryRecordInput): StoredMessage {
   const item: HistoryItem = normalizeHistoryItem(input);
   for (const [name, value] of [['steamAccountId', item.steamAccountId], ['id', item.id]]) {

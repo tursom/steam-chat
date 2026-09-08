@@ -1089,6 +1089,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (typeof result === 'string' && result) message = result;
     else if (isRecord(result) && typeof result.url === 'string' && result.url) message = result.url;
     const record: HistoryRecordInput = {
+      imageSendSource: 'upload',
       type: historyStorage ? 'image' : 'message',
       echo: true,
       steamAccountId,

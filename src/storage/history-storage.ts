@@ -1,7 +1,7 @@
 import { fork, type ChildProcess } from 'node:child_process';
 import * as path from 'node:path';
 import type { ConversationSummary, HistoryItem, HistoryRecordInput, LoggerLike } from '../types';
-import { normalizeStoredMessage, type StoredMessage } from './history-message';
+import { imageEchoIdentity, normalizeStoredMessage, type StoredMessage } from './history-message';
 
 export type SyncQuery = { steamAccountId: string; cursor?: string; limit?: number };
 export type SyncPage = { items: Array<HistoryItem & { syncId: string }>; nextCursor: string; hasMore: boolean; steamAccountId: string };
@@ -181,7 +181,7 @@ export function createHistoryStorage(options: Options = {}): HistoryStorage {
   const durableListeners = new Set<(item: HistoryItem) => void>();
   const messages = new Set<(item: HistoryItem) => void>();
   const listeners = new Set<(status: StorageStatus) => void>();
-  const recent = new Map<string, { item: StoredMessage; expires: number; bytes: number; notified: boolean }>();
+  const recent = new Map<string, { item: StoredMessage; expires: number; bytes: number; notified: boolean; image?: ReturnType<typeof imageEchoIdentity> }>();
   let recentBytes = 0;
   let closed = false;
   let jsonl: WriterLane;
@@ -196,19 +196,30 @@ export function createHistoryStorage(options: Options = {}): HistoryStorage {
       if (closed) throw unavailable('History storage closed');
       const key = typeof input.steamEventKey === 'string' && /^[a-f0-9]{64}$/.test(input.steamEventKey) ? input.steamEventKey : undefined;
       for (const [id, value] of recent) {
-        if (value.expires > Date.now()) break;
+        if (value.expires > Date.now()) continue;
         recent.delete(id); recentBytes -= value.bytes;
       }
-      const previous = key ? recent.get(key) : undefined;
+      let previous = key ? recent.get(key) : undefined;
+      const image = dispatch.notify === false ? undefined : imageEchoIdentity(input);
+      if (!previous && image) {
+        // Consume one opposite-source counterpart, never another independent upload.
+        previous = [...recent.values()].find(value => value.image && !value.image.paired
+          && value.image.source !== image.source && value.image.key === image.key
+          && Math.abs(value.image.at - image.at) <= 30000);
+        if (previous?.image) previous.image.paired = true;
+      }
       const item = previous?.item || normalizeStoredMessage(input);
-      if (key && !previous) {
-        const bytes = Buffer.byteLength(JSON.stringify(item));
+      const cached = previous || { item, expires: Date.now() + 30000,
+        bytes: Buffer.byteLength(JSON.stringify(item)), notified: false, image };
+      const cacheKey = key || (image && !previous ? `image:${item.eventId}` : undefined);
+      if (cacheKey && !recent.has(cacheKey)) {
+        const bytes = cached.bytes;
         while (recent.size >= 1024 || recentBytes + bytes > 4 * 1024 * 1024) {
           const oldest = recent.entries().next().value;
           if (!oldest) break;
           recent.delete(oldest[0]); recentBytes -= oldest[1].bytes;
         }
-        recent.set(key, { item, expires: Date.now() + 30000, bytes, notified: false }); recentBytes += bytes;
+        recent.set(cacheKey, cached); recentBytes += bytes;
       }
       // No await and no shared queue: a failing lane never cancels the other enqueue.
       const persistence = { jsonl: 'pending', rocksdb: 'pending' };
@@ -218,8 +229,7 @@ export function createHistoryStorage(options: Options = {}): HistoryStorage {
       }
       const result: HistoryItem = { ...item, persistence };
       if (dispatch.notify !== false && !previous?.notified) {
-        const cached = key ? recent.get(key) : undefined;
-        if (cached) cached.notified = true;
+        cached.notified = true;
         for (const listener of messages) { try { listener(result); } catch (_) { options.logger?.warn?.('History message listener failed'); } }
       }
       return result;

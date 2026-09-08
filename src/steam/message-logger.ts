@@ -71,6 +71,7 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
   let closed = false;
   function persist(record: HistoryRecordInput, historical = false) {
     if (closed) throw new Error('Message logger closed');
+    record.imageSendSource = record.echo && !historical ? 'echo' : undefined;
     const at = record.sentAt || record.date;
     record.steamEventKey = steamEventKey(record.steamAccountId, String(record.id), Boolean(record.echo), record.message || '',
       at ? new Date(at.replace(' ', 'T')) : undefined, record.ordinal);
@@ -184,7 +185,7 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
     const id = event.id;
     const steamAccountId = activeSteamAccountId();
     const selfNamePromise = settleMetadata(getSelfName(steamAccountId), 'Me');
-    const key = echoKey(`${steamAccountId || ''}:${id}`, event.message, event.ordinal);
+    const key = echoKey(`${steamAccountId || ''}:${id}:${event.serverTimestamp?.getTime() ?? ''}`, event.message, event.ordinal);
     if (!rememberEcho(key)) return;
     try {
       if (storage && !steamAccountId) throw new Error('Steam account is required for history');
