@@ -184,18 +184,18 @@ test('individual remove buttons revoke only the selected draft and send the rema
   assert.equal(new Set(h.revoked).size, 3);
 });
 
-test('failed text keeps text and all images and releases the duplicate-send guard for retry', async () => {
+test('uncertain text keeps images but is not automatically retried on the next send', async () => {
   const h = harness(); h.input.value = 'keep caption'; h.paste([image()]); h.send();
   h.paste([image('new.png')]);
   h.textRequests[0].reject(new Error('text rejected'));
   await settle();
-  assert.equal(h.input.value, 'keep caption');
+  assert.equal(h.input.value, '');
   assert.equal(h.drafts().length, 2);
   assert.equal(h.revoked.length, 0);
   assert.equal(h.readers.length, 0);
   h.send();
-  assert.equal(h.textRequests.length, 2);
-  h.textRequests[1].resolve(); await settle();
+  assert.equal(h.textRequests.length, 1);
+  await settle();
   assert.equal(h.readers.length, 2);
 });
 

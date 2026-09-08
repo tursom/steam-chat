@@ -1344,6 +1344,41 @@ dl.friend-facts {
   line-height: 1.8;
 }
 
+.message-send-state {
+  display: block;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+.bubble > .message-send-state {
+  padding: 0 13px 9px;
+}
+
+.meta .message-send-state {
+  margin-left: auto;
+}
+
+.msg-row[data-send-state="sending"] .message-send-state {
+  color: var(--brand);
+}
+
+.msg-row[data-send-state="failed"] .message-send-state {
+  color: var(--danger);
+}
+
+.msg-row[data-send-state="unknown"] .message-send-state {
+  color: #946400;
+}
+
+.outgoing-image-preview {
+  display: block;
+  max-width: 100%;
+  max-height: 420px;
+  object-fit: contain;
+}
+
 .message-content a {
   color: var(--brand);
 }

@@ -70,7 +70,7 @@ function harness(withLayout = false) {
     state.me = {id: 1}; state.activeId = 'peer'; state.steam.accessAllowed = true;
     resizeComposerInput = () => {};
     globalThis.__test = {sendText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
-      resetHistory, invalidateChat, state, items: () => historyItems,
+      resetHistory, invalidateChat, state, items: () => historyItems, outgoing: () => Array.from(outgoingMessages.values()),
       switchPeer: (id) => { state.activeId = id; resetHistory(); },
       detached: () => historyDetached, busy: () => historyBusy};`, sandbox);
   const api = sandbox.__test as {
@@ -86,6 +86,7 @@ function harness(withLayout = false) {
     switchPeer: (id: string) => void;
     state: { steam: { steamId: string }; friends: Array<{id: string; name: string}>; activeName: string;
       conversations: Array<{id: string; name?: string; preview?: string; updatedAt?: string}>; feedback: string };
+    outgoing: () => Array<{ state: string; item: Item; context: string }>;
     items: () => Item[];
     detached: () => boolean;
     busy: () => boolean;
@@ -95,6 +96,150 @@ function harness(withLayout = false) {
     resize: () => { for (const observer of [...observers]) if (observer.active) observer.callback(); flushFrames(); } };
 }
 const item = (eventId: string, id = 'peer'): Item => ({ id, eventId, message: eventId });
+
+test('optimistic text appears before the response and reconciles response, WebSocket and history once', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'hello';
+  const sending = api.sendText();
+  assert.equal(messages.children.length, 1);
+  assert.equal(messages.children[0].dataset.sendState, 'sending');
+  assert.equal(api.outgoing()[0].item.echo, true);
+  assert.equal(api.items().length, 0);
+  assert.equal(nodes['#messageInput'].value, '');
+  const confirmed = { ...item('confirmed'), message: 'hello', echo: true };
+  api.receiveHistoryMessage(confirmed);
+  pending[0].resolve({ ok: true, item: confirmed });
+  await sending;
+  api.receiveHistoryMessage(confirmed);
+  assert.equal(messages.children.length, 1);
+  assert.equal(api.items().length, 1);
+  const loading = api.loadHistory();
+  pending[1].resolve({ items: [confirmed] });
+  await loading;
+  assert.equal(messages.children.length, 1);
+});
+
+test('image send has a provisional preview source and replaces it with the confirmed URL', async () => {
+  const { api, pending, messages } = harness();
+  const preview = 'data:image/png;base64,YWJj';
+  const sending = api.sendImage({ img: preview });
+  assert.equal(messages.children.length, 1);
+  assert.equal(messages.children[0].dataset.sendState, 'sending');
+  assert.equal(api.outgoing()[0].item.message, preview);
+  assert.equal(api.outgoing()[0].item.type, 'image');
+  const confirmed = { ...item('image-confirmed'), type: 'image', echo: true, message: 'https://example.com/image.png' };
+  pending[0].resolve({ ok: true, item: confirmed });
+  await sending;
+  api.receiveHistoryMessage(confirmed);
+  assert.equal(messages.children.length, 1);
+  assert.equal(api.outgoing().length, 0);
+  assert.equal(api.items()[0].message, confirmed.message);
+});
+
+test('success without stable event identity keeps one sent row and no fake history event', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'hello';
+  const sending = api.sendText();
+  pending[0].resolve({ ok: true, item: { id: 'peer', echo: true, message: 'hello' } });
+  await sending;
+  assert.equal(messages.children.length, 1);
+  assert.equal(messages.children[0].dataset.sendState, 'sent');
+  assert.equal(api.items().length, 0);
+});
+
+test('identical intentional sends stay distinct and preserve a newer composer draft', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'same';
+  const first = api.sendText();
+  nodes['#messageInput'].value = 'same';
+  const second = api.sendText();
+  nodes['#messageInput'].value = 'new draft';
+  assert.equal(messages.children.length, 2);
+  pending[1].resolve({ ok: true, item: { ...item('two'), message: 'same', echo: true } });
+  await second;
+  pending[0].resolve({ ok: true, item: { ...item('one'), message: 'same', echo: true } });
+  await first;
+  assert.equal(messages.children.length, 2);
+  assert.equal(nodes['#messageInput'].value, 'new draft');
+});
+
+for (const status of [400, 500, undefined]) {
+  test(`outgoing failure ${status} is classified without retry`, async () => {
+    const { api, pending, nodes, messages } = harness();
+    nodes['#messageInput'].value = 'hello';
+    const sending = api.sendText();
+    pending[0].reject(Object.assign(new Error('rejected'), { status }));
+    assert.equal(await sending, false);
+    assert.equal(api.outgoing()[0].state, status === 400 ? 'failed' : 'unknown');
+    assert.equal(messages.children.length, 1);
+    assert.equal(pending.length, 1);
+  });
+}
+
+test('outgoing rows survive peer switches, but account invalidation discards stale completions', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'hello';
+  const sending = api.sendText();
+  api.switchPeer('other');
+  assert.equal(messages.children[0].dataset.outgoingId, undefined);
+  pending[0].resolve({ ok: true, item: { ...item('confirmed'), echo: true } });
+  await sending;
+  api.switchPeer('peer');
+  assert.equal(api.outgoing().length, 0);
+  const loading = api.loadHistory();
+  pending[1].resolve({ items: [{ ...item('confirmed'), echo: true }] });
+  await loading;
+  assert.equal(messages.children.length, 1);
+  assert.equal(messages.children[0].dataset.eventId, 'confirmed');
+  nodes['#messageInput'].value = 'next';
+  const stale = api.sendText();
+  api.invalidateChat();
+  pending[2].resolve({ ok: true, item: { ...item('stale'), echo: true } });
+  await stale;
+  assert.equal(api.outgoing().length, 0);
+  assert.equal(api.items().length, 0);
+});
+
+test('date views exclude provisional messages and old confirmed sends never reappear', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'sending now';
+  const sending = api.sendText();
+  const past = api.loadHistory('date', '2026-01-02T13:45');
+  pending[1].resolve({ items: [item('old')] });
+  await past;
+  assert.equal(messages.children.length, 1);
+  assert.equal(messages.children[0].dataset.eventId, 'old');
+  pending[0].resolve({ ok: true, item: { ...item('confirmed'), echo: true } });
+  await sending;
+  assert.equal(api.outgoing().length, 0);
+  assert.equal(messages.children.length, 1);
+  api.switchPeer('other');
+  api.switchPeer('peer');
+  const latest = api.loadHistory();
+  pending[2].resolve({ items: [item('newest')] });
+  await latest;
+  assert.equal(messages.children.length, 1);
+  assert.equal(messages.children[0].dataset.eventId, 'newest');
+});
+
+test('optimistic append and confirmation preserve reading position and following intent', async () => {
+  const { api, pending, nodes, messages, resize } = harness(true);
+  const loading = api.loadHistory();
+  pending[0].resolve({ items: [item('a'), item('b'), item('c'), item('d')] });
+  await loading;
+  messages.dispatch('wheel', { deltaY: -100 });
+  messages.scrollTop = 20;
+  const existingRow = messages.children[0];
+  nodes['#messageInput'].value = 'hello';
+  const sending = api.sendText();
+  assert.equal(messages.children[0], existingRow);
+  assert.equal(messages.scrollTop, 20);
+  pending[1].resolve({ ok: true, item: { ...item('confirmed'), echo: true } });
+  await sending;
+  resize();
+  assert.equal(messages.scrollTop, 20);
+  assert.equal(messages.dataset.followBottom, 'false');
+});
 
 test('latest history follows late row growth and a newly visible viewport', async () => {
   const { api, pending, messages, resize } = harness(true);
@@ -199,17 +344,16 @@ for (const kind of ['text', 'image'] as const) {
     const sending = kind === 'text' ? api.sendText() : api.sendImage({ img: 'YWJj' });
     assert.equal(pending[0].url.pathname, kind === 'text' ? '/message' : '/image');
     pending[0].resolve({ ok: true, item: { ...item('sent'), echo: true, type: kind === 'text' ? 'message' : 'image' } });
-    for (let i = 0; i < 30 && pending.length < 2; i++) await Promise.resolve();
+    const result = await sending;
     assert.deepEqual(Array.from(api.state.conversations, entry => entry.id), ['peer']);
     assert.equal(api.state.conversations[0].preview, kind === 'text' ? 'sent' : '[图片]');
-    pending[1].resolve({ items: [] });
-    const result = await sending;
+    assert.equal(pending.length, 1);
     if (kind === 'text') assert.equal(result, true);
     assert.equal(api.state.conversations.length, 1);
   });
 }
 
-test('sendText returns false for empty input and failed requests, retaining failed text', async () => {
+test('sendText returns false for empty input and uncertain requests without restoring text', async () => {
   const { api, pending, nodes } = harness();
   assert.equal(await api.sendText(), false);
   assert.equal(pending.length, 0);
@@ -217,7 +361,7 @@ test('sendText returns false for empty input and failed requests, retaining fail
   const sending = api.sendText();
   pending[0].reject(new Error('send failed'));
   assert.equal(await sending, false);
-  assert.equal(nodes['#messageInput'].value, 'retry this');
+  assert.equal(nodes['#messageInput'].value, '');
 });
 
 test('recent conversations update for other peers, move to the top and ignore older events', () => {

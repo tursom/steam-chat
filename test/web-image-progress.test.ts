@@ -195,10 +195,9 @@ test('scoped file send renders reading, upload, processing and sent before histo
   assert.match(h.row(transfer)?.querySelector('.image-transfer-status')?.textContent || '', /Steam/);
   xhr.respond(200, { ok: true });
   await settle();
-  assert.equal(h.history.length, 1);
+  assert.equal(h.history.length, 0);
   assert.equal(transfer.stage, 'sent');
   assert.equal(h.row(transfer)?.dataset.stage, 'sent');
-  h.history[0]();
   await settle();
   assert.equal(input.value, 'keep draft');
   assert.equal(h.requests.length, 1);
@@ -287,17 +286,16 @@ test('account invalidation clears transfers and late upload callbacks do not res
   assert.equal(h.history.length, 0);
 });
 
-test('switching conversations during history refresh does not overwrite the new feedback', async () => {
+test('successful sends do not start a history refresh or overwrite later conversation feedback', async () => {
   const h = harness();
   const sending = h.sendImage({ img: 'YWJj' });
   h.requests[0].respond(200, { ok: true });
   await settle();
   assert.equal(h.transfers()[0].stage, 'sent');
-  assert.equal(h.history.length, 1);
+  assert.equal(h.history.length, 0);
   h.state.activeId = 'other';
   h.resetHistory();
   h.state.feedback = 'new conversation';
-  h.history[0]();
   await sending;
   assert.equal(h.state.feedback, 'new conversation');
   assert.equal(h.requests.length, 1);

@@ -238,6 +238,10 @@ const state: AppState = {
   feedbackTone: 'muted'
 };
 
+type OutgoingState = 'sending' | 'sent' | 'failed' | 'unknown';
+type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string };
+const outgoingMessages = new Map<number, OutgoingMessage>();
+let outgoingId = 0;
 let chatEpoch = 0;
 let historyRequest = 0;
 let listRequest = 0;
@@ -290,6 +294,7 @@ function invalidateChat() {
   conversationsBusy = false;
   recentConversationUpdates.clear();
   imageTransfers.clear();
+  outgoingMessages.clear();
   clearImageDrafts();
   storageHealth = null;
   resetHistory();
@@ -500,7 +505,7 @@ async function api(path: string, options: RequestInit = {}, onUploadProgress?: (
       state.needsSetup = false;
       renderLogin();
     }
-    throw new Error(isRecord(payload) && typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`);
+    throw Object.assign(new Error(isRecord(payload) && typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`), { status: response.status });
   }
   return payload;
 }
@@ -2185,16 +2190,87 @@ function watchHistoryLayout(messages: HTMLElement, follow: boolean) {
   settle();
 }
 
+function visibleOutgoing() {
+  if (historyDetached) return [];
+  return [...outgoingMessages.values()].filter(entry => entry.context === chatContext() && entry.item.id === state.activeId
+    && (!entry.eventId || !historyItems.some(item => item.eventId === entry.eventId)));
+}
+
+function refreshOutgoing() {
+  const messages = document.querySelector<HTMLElement>('#messages');
+  if (!messages) return;
+  const top = messages.scrollTop;
+  const following = !historyDetached && (historyScroll?.following() ?? messages.scrollHeight - top - messages.clientHeight < 48);
+  renderHistory(historyItems);
+  if (!following) {
+    messages.scrollTop = top;
+    watchHistoryLayout(messages, false);
+  }
+}
+
+function beginOutgoing(id: string, message: string, type = 'message') {
+  const entry: OutgoingMessage = { localId: ++outgoingId, context: chatContext(), state: 'sending',
+    item: { id, message, type, echo: true, name: '我', sentAt: new Date().toISOString() } };
+  outgoingMessages.set(entry.localId, entry);
+  refreshOutgoing();
+  return entry;
+}
+
+function finishOutgoing(entry: OutgoingMessage, status: OutgoingState, response?: unknown, error?: string) {
+  if (entry.context !== chatContext() || !outgoingMessages.has(entry.localId)) return;
+  entry.state = status;
+  entry.error = error;
+  if (isRecord(response)) {
+    const account = state.steam.activeAccount?.steamId || state.steam.steamId;
+    const item = asMessages([response.item]).find(item => item.id === entry.item.id && item.echo && item.eventId
+      && (!item.steamAccountId || item.steamAccountId === account));
+    if (item) {
+      entry.item = item;
+      entry.eventId = item.eventId;
+      outgoingMessages.delete(entry.localId);
+      receiveHistoryMessage(item);
+    }
+  }
+  if (entry.item.id === state.activeId) refreshOutgoing();
+}
+
+function outgoingFailure(error: unknown): 'failed' | 'unknown' {
+  // Transport and server failures do not prove Steam rejected the send.
+  return isRecord(error) && typeof error.status === 'number' && error.status >= 400 && error.status < 500 ? 'failed' : 'unknown';
+}
+
 function renderHistory(items: MessageItem[]) {
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages) return;
+  const existing = new Map(Array.from(messages.children).filter(row => (row as HTMLElement).dataset.eventId)
+    .map(row => [(row as HTMLElement).dataset.eventId, row]));
   clear(messages);
-  if (!items.length) {
+  const outgoing = visibleOutgoing();
+  if (!items.length && !outgoing.length) {
     const empty = create('div', 'thread-empty');
     empty.append(create('strong', '', state.activeId ? '暂无消息' : '未选择会话'));
     messages.append(empty);
   } else {
-    for (const item of items) messages.append(renderMessage(item));
+    for (const item of items) messages.append((item.eventId && existing.get(item.eventId)) || renderMessage(item));
+  }
+  for (const entry of outgoing) {
+    const localImage = entry.item.type === 'image' && /^data:image\//i.test(entry.item.message || '');
+    const row = renderMessage(localImage ? { ...entry.item, message: '[图片]' } : entry.item);
+    row.dataset.outgoingId = String(entry.localId);
+    row.dataset.sendState = entry.state;
+    if (localImage) {
+      const content = row.querySelector('.message-content');
+      const image = create('img', 'outgoing-image-preview');
+      image.src = entry.item.message!;
+      image.alt = '图片';
+      content?.replaceChildren(image);
+    }
+    const labels: Record<OutgoingState, string> = { sending: '发送中…', sent: '已发送', failed: '发送失败', unknown: '结果未确认，请先检查聊天记录' };
+    const status = create('span', 'message-send-state', labels[entry.state]);
+    status.setAttribute('role', 'status');
+    if (entry.error) status.title = entry.error;
+    (row.querySelector('.bubble') || row).append(status);
+    messages.append(row);
   }
   if (historyDetached) watchHistoryLayout(messages, false);
   else followHistoryBottom(messages);
@@ -2206,6 +2282,10 @@ function renderMessage(item: MessageItem) {
   const bubble = create('div', 'bubble');
   const meta = create('div', 'meta');
   meta.append(create('span', '', item.name || (item.echo ? '我' : item.id)), create('span', '', formatTime(item.sentAt || item.date)));
+  if (item.eventId && item.echo) {
+    row.dataset.sendState = 'sent';
+    meta.append(create('span', 'message-send-state', '已发送'));
+  }
   const content = create('div', 'message-content');
   const message = item.message || '';
   if (item.type === 'image') {
@@ -2614,21 +2694,16 @@ async function sendText(): Promise<boolean> {
   const draft = input?.value || '';
   const msg = draft.trim();
   if (!id || !msg) return false;
-  const context = chatContext();
+  const outgoing = beginOutgoing(id, msg);
+  if (input) { input.value = ''; resizeComposerInput(input); }
   try {
-    const response = await api('/message', jsonBody({ id, msg }));
+    const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId;
+    const response = await api('/message', jsonBody({ id, msg, ...(steamAccountId ? { steamAccountId } : {}) }));
     if (!isRecord(response) || response.ok !== true) throw new Error('文字发送结果未确认，请先检查聊天记录。');
-    if (context !== chatContext() || id !== state.activeId) return true;
-    if (isRecord(response)) for (const item of asMessages([response.item])) receiveHistoryMessage(item);
-    if (input && input.value === draft) {
-      input.value = '';
-      resizeComposerInput(input);
-    }
-    await loadHistory();
-    if (context === chatContext() && id === state.activeId) setFeedback('已发送', 'ok');
+    finishOutgoing(outgoing, 'sent', response);
     return true;
   } catch (error) {
-    if (context === chatContext() && id === state.activeId) setFeedback(errorMessage(error), 'error');
+    finishOutgoing(outgoing, outgoingFailure(error), undefined, errorMessage(error));
     return false;
   }
 }
@@ -2716,6 +2791,7 @@ async function sendComposer() {
   const drafts = getImageDrafts();
   const text = document.querySelector<HTMLTextAreaElement>('#messageInput')?.value.trim();
   if (!text && !drafts.length) return;
+  if (text && !drafts.length) { await sendText(); return; }
   composerSending.add(key);
   updateChatAvailability();
   try {
@@ -2782,11 +2858,10 @@ function renderImageTransfers(container = document.querySelector<HTMLElement>('#
 async function sendImage(payload: Record<string, string>, existing?: ImageTransfer) {
   const id = activeIdOrWarn();
   if (!id) return;
-  const context = chatContext();
-  const current = () => context === chatContext() && id === state.activeId && state.view === 'chat';
   const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId;
   const transfer = existing || createImageTransfer(payload.url ? '图片 URL' : '图片', payload.img ? 'uploading' : 'processing');
   updateImageTransfer(transfer, payload.img ? 'uploading' : 'processing', payload.img ? 0 : null);
+  const outgoing = beginOutgoing(id, payload.img || payload.url || '', 'image');
   let response: unknown;
   try {
     response = await api('/image', jsonBody({ id, ...payload, ...(steamAccountId ? { steamAccountId } : {}) }), (percent) => {
@@ -2796,15 +2871,12 @@ async function sendImage(payload: Record<string, string>, existing?: ImageTransf
     if (!isRecord(response) || response.ok !== true) throw Object.assign(new Error('发送结果未确认，请先检查聊天记录。'), { uncertain: true });
   } catch (error) {
     const message = errorMessage(error);
-    updateImageTransfer(transfer, isRecord(error) && error.uncertain ? 'unknown' : 'failed', null, message);
-    if (current()) setFeedback(message, 'error');
+    finishOutgoing(outgoing, outgoingFailure(error), undefined, message);
+    updateImageTransfer(transfer, outgoingFailure(error), null, message);
     return;
   }
   updateImageTransfer(transfer, 'sent', 100);
-  if (!current()) return;
-  if (isRecord(response)) for (const item of asMessages([response.item])) receiveHistoryMessage(item);
-  await loadHistory();
-  if (current()) setFeedback('图片已发送', 'ok');
+  finishOutgoing(outgoing, 'sent', response);
 }
 
 function canSendImages() {
