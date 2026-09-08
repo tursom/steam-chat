@@ -1,9 +1,6 @@
 services:
   steam-chat:
     image: ${STEAM_CHAT_IMAGE:-ghcr.io/tursom/steam-chat:latest}
-    build:
-      context: .
-      dockerfile: Dockerfile
     container_name: ${STEAM_CHAT_CONTAINER_NAME:-steam-chat}
     restart: unless-stopped
     init: true
@@ -15,6 +12,9 @@ services:
       STEAM_CHAT_HOST: 0.0.0.0
       STEAM_CHAT_PORT: 3000
       STEAM_CHAT_WS_PATH: /ws
+      STEAM_CHAT_DEPLOY_WEBHOOK_URL: ${STEAM_CHAT_DEPLOY_WEBHOOK_URL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
       - ./data:/app/data
     healthcheck:

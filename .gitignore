@@ -17,6 +17,8 @@ auth.sqlite
 
 # Build
 dist/
+__pycache__/
+*.pyc
 
 # Test coverage
 coverage/

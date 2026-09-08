@@ -1,50 +1,27 @@
-# Steam Chat Docker Compose 部署设计
+# Steam Chat GHCR 部署
 
-## 目标
+## 部署方式
 
-提供一个单服务 Docker Compose 部署方式，让服务器上可以用下面的命令完成构建和启动：
+Docker Compose 直接拉取 GitHub Container Registry（GHCR）镜像，不在部署服务器上构建源码。
 
-```bash
-docker compose up -d --build
-```
-
-部署后，用户通过浏览器访问 Web 后台，首次初始化管理员，然后由管理员完成 Steam 登录。
-
-本部署方案不包含反向代理、HTTPS、外部数据库或额外服务。生产公网访问建议在外层自行接入 HTTPS 反向代理。
-
-## 交付文件
-
-需要新增或调整：
-
-- `docker-compose.yaml`
-- `.env.example`
-- `Dockerfile`
-- `.dockerignore`
-- `.gitignore`
-- `.github/workflows/docker-publish.yml`
-- 后台改造文档中约定的数据目录和健康检查接口
-
-GitHub Actions 在 `master` 分支、`v*.*.*` 标签和手动触发时构建 Docker 镜像；非 PR 事件会推送到 GitHub Container Registry。
-
-默认镜像名：
+默认镜像：
 
 ```text
 ghcr.io/tursom/steam-chat:latest
 ```
 
-Compose 文件保留本地源码构建能力，同时设置固定 GHCR 镜像名，避免只有 `image` 而没有 `build` 时 `docker compose up --build` 仍尝试拉取远端镜像。
+`.github/workflows/docker-publish.yml` 在 `master` 分支更新、`v*.*.*` 标签和手动触发时构建并发布镜像。PR 只构建，不发布。部署前应确认该工作流已成功发布所选镜像标签。
 
-## Compose 服务定义
+部署机器只需安装 Docker Engine 和 Docker Compose 插件，并准备 `docker-compose.yaml`、可选的 `.env` 及持久化数据目录；不需要 Node.js、Android SDK、Dockerfile 或完整源码。
 
-目标 `docker-compose.yaml`：
+仓库中的 Dockerfile 继续供 GitHub Actions 构建镜像使用；默认 Compose 文件不再包含 `build`，不再使用 `docker compose up --build` 部署。
+
+## Compose 配置
 
 ```yaml
 services:
   steam-chat:
     image: ${STEAM_CHAT_IMAGE:-ghcr.io/tursom/steam-chat:latest}
-    build:
-      context: .
-      dockerfile: Dockerfile
     container_name: ${STEAM_CHAT_CONTAINER_NAME:-steam-chat}
     restart: unless-stopped
     init: true
@@ -56,8 +33,11 @@ services:
       STEAM_CHAT_HOST: 0.0.0.0
       STEAM_CHAT_PORT: 3000
       STEAM_CHAT_WS_PATH: /ws
+      STEAM_CHAT_DEPLOY_WEBHOOK_URL: ${STEAM_CHAT_DEPLOY_WEBHOOK_URL:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     volumes:
-      - steam-chat-data:/app/data
+      - ./data:/app/data
     healthcheck:
       test:
         - CMD
@@ -68,30 +48,15 @@ services:
       timeout: 5s
       retries: 3
       start_period: 20s
-
-volumes:
-  steam-chat-data:
 ```
 
-默认使用 Docker named volume，而不是 `./data:/app/data`。原因是运行容器使用非 root 用户时，bind mount 容易遇到宿主机目录权限问题；named volume 会继承镜像内 `/app/data` 的权限，更适合快速部署。
+保留现有的宿主机目录挂载 `./data:/app/data`。升级时应在原 Compose 目录操作，不要更换挂载位置，也不要直接切换成一个空的命名卷。
 
-如果必须把数据放在当前目录，可以把 volume 改成：
-
-```yaml
-    volumes:
-      - ./data:/app/data
-```
-
-并在首次启动前执行：
-
-```bash
-mkdir -p data
-sudo chown -R 1000:1000 data
-```
+入口脚本创建数据目录并调整权限，之后以镜像中的 `node` 用户运行服务。若宿主机文件系统不允许调整所有权，需提前为容器运行用户准备可写的数据目录。
 
 ## 环境变量
 
-`.env.example`：
+可复制 `.env.example` 为 `.env`，按部署环境调整：
 
 ```dotenv
 STEAM_CHAT_IMAGE=ghcr.io/tursom/steam-chat:latest
@@ -100,228 +65,100 @@ STEAM_CHAT_BIND=0.0.0.0
 STEAM_CHAT_PORT=3000
 ```
 
-说明：
+`STEAM_CHAT_IMAGE` 支持已发布的版本标签、`sha-<提交短哈希>` 标签或镜像 digest。生产部署建议固定版本或 digest；`latest` 会随默认分支发布更新。
 
-- Compose 会自动读取同目录 `.env` 做 YAML 变量替换。
-- `.env` 中的变量不会自动进入容器，只有在 `environment:` 中显式声明的变量才会成为容器环境变量。
-- 本项目不在 `.env` 中保存 Steam 账号、Steam 密码、Steam Guard code 或 refresh token。
-- Steam 登录凭据只通过 Web 后台提交，登录成功后只保存 `refresh.token` 到数据卷。
+Compose 读取 `.env` 做变量替换，不会自动把所有变量传入容器。不要在这些文件里保存 Steam 密码、后台密码、Guard code 或 refresh token。
 
-## Dockerfile 调整
+## 首次部署
 
-继续使用多阶段构建：
-
-1. `build` 阶段执行 `npm ci` 和 `npm run build`。
-2. `runtime` 阶段只复制 `dist/`、`node_modules/`、`package.json`、`package-lock.json`。
-3. 运行用户使用 `node`。
-4. 创建 `/app/data` 并设置为 `node:node`。
-5. 默认命令为 `node dist/src/index.js`。
-
-运行时环境：
-
-```dockerfile
-ENV NODE_ENV=production
-ENV STEAM_CHAT_DATA_DIR=/app/data
-ENV STEAM_CHAT_HOST=0.0.0.0
-ENV STEAM_CHAT_PORT=3000
-```
-
-镜像内不复制或生成以下敏感/状态文件：
-
-- `config.js`
-- `.env`
-- `refresh.token`
-- `auth.sqlite`
-- `logs/`
-- `data/`
-
-`.dockerignore` 和 `.gitignore` 都应包含：
-
-```text
-data/
-auth.sqlite
-```
-
-## 数据目录
-
-容器内固定数据目录：
-
-```text
-/app/data
-```
-
-目录内容：
-
-```text
-/app/data/auth.sqlite
-/app/data/refresh.token
-/app/data/logs/chat.jsonl
-/app/data/logs/images/
-/app/data/logs/stickers/
-```
-
-其中：
-
-- `auth.sqlite` 保存后台用户、角色、禁用状态和应用会话密钥。
-- `refresh.token` 保存 Steam refresh token。
-- `logs/chat.jsonl` 保存聊天历史。
-- `logs/images/` 和 `logs/stickers/` 保存媒体缓存。
-
-## 健康检查
-
-新增 `GET /healthz`：
-
-```json
-{
-  "ok": true
-}
-```
-
-该接口只检查应用 HTTP 服务是否可用，不检查 Steam 是否已经登录。原因是首次部署时 Steam 本来就可能未登录，如果健康检查依赖 Steam，会导致容器在正常初始化阶段被判定为 unhealthy。
-
-Steam 状态通过后台接口查看：
+在存放 Compose 文件的目录执行：
 
 ```bash
-curl http://127.0.0.1:3000/api/steam/status
-```
-
-该接口需要后台登录 Cookie，主要给 Web 后台使用。
-
-## 部署流程
-
-首次部署：
-
-```bash
-cp .env.example .env
+mkdir -p data
 docker compose config --quiet
-docker compose up -d --build
+docker compose pull steam-chat
+docker compose up -d --no-build steam-chat
 docker compose ps
 ```
 
-访问：
+必须先确认 `pull` 成功；出现权限、标签不存在或网络错误时应先处理，不要把旧镜像启动成功误认为已升级。
 
-```text
-http://服务器地址:3000
-```
-
-首次打开页面：
-
-1. 初始化管理员。
-2. 使用管理员账号登录后台。
-3. 在后台提交 Steam 账号密码。
-4. 如果 Steam 要求 Guard，提交邮箱码或手机 2FA。
-5. Steam 登录成功后开始使用聊天功能。
-
-更新部署：
+公开镜像通常无需登录。若 GHCR 包是私有的，先执行：
 
 ```bash
-git pull
-docker compose pull
-docker compose up -d
+docker login ghcr.io -u YOUR_GITHUB_USERNAME
+```
+
+在密码提示中输入有权读取该包、具备 `read:packages` 权限的 GitHub token，不要把 token 写进命令、Compose 或 `.env`。也可将包设置为公开以允许匿名拉取。
+
+打开 `http://服务器地址:3000`，首次初始化管理员，再由管理员在 Web 后台完成 Steam 登录、Guard 验证和用户授权。没有 Steam token 时服务也可以启动。
+
+## 更新部署
+
+先确认新镜像已发布，并完成数据备份。保持原有 `.env` 和 `data/` 挂载：
+
+```bash
+docker compose pull steam-chat
+docker compose up -d --no-build steam-chat
 docker compose ps
 ```
 
-如果要在服务器上用当前源码重新构建，而不是拉取 GHCR 镜像，继续使用：
+如果 Compose 文件有更新，再替换配置文件；日常镜像更新不要求在服务器执行 `git pull`。
 
-```bash
-docker compose up -d --build
+历史库可能随镜像升级而迁移。例如 Android 增量同步需要 schema 2，旧版本程序不能直接打开升级后的库。部署前应预留索引、WAL 和压缩空间，并阅读 [同步与升级说明](android-durable-sync.md)。不能只切回旧镜像就假定数据库也已回滚。
+
+## 自动更新
+
+`master` 镜像通过测试并发布成功后，Actions 可调用 HTTPS webhook 自动更新。部署使用本次构建的不可变 digest，而不是重新解析 `latest`。PR 和版本标签不会触发生产更新。
+
+GitHub 仓库需要设置两个 Secrets：`DEPLOY_WEBHOOK_URL`（例如 `https://steam.tursom.dev/api/deploy`）和 `DEPLOY_WEBHOOK_SECRET`（至少 32 字符的随机密钥）。首次部署完成后，再将仓库 Actions Variable `DEPLOY_WEBHOOK_ENABLED` 设置为 `true`；其他值会跳过生产更新，可用作暂停开关。
+
+聊天容器仅转发原始签名请求，不保存部署密钥，也不挂载 Docker socket。宿主机独立更新器验签、限制镜像仓库、拒绝过时任务，并执行拉取、停服备份、启动和健康检查。部署密钥不得与后台登录密码共用。
+
+在服务器 `.env` 中启用转发：
+
+```dotenv
+STEAM_CHAT_DEPLOY_WEBHOOK_URL=http://host.docker.internal:3001/deploy
 ```
 
-查看日志：
+宿主机更新器应绑定 Docker host-gateway 对应地址，不直接开放公网端口。安装与故障处理参见 [部署更新器](../ops/deploy/README.md)。首次安装需要先部署包含转发入口的新镜像。
 
-```bash
-docker compose logs -f steam-chat
-```
+自动更新生成 `compose.deploy.yml` 固定镜像 digest。启用后手工操作也要同时加载原 Compose 文件和该覆盖文件，避免意外退回 `latest`。停服后备份完整 `data/`；备份不自动删除。新版本启动失败时不自动切旧镜像，因为数据 schema 可能已迁移。
 
-停止：
+## 数据与备份
 
-```bash
-docker compose down
-```
+宿主机 `data/` 对应容器 `/app/data`，包含后台用户库、Steam 登录凭据、RocksDB 历史库、JSONL 副本和媒体缓存。整个目录都应作为敏感数据保护。
 
-删除容器但保留数据卷：
-
-```bash
-docker compose down
-docker compose up -d
-```
-
-删除数据卷会清空后台用户、Steam token、聊天历史和缓存，只有明确要重置时才执行：
-
-```bash
-docker compose down -v
-```
-
-## 备份与恢复
-
-默认 named volume 备份：
+停止所有写入进程后备份整个目录，不要把运行中直接复制的 RocksDB 当作一致性备份：
 
 ```bash
 mkdir -p backups
-docker run --rm \
-  -v steam-chat_steam-chat-data:/data:ro \
-  -v "$PWD/backups:/backup" \
-  alpine \
-  tar -czf /backup/steam-chat-data.tgz -C /data .
+docker compose stop --timeout 60 steam-chat
+sudo tar -czf "backups/steam-chat-data-$(date +%Y%m%d-%H%M%S).tgz" data
+docker compose start steam-chat
 ```
 
-恢复：
+备份失败时应先排查，确认备份可恢复后再升级。恢复时先停服务，保留当前目录，验证备份并恢复完整数据目录，使用与数据库 schema 兼容的镜像。详细操作见 [历史存储维护说明](history-storage-operations.md)。
+
+`docker compose down` 会删除容器，但不会删除这个 bind mount 的宿主机 `data/`。不要删除或清空 `data/`，否则会丢失账户、token、聊天记录和缓存。
+
+## 健康检查与日志
 
 ```bash
-docker compose down
-docker run --rm \
-  -v steam-chat_steam-chat-data:/data \
-  -v "$PWD/backups:/backup" \
-  alpine \
-  sh -c "rm -rf /data/* && tar -xzf /backup/steam-chat-data.tgz -C /data"
-docker compose up -d
+docker compose logs -f steam-chat
+curl -fsS http://127.0.0.1:3000/healthz
 ```
 
-如果使用 bind mount `./data:/app/data`，直接备份宿主机 `data/` 目录即可。
+修改了外部端口时，健康检查命令也要使用对应端口。`/healthz` 返回 `{"ok":true}` 仅表示 HTTP 服务可用，不代表 Steam 已登录或所有存储写入正常；Steam 状态和存储状态应在登录后查看。
 
-## 安全建议
+## 公网访问
 
-- 不要把 Steam 密码、后台密码、Steam Guard code 或 refresh token 写入 `.env`、compose 文件或镜像。
-- 公网部署时建议使用 HTTPS 反向代理。
-- 如果只允许本机反向代理访问应用端口，可设置：
+公网部署应配置 HTTPS 反向代理。Android App 只接受有效 HTTPS 地址。反代需要支持 `/ws` 的 WebSocket Upgrade，正确转发协议及必要的客户端信息。
+
+若只有本机反代需要访问服务端口，可在 `.env` 设置：
 
 ```dotenv
 STEAM_CHAT_BIND=127.0.0.1
 ```
 
-- 后台登录 Cookie 在 HTTPS 下应设置 `Secure`；应用可以根据 `X-Forwarded-Proto: https` 或显式环境变量判断。
-- 反向代理需要支持 WebSocket Upgrade，并转发 `/ws`。
-
-## 验收命令
-
-配置校验：
-
-```bash
-docker compose config --quiet
-```
-
-镜像构建：
-
-```bash
-docker compose build
-```
-
-启动：
-
-```bash
-docker compose up -d
-docker compose ps
-```
-
-健康检查：
-
-```bash
-curl -fsS http://127.0.0.1:${STEAM_CHAT_PORT:-3000}/healthz
-```
-
-代码质量：
-
-```bash
-npm run typecheck
-npm test
-```
+本 Compose 不包含反向代理、TLS 证书或外部数据库。

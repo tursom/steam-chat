@@ -1,5 +1,6 @@
 'use strict';
 
+import { handleDeployWebhook } from './deploy-webhook';
 import { settleMetadata } from '../steam/metadata';
 import { steamEventKey } from '../storage/history-message';
 import type { HistoryStorage } from '../storage/history-storage';
@@ -96,6 +97,7 @@ type GetEmoticonsOptions = {
 };
 
 type ChatServiceOptions = {
+  deploymentWebhookUrl?: string;
   historyStorage?: HistoryStorage;
   config?: unknown;
   chatConfig?: unknown;
@@ -1141,6 +1143,10 @@ function createChatService(options: ChatServiceOptions = {}) {
     try {
       if (stopping) {
         jsonResponse(res, 503, { error: 'Service is stopping' });
+        return;
+      }
+      if (url.pathname === '/api/deploy') {
+        await handleDeployWebhook(req, res, options.deploymentWebhookUrl ?? process.env.STEAM_CHAT_DEPLOY_WEBHOOK_URL);
         return;
       }
       if (req.method === 'GET' && url.pathname === '/healthz') {

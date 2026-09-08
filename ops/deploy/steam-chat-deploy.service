@@ -1,0 +1,29 @@
+[Unit]
+Description=Steam Chat authenticated host deployment receiver
+After=network.target docker.service
+Requires=docker.service
+
+[Service]
+Type=simple
+# Docker socket access is root-equivalent. This is a privileged host service.
+User=root
+Group=root
+WorkingDirectory=/opt/steam-chat
+EnvironmentFile=/etc/steam-chat/deploy.env
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=DOCKER_CONFIG=/etc/steam-chat/docker
+ExecStart=/usr/bin/python3 /opt/steam-chat/deploy/receiver.py
+Restart=on-failure
+RestartSec=5
+KillMode=control-group
+TimeoutStopSec=90
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/steam-chat
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target
