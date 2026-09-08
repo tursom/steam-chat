@@ -22,11 +22,11 @@ class Element {
   addEventListener() {}
 }
 
-type Item = { id: string; eventId: string; message: string };
+type Item = { id: string; eventId: string; message: string; echo?: boolean; name?: string; sentAt?: string; steamAccountId?: string; type?: string };
 type Pending = { url: URL; resolve: (value: unknown) => void; reject: (error: Error) => void };
 function harness() {
   const source = readFileSync(resolve(__dirname, '../web/app.js'), 'utf8');
-  const nodes: Record<string, Element> = { '#app': new Element(), '#messages': new Element(), '#historyOlder': new Element(), '#storageHealth': new Element() };
+  const nodes: Record<string, Element> = { '#app': new Element(), '#chatListSections': new Element(), '#messageInput': new Element(), '#messages': new Element(), '#historyOlder': new Element(), '#storageHealth': new Element() };
   const pending: Pending[] = [];
   const sandbox = {
     document: { querySelector: (id: string) => nodes[id] || null, querySelectorAll: (): Element[] => [], addEventListener() {}, createElement: () => new Element() },
@@ -39,11 +39,14 @@ function harness() {
   runInNewContext(`${source.slice(0, source.lastIndexOf('bootstrap().catch'))}
     renderMessage = (item) => { const row = document.createElement('article'); row.dataset.eventId = item.eventId; return row; };
     state.me = {id: 1}; state.activeId = 'peer'; state.steam.accessAllowed = true;
-    globalThis.__test = {loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
+    resizeComposerInput = () => {};
+    globalThis.__test = {sendText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
       resetHistory, invalidateChat, state, items: () => historyItems,
       switchPeer: (id) => { state.activeId = id; resetHistory(); },
       detached: () => historyDetached, busy: () => historyBusy};`, sandbox);
   const api = sandbox.__test as {
+    sendText: () => Promise<void>;
+    sendImage: (payload: Record<string, string>) => Promise<void>;
     loadHistory: (mode?: string, date?: string) => Promise<void>;
     loadConversations: (more?: boolean) => Promise<void>;
     receiveHistoryMessage: (item: Item) => void;
@@ -52,7 +55,8 @@ function harness() {
     resetHistory: () => void;
     invalidateChat: () => void;
     switchPeer: (id: string) => void;
-    state: { steam: { steamId: string }; conversations: Array<{id: string}>; feedback: string };
+    state: { steam: { steamId: string }; friends: Array<{id: string; name: string}>; activeName: string;
+      conversations: Array<{id: string; name?: string; preview?: string; updatedAt?: string}>; feedback: string };
     items: () => Item[];
     detached: () => boolean;
     busy: () => boolean;
@@ -60,6 +64,82 @@ function harness() {
   return { api, pending, messages: nodes['#messages'], nodes };
 }
 const item = (eventId: string, id = 'peer'): Item => ({ id, eventId, message: eventId });
+
+test('a newly sent message immediately adds its friend to recent conversations', () => {
+  const { api, nodes } = harness();
+  api.state.friends = [{ id: 'peer', name: 'Friend' }];
+  api.receiveHistoryMessage({ ...item('sent-message'), echo: true, name: 'My name' });
+  assert.deepEqual(Array.from(api.state.conversations, entry => entry.id), ['peer']);
+  assert.equal(api.state.conversations[0].name, 'Friend');
+  assert.equal(api.state.conversations[0].preview, 'sent-message');
+  assert.equal(nodes['#chatListSections'].children.length, 1);
+});
+
+for (const kind of ['text', 'image'] as const) {
+  test(`${kind} send response adds a recent conversation without WebSocket or page refresh`, async () => {
+    const { api, pending, nodes } = harness();
+    nodes['#messageInput'].value = 'sent';
+    const sending = kind === 'text' ? api.sendText() : api.sendImage({ img: 'YWJj' });
+    assert.equal(pending[0].url.pathname, kind === 'text' ? '/message' : '/image');
+    pending[0].resolve({ ok: true, item: { ...item('sent'), echo: true, type: kind === 'text' ? 'message' : 'image' } });
+    for (let i = 0; i < 30 && pending.length < 2; i++) await Promise.resolve();
+    assert.deepEqual(Array.from(api.state.conversations, entry => entry.id), ['peer']);
+    assert.equal(api.state.conversations[0].preview, kind === 'text' ? 'sent' : '[图片]');
+    pending[1].resolve({ items: [] });
+    await sending;
+    assert.equal(api.state.conversations.length, 1);
+  });
+}
+
+test('recent conversations update for other peers, move to the top and ignore older events', () => {
+  const { api } = harness();
+  api.state.conversations = [{ id: 'peer', updatedAt: '2026-01-01T00:00:00Z' }];
+  const message = { ...item('incoming', 'other'), sentAt: '2026-01-02T00:00:00Z', name: 'Other friend' };
+  api.receiveHistoryMessage(message);
+  api.receiveHistoryMessage(message);
+  assert.deepEqual(Array.from(api.state.conversations, entry => entry.id), ['other', 'peer']);
+  assert.equal(api.items().length, 0);
+  api.receiveHistoryMessage({ ...item('newest'), sentAt: '2026-01-03T00:00:00Z' });
+  api.receiveHistoryMessage({ ...item('old'), sentAt: '2025-01-01T00:00:00Z' });
+  assert.deepEqual(Array.from(api.state.conversations, entry => entry.id), ['peer', 'other']);
+  assert.equal(api.state.conversations[0].preview, 'newest');
+});
+
+test('stale list responses cannot remove or overwrite unconfirmed recent messages', async () => {
+  const { api, pending } = harness();
+  const loading = api.loadConversations();
+  const sentAt = '2026-01-03T00:00:00Z';
+  api.receiveHistoryMessage({ ...item('newest'), sentAt, echo: true });
+  pending[0].resolve({ items: [] });
+  await loading;
+  assert.equal(api.state.conversations[0].preview, 'newest');
+  const stale = api.loadConversations();
+  pending[1].resolve({ items: [{ id: 'peer', updatedAt: sentAt, preview: 'old', lastEcho: true }] });
+  await stale;
+  assert.equal(api.state.conversations[0].preview, 'newest');
+  const confirmed = api.loadConversations();
+  pending[2].resolve({ items: [{ id: 'peer', updatedAt: sentAt, preview: 'newest', lastEcho: true }] });
+  await confirmed;
+  const newer = api.loadConversations();
+  pending[3].resolve({ items: [{ id: 'peer', updatedAt: '2026-01-04T00:00:00Z', preview: 'from server' }] });
+  await newer;
+  assert.equal(api.state.conversations[0].preview, 'from server');
+});
+
+test('account invalidation clears pending recent updates and foreign-account messages are ignored', async () => {
+  const { api, pending } = harness();
+  api.state.steam.steamId = 'account-A';
+  api.receiveHistoryMessage({ ...item('wrong'), steamAccountId: 'account-B' });
+  assert.equal(api.state.conversations.length, 0);
+  api.receiveHistoryMessage({ ...item('own'), steamAccountId: 'account-A' });
+  api.invalidateChat();
+  api.state.conversations = [];
+  api.state.steam.steamId = 'account-B';
+  const loading = api.loadConversations();
+  pending[0].resolve({ items: [] });
+  await loading;
+  assert.equal(api.state.conversations.length, 0);
+});
 
 test('live messages survive a refresh that races database persistence', async () => {
   const { api, pending } = harness();

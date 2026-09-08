@@ -251,6 +251,7 @@ let historyDetached = false;
 let historyLive: MessageItem[] = [];
 let conversationsBefore = '';
 let conversationsBusy = false;
+const recentConversationUpdates = new Map<string, ListEntry>();
 let storageHealth: unknown = null;
 
 function chatContext() {
@@ -273,6 +274,7 @@ function invalidateChat() {
   healthRequest += 1;
   conversationsBefore = '';
   conversationsBusy = false;
+  recentConversationUpdates.clear();
   storageHealth = null;
   resetHistory();
   updateStorageHealth();
@@ -1837,7 +1839,18 @@ async function loadConversations(more = false) {
     const items = asListEntries(isRecord(payload) ? payload.items : payload);
     const merged = new Map((more ? state.conversations : []).map((item) => [item.id, item]));
     for (const item of items) if (!more || !merged.has(item.id)) merged.set(item.id, item);
-    state.conversations = [...merged.values()];
+    for (const [id, local] of recentConversationUpdates) {
+      const stored = items.find((entry) => entry.id === id);
+      const storedAt = conversationTimestamp(stored?.updatedAt);
+      const localAt = conversationTimestamp(local.updatedAt);
+      if (stored && (storedAt > localAt || (storedAt === localAt && stored.preview === local.preview && stored.lastEcho === local.lastEcho))) {
+        recentConversationUpdates.delete(id);
+        merged.set(id, { ...merged.get(id), ...stored });
+      } else {
+        merged.set(id, { ...merged.get(id), ...local });
+      }
+    }
+    state.conversations = [...merged.values()].sort((left, right) => conversationTimestamp(right.updatedAt) - conversationTimestamp(left.updatedAt));
     conversationsBefore = pageCursor(payload);
   } catch (_) {
     if (context === chatContext() && request === conversationRequest) setFeedback('会话列表暂时无法加载，请稍后重试。', 'warn');
@@ -2015,8 +2028,34 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
   }
 }
 
+function conversationTimestamp(value: unknown): number {
+  const at = Date.parse(String(value || ''));
+  return Number.isFinite(at) ? at : 0;
+}
+
+function updateRecentConversation(item: MessageItem) {
+  const previous = state.conversations.find((entry) => entry.id === item.id);
+  const updatedAt = item.sentAt || item.date || new Date().toISOString();
+  if (previous && conversationTimestamp(previous.updatedAt) > conversationTimestamp(updatedAt)) return;
+  const friend = state.friends.find((entry) => entry.id === item.id);
+  const name = friend?.name || previous?.name
+    || (item.id === state.activeId ? state.activeName : '')
+    || (!item.echo ? item.name : '') || item.id;
+  const preview = item.type === 'image' ? '[图片]' : (item.message || '').replace(/\s+/g, ' ').trim() || '[空消息]';
+  const conversation: ListEntry = { ...previous, id: item.id, name, updatedAt, preview,
+    lastType: item.type || 'message', lastEcho: Boolean(item.echo) };
+  recentConversationUpdates.set(item.id, conversation);
+  state.conversations = [conversation, ...state.conversations.filter((entry) => entry.id !== item.id)]
+    .sort((left, right) => conversationTimestamp(right.updatedAt) - conversationTimestamp(left.updatedAt));
+  updateChatLists();
+}
+
 function receiveHistoryMessage(item: MessageItem) {
-  if (item.id !== state.activeId || !steamAccessAllowed()) return;
+  if (!item.id || !steamAccessAllowed()) return;
+  const account = state.steam.activeAccount?.steamId || state.steam.steamId;
+  if (item.steamAccountId && item.steamAccountId !== account) return;
+  updateRecentConversation(item);
+  if (item.id !== state.activeId) return;
   historyLive = uniqueMessages([...historyLive, item]).slice(-500);
   if (historyDetached || (item.eventId && historyItems.some((entry) => entry.eventId === item.eventId))) return;
   historyItems.push(item);
