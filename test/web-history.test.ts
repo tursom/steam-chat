@@ -28,12 +28,21 @@ class Element {
     this.listeners.get(name)!.add(listener);
   }
   removeEventListener(name: string, listener: () => void) { this.listeners.get(name)?.delete(listener); }
-  dispatch(name: string) { for (const listener of this.listeners.get(name) || []) listener(); }
+  dispatch(name: string, event: Record<string, unknown> = {}) {
+    for (const listener of this.listeners.get(name) || []) (listener as (event: unknown) => void)(event);
+  }
 }
 
 type Item = { id: string; eventId: string; message: string; echo?: boolean; name?: string; sentAt?: string; steamAccountId?: string; type?: string };
 type Pending = { url: URL; resolve: (value: unknown) => void; reject: (error: Error) => void };
 function harness(withLayout = false) {
+  const frames = new Map<number, () => void>();
+  let frameId = 0;
+  const flushFrames = () => {
+    const callbacks = [...frames.values()];
+    frames.clear();
+    for (const callback of callbacks) callback();
+  };
   const observers: Array<{ active: boolean; callback: () => void }> = [];
   class LayoutObserver {
     active = true;
@@ -47,7 +56,9 @@ function harness(withLayout = false) {
   const sandbox = {
     document: { querySelector: (id: string) => nodes[id] || null, querySelectorAll: (): Element[] => [], addEventListener() {}, createElement: () => new Element() },
     localStorage: { getItem: (): null => null, setItem() {} },
-    ...(withLayout ? { ResizeObserver: LayoutObserver } : {}),
+    ...(withLayout ? { ResizeObserver: LayoutObserver,
+      requestAnimationFrame: (callback: () => void) => { frames.set(++frameId, callback); return frameId; },
+      cancelAnimationFrame: (id: number) => frames.delete(id) } : {}),
     URL, URLSearchParams, Headers, console,
     setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
     fetch: (url: string) => new Promise((resolve, reject) => pending.push({ url: new URL(url, 'http://test'), resolve: (payload) => resolve({ ok: true, json: async () => payload }), reject })),
@@ -80,7 +91,8 @@ function harness(withLayout = false) {
     busy: () => boolean;
   };
   return { api, pending, messages: nodes['#messages'], nodes,
-    resize: () => { for (const observer of [...observers]) if (observer.active) observer.callback(); } };
+    flushFrames,
+    resize: () => { for (const observer of [...observers]) if (observer.active) observer.callback(); flushFrames(); } };
 }
 const item = (eventId: string, id = 'peer'): Item => ({ id, eventId, message: eventId });
 
@@ -99,11 +111,53 @@ test('latest history follows late row growth and a newly visible viewport', asyn
   assert.equal(messages.scrollTop, messages.scrollHeight);
 });
 
+test('automatic scroll adjustments do not cancel bottom following', async () => {
+  const { api, pending, messages, resize } = harness(true);
+  const loading = api.loadHistory();
+  pending[0].resolve({ items: [item('a'), item('b'), item('c'), item('d')] });
+  await loading;
+  messages.scrollTop -= 150;
+  messages.dispatch('scroll');
+  messages.extraHeight += 150;
+  resize();
+  assert.equal(messages.scrollTop, messages.scrollHeight);
+});
+
+test('a late automatic scroll is corrected even without another resize', async () => {
+  const { api, pending, messages, flushFrames } = harness(true);
+  const loading = api.loadHistory();
+  pending[0].resolve({ items: [item('a'), item('b'), item('c'), item('d')] });
+  await loading;
+  flushFrames();
+  messages.scrollTop = 20;
+  messages.dispatch('scroll');
+  api.receiveHistoryMessage(item('late-live'));
+  flushFrames();
+  assert.equal(messages.scrollTop, messages.scrollHeight);
+});
+
+for (const interaction of ['touchmove', 'pointerdown', 'keydown']) {
+  test(`${interaction} preserves reading position through resize and live messages`, async () => {
+    const { api, pending, messages, resize } = harness(true);
+    const loading = api.loadHistory();
+    pending[0].resolve({ items: [item('a'), item('b'), item('c'), item('d')] });
+    await loading;
+    messages.dispatch(interaction, { key: 'PageUp', target: messages });
+    messages.scrollTop = 20;
+    messages.dispatch('scroll');
+    api.receiveHistoryMessage(item('late-live'));
+    messages.extraHeight = 600;
+    resize();
+    assert.equal(messages.scrollTop, 20);
+  });
+}
+
 test('manual upward scrolling disables late-layout following', async () => {
   const { api, pending, messages, resize } = harness(true);
   const loading = api.loadHistory();
   pending[0].resolve({ items: [item('a'), item('b'), item('c'), item('d')] });
   await loading;
+  messages.dispatch('wheel', { deltaY: -100 });
   messages.scrollTop = 20;
   messages.dispatch('scroll');
   messages.extraHeight = 600;

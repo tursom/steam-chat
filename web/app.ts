@@ -249,7 +249,7 @@ let historyAt = '';
 let historyBusy = false;
 let historyDetached = false;
 let historyLive: MessageItem[] = [];
-let historyScroll: { dispose: () => void } | null = null;
+let historyScroll: { dispose: () => void; following: () => boolean } | null = null;
 const pendingImageReaders = new Set<FileReader>();
 type ImageDraft = { id: number; context: string; peerId: string; file: File; url: string };
 const imageDrafts = new Map<number, ImageDraft>();
@@ -2113,7 +2113,8 @@ function receiveHistoryMessage(item: MessageItem) {
   historyItems.push(item);
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages) return;
-  const atBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48;
+  const atBottom = historyScroll ? historyScroll.following()
+    : messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48;
   messages.querySelector('.thread-empty')?.remove();
   messages.append(renderMessage(item));
   if (atBottom) followHistoryBottom(messages);
@@ -2128,34 +2129,58 @@ function followHistoryBottom(messages: HTMLElement) {
 function watchHistoryLayout(messages: HTMLElement, follow: boolean) {
   historyScroll?.dispose();
   if (typeof ResizeObserver === 'undefined') return;
-  let top = messages.scrollTop;
-  const onScroll = () => {
-    const next = messages.scrollTop;
-    if (messages.scrollHeight - next - messages.clientHeight < 2) follow = !historyDetached;
-    else if (next < top) follow = false;
-    top = next;
+  let frame = 0;
+  const setFollowing = (value: boolean) => {
+    follow = value && !historyDetached;
+    messages.dataset.followBottom = String(follow);
   };
-  const onWheel = (event: WheelEvent) => { if (event.deltaY < 0) follow = false; };
-  // Observe rows as well as the viewport: late images change content height,
-  // while opening the mobile thread changes the viewport from zero height.
+  setFollowing(follow);
+  const settle = () => {
+    if (!follow || frame) return;
+    frame = requestAnimationFrame(() => {
+      frame = 0;
+      if (!messages.isConnected) { dispose(); return; }
+      if (follow && !historyDetached && messages.clientHeight > 0) messages.scrollTop = messages.scrollHeight;
+    });
+  };
+  const onScroll = () => {
+    if (messages.scrollHeight - messages.scrollTop - messages.clientHeight < 2) setFollowing(true);
+    else settle();
+  };
+  const onWheel = (event: WheelEvent) => { if (event.deltaY < 0) setFollowing(false); };
+  const onTouchMove = () => setFollowing(false);
+  const onPointerDown = (event: PointerEvent) => {
+    if (event.target === messages) setFollowing(false);
+  };
+  const onKeyDown = (event: KeyboardEvent) => {
+    if (['ArrowUp', 'PageUp', 'Home'].includes(event.key)) setFollowing(false);
+  };
+  // Browser scroll anchoring and layout changes are not user scroll intent.
+  // Settle after layout, and disable following only on actual interaction.
   const observer = new ResizeObserver(() => {
     if (!messages.isConnected) { dispose(); return; }
-    if (follow && !historyDetached && messages.clientHeight > 0) {
-      messages.scrollTop = messages.scrollHeight;
-      top = messages.scrollTop;
-    }
+    settle();
   });
   const dispose = () => {
     observer.disconnect();
+    if (frame) cancelAnimationFrame(frame);
     messages.removeEventListener('scroll', onScroll);
     messages.removeEventListener('wheel', onWheel);
+    messages.removeEventListener('touchmove', onTouchMove);
+    messages.removeEventListener('pointerdown', onPointerDown);
+    messages.removeEventListener('keydown', onKeyDown);
+    delete messages.dataset.followBottom;
     if (historyScroll?.dispose === dispose) historyScroll = null;
   };
-  historyScroll = { dispose };
+  historyScroll = { dispose, following: () => follow };
   messages.addEventListener('scroll', onScroll, { passive: true });
   messages.addEventListener('wheel', onWheel, { passive: true });
+  messages.addEventListener('touchmove', onTouchMove, { passive: true });
+  messages.addEventListener('pointerdown', onPointerDown, { passive: true });
+  messages.addEventListener('keydown', onKeyDown);
   observer.observe(messages);
   for (const row of Array.from(messages.children)) observer.observe(row);
+  settle();
 }
 
 function renderHistory(items: MessageItem[]) {

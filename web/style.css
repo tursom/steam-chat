@@ -1277,6 +1277,10 @@ dl.friend-facts {
   overscroll-behavior: contain;
 }
 
+.messages[data-follow-bottom="true"] {
+  overflow-anchor: none;
+}
+
 .thread-empty {
   display: grid;
   min-height: 100%;
