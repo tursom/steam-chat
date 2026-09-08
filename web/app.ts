@@ -249,6 +249,7 @@ let historyAt = '';
 let historyBusy = false;
 let historyDetached = false;
 let historyLive: MessageItem[] = [];
+let historyScroll: { dispose: () => void } | null = null;
 const pendingImageReaders = new Set<FileReader>();
 type ImageDraft = { id: number; context: string; peerId: string; file: File; url: string };
 const imageDrafts = new Map<number, ImageDraft>();
@@ -537,6 +538,7 @@ function formValue(form: HTMLFormElement, name: string): string {
 }
 
 function authPage(title: string, subtitle: string, form: HTMLElement) {
+  historyScroll?.dispose();
   invalidateChat();
   stopStatusPolling();
   stopWebSocket();
@@ -615,6 +617,7 @@ function panel(title: string, className = '') {
 }
 
 function renderShell() {
+  historyScroll?.dispose();
   if (!state.me) {
     renderLogin();
     return;
@@ -1850,7 +1853,11 @@ function openConversation(id: unknown, name = '') {
   if (head) renderThreadHeader(head);
   syncFriendDetails();
   updateChatAvailability();
-  if (!alreadyActive) void loadHistory();
+  if (!alreadyActive || historyDetached) void loadHistory();
+  else {
+    const messages = document.querySelector<HTMLElement>('#messages');
+    if (messages) followHistoryBottom(messages);
+  }
 }
 
 function showChatList() {
@@ -2048,6 +2055,7 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
         messages.scrollTop = top;
         historyAfter = pageCursor(payload, 'previousCursor');
       }
+      watchHistoryLayout(messages, false);
     } else {
       historyDetached = mode === 'date';
       historyAt = mode === 'date' ? date : '';
@@ -2108,7 +2116,46 @@ function receiveHistoryMessage(item: MessageItem) {
   const atBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48;
   messages.querySelector('.thread-empty')?.remove();
   messages.append(renderMessage(item));
-  if (atBottom) messages.scrollTop = messages.scrollHeight;
+  if (atBottom) followHistoryBottom(messages);
+  else watchHistoryLayout(messages, false);
+}
+
+function followHistoryBottom(messages: HTMLElement) {
+  messages.scrollTop = messages.scrollHeight;
+  watchHistoryLayout(messages, true);
+}
+
+function watchHistoryLayout(messages: HTMLElement, follow: boolean) {
+  historyScroll?.dispose();
+  if (typeof ResizeObserver === 'undefined') return;
+  let top = messages.scrollTop;
+  const onScroll = () => {
+    const next = messages.scrollTop;
+    if (messages.scrollHeight - next - messages.clientHeight < 2) follow = !historyDetached;
+    else if (next < top) follow = false;
+    top = next;
+  };
+  const onWheel = (event: WheelEvent) => { if (event.deltaY < 0) follow = false; };
+  // Observe rows as well as the viewport: late images change content height,
+  // while opening the mobile thread changes the viewport from zero height.
+  const observer = new ResizeObserver(() => {
+    if (!messages.isConnected) { dispose(); return; }
+    if (follow && !historyDetached && messages.clientHeight > 0) {
+      messages.scrollTop = messages.scrollHeight;
+      top = messages.scrollTop;
+    }
+  });
+  const dispose = () => {
+    observer.disconnect();
+    messages.removeEventListener('scroll', onScroll);
+    messages.removeEventListener('wheel', onWheel);
+    if (historyScroll?.dispose === dispose) historyScroll = null;
+  };
+  historyScroll = { dispose };
+  messages.addEventListener('scroll', onScroll, { passive: true });
+  messages.addEventListener('wheel', onWheel, { passive: true });
+  observer.observe(messages);
+  for (const row of Array.from(messages.children)) observer.observe(row);
 }
 
 function renderHistory(items: MessageItem[]) {
@@ -2119,10 +2166,11 @@ function renderHistory(items: MessageItem[]) {
     const empty = create('div', 'thread-empty');
     empty.append(create('strong', '', state.activeId ? '暂无消息' : '未选择会话'));
     messages.append(empty);
-    return;
+  } else {
+    for (const item of items) messages.append(renderMessage(item));
   }
-  for (const item of items) messages.append(renderMessage(item));
-  messages.scrollTop = messages.scrollHeight;
+  if (historyDetached) watchHistoryLayout(messages, false);
+  else followHistoryBottom(messages);
 }
 
 function renderMessage(item: MessageItem) {

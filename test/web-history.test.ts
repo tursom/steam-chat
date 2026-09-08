@@ -13,25 +13,41 @@ class Element {
   hidden = false;
   disabled = false;
   value = '';
-  get scrollHeight() { return this.children.length * 50; }
+  isConnected = true;
+  extraHeight = 0;
+  listeners = new Map<string, Set<() => void>>();
+  get scrollHeight() { return this.children.length * 50 + this.extraHeight; }
   append(...nodes: Element[]) { this.children.push(...nodes); }
   prepend(...nodes: Element[]) { this.children.unshift(...nodes); }
   replaceChildren(...nodes: Element[]) { this.children = nodes; }
   querySelector(): null { return null; }
   removeAttribute() {}
   setAttribute() {}
-  addEventListener() {}
+  addEventListener(name: string, listener: () => void) {
+    if (!this.listeners.has(name)) this.listeners.set(name, new Set());
+    this.listeners.get(name)!.add(listener);
+  }
+  removeEventListener(name: string, listener: () => void) { this.listeners.get(name)?.delete(listener); }
+  dispatch(name: string) { for (const listener of this.listeners.get(name) || []) listener(); }
 }
 
 type Item = { id: string; eventId: string; message: string; echo?: boolean; name?: string; sentAt?: string; steamAccountId?: string; type?: string };
 type Pending = { url: URL; resolve: (value: unknown) => void; reject: (error: Error) => void };
-function harness() {
+function harness(withLayout = false) {
+  const observers: Array<{ active: boolean; callback: () => void }> = [];
+  class LayoutObserver {
+    active = true;
+    constructor(readonly callback: () => void) { observers.push(this); }
+    observe() {}
+    disconnect() { this.active = false; }
+  }
   const source = readFileSync(resolve(__dirname, '../web/app.js'), 'utf8');
   const nodes: Record<string, Element> = { '#app': new Element(), '#chatListSections': new Element(), '#messageInput': new Element(), '#messages': new Element(), '#historyOlder': new Element(), '#storageHealth': new Element() };
   const pending: Pending[] = [];
   const sandbox = {
     document: { querySelector: (id: string) => nodes[id] || null, querySelectorAll: (): Element[] => [], addEventListener() {}, createElement: () => new Element() },
     localStorage: { getItem: (): null => null, setItem() {} },
+    ...(withLayout ? { ResizeObserver: LayoutObserver } : {}),
     URL, URLSearchParams, Headers, console,
     setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
     fetch: (url: string) => new Promise((resolve, reject) => pending.push({ url: new URL(url, 'http://test'), resolve: (payload) => resolve({ ok: true, json: async () => payload }), reject })),
@@ -63,9 +79,54 @@ function harness() {
     detached: () => boolean;
     busy: () => boolean;
   };
-  return { api, pending, messages: nodes['#messages'], nodes };
+  return { api, pending, messages: nodes['#messages'], nodes,
+    resize: () => { for (const observer of [...observers]) if (observer.active) observer.callback(); } };
 }
 const item = (eventId: string, id = 'peer'): Item => ({ id, eventId, message: eventId });
+
+test('latest history follows late row growth and a newly visible viewport', async () => {
+  const { api, pending, messages, resize } = harness(true);
+  messages.clientHeight = 0;
+  const loading = api.loadHistory();
+  pending[0].resolve({ items: [item('a'), item('b'), item('c')] });
+  await loading;
+  messages.scrollTop = 0;
+  messages.clientHeight = 100;
+  resize();
+  assert.equal(messages.scrollTop, messages.scrollHeight);
+  messages.extraHeight = 600;
+  resize();
+  assert.equal(messages.scrollTop, messages.scrollHeight);
+});
+
+test('manual upward scrolling disables late-layout following', async () => {
+  const { api, pending, messages, resize } = harness(true);
+  const loading = api.loadHistory();
+  pending[0].resolve({ items: [item('a'), item('b'), item('c'), item('d')] });
+  await loading;
+  messages.scrollTop = 20;
+  messages.dispatch('scroll');
+  messages.extraHeight = 600;
+  resize();
+  assert.equal(messages.scrollTop, 20);
+});
+
+test('date history and older pagination do not jump to bottom on image resize', async () => {
+  const { api, pending, messages, resize } = harness(true);
+  const loading = api.loadHistory('date', '2026-01-02T13:45');
+  pending[0].resolve({ items: [item('a'), item('b')], nextCursor: 'older' });
+  await loading;
+  messages.extraHeight = 400;
+  resize();
+  assert.equal(messages.scrollTop, 0);
+  const older = api.loadHistory('older');
+  pending[1].resolve({ items: [item('past')] });
+  await older;
+  const top = messages.scrollTop;
+  messages.extraHeight += 400;
+  resize();
+  assert.equal(messages.scrollTop, top);
+});
 
 test('a newly sent message immediately adds its friend to recent conversations', () => {
   const { api, nodes } = harness();
