@@ -250,6 +250,14 @@ let historyBusy = false;
 let historyDetached = false;
 let historyLive: MessageItem[] = [];
 const pendingImageReaders = new Set<FileReader>();
+type ImageDraft = { id: number; context: string; peerId: string; file: File; url: string };
+const imageDrafts = new Map<number, ImageDraft>();
+const composerSending = new Set<string>();
+let imageDraftId = 0;
+type ImageTransferStage = 'reading' | 'uploading' | 'processing' | 'sent' | 'failed' | 'cancelled' | 'unknown';
+type ImageTransfer = { id: number; context: string; peerId: string; name: string; stage: ImageTransferStage; percent: number | null; error?: string };
+const imageTransfers = new Map<number, ImageTransfer>();
+let imageTransferId = 0;
 let conversationsBefore = '';
 let conversationsBusy = false;
 const recentConversationUpdates = new Map<string, ListEntry>();
@@ -262,6 +270,8 @@ function chatContext() {
 function resetHistory() {
   for (const reader of pendingImageReaders) reader.abort();
   pendingImageReaders.clear();
+  renderImageTransfers();
+  renderImageDrafts();
   historyRequest += 1;
   historyItems = [];
   historyLive = [];
@@ -278,6 +288,8 @@ function invalidateChat() {
   conversationsBefore = '';
   conversationsBusy = false;
   recentConversationUpdates.clear();
+  imageTransfers.clear();
+  clearImageDrafts();
   storageHealth = null;
   resetHistory();
   updateStorageHealth();
@@ -471,15 +483,13 @@ function updateSteamStatus(status: SteamStatus) {
   }
 }
 
-async function api(path: string, options: RequestInit = {}): Promise<unknown> {
+async function api(path: string, options: RequestInit = {}, onUploadProgress?: (percent: number | null) => void): Promise<unknown> {
   const headers = new Headers(options.headers || {});
   headers.set('Accept', 'application/json');
   if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-  const response = await fetch(path, {
-    ...options,
-    headers,
-    credentials: 'same-origin'
-  });
+  const response = onUploadProgress
+    ? await uploadRequest(path, { ...options, headers }, onUploadProgress)
+    : await fetch(path, { ...options, headers, credentials: 'same-origin' });
   const payload: unknown = await response.json().catch((): null => null);
   if (!response.ok) {
     if (response.status === 401 && !path.startsWith('/api/auth/me') && !path.startsWith('/api/auth/login')) {
@@ -492,6 +502,26 @@ async function api(path: string, options: RequestInit = {}): Promise<unknown> {
     throw new Error(isRecord(payload) && typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`);
   }
   return payload;
+}
+
+function uploadRequest(path: string, options: RequestInit, onProgress: (percent: number | null) => void): Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }> {
+  return new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open(options.method || 'POST', path, true);
+    xhr.timeout = 120000;
+    xhr.withCredentials = true;
+    new Headers(options.headers || {}).forEach((value, name) => xhr.setRequestHeader(name, value));
+    xhr.upload.onprogress = (event) => onProgress(event.lengthComputable && event.total > 0 ? Math.min(99, Math.floor(event.loaded / event.total * 100)) : null);
+    xhr.upload.onload = () => onProgress(100);
+    xhr.onload = () => resolve({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status,
+      json: async () => JSON.parse(xhr.responseText) });
+    const uncertain = () => reject(Object.assign(new Error('发送结果未确认，请先检查聊天记录。'), { uncertain: true }));
+    xhr.onerror = uncertain;
+    xhr.ontimeout = uncertain;
+    xhr.onabort = uncertain;
+    if (typeof options.body !== 'string') { reject(new Error('Invalid image upload body')); return; }
+    xhr.send(options.body);
+  });
 }
 
 function jsonBody(body: Record<string, unknown>): RequestInit {
@@ -1672,20 +1702,28 @@ function renderComposer() {
   input.addEventListener('paste', handleImagePaste);
   input.addEventListener('input', () => resizeComposerInput(input));
   input.addEventListener('keydown', (event) => {
-    if (event.key === 'Enter' && !event.shiftKey) {
+    if (event.key === 'Enter' && !event.shiftKey && !event.isComposing) {
       event.preventDefault();
-      void sendText();
+      void sendComposer();
     }
   });
   const send = chatIconButton('send', '发送消息', 'send-btn');
   send.id = 'sendButton';
-  send.addEventListener('click', () => sendText());
+  send.addEventListener('click', () => void sendComposer());
   const tools = create('div', 'composer-tools');
   tools.append(pickerButton, attachment);
-  row.append(input, tools, send);
-  shell.append(disabledNote, picker, row);
+  const drafts = create('div', 'image-drafts');
+  drafts.id = 'imageDrafts';
+  drafts.setAttribute('aria-label', '待发送图片');
+  row.append(drafts, input, tools, send);
+  renderImageDrafts(drafts);
+  const transfers = create('div', 'image-transfers');
+  transfers.id = 'imageTransfers';
+  transfers.setAttribute('aria-label', '图片发送进度');
+  renderImageTransfers(transfers);
+  shell.append(disabledNote, picker, transfers, row);
   shell.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>('button, input, textarea').forEach((node) => {
-    node.dataset.chatControl = '';
+    if (!['image-transfer-dismiss', 'image-draft-remove', 'image-draft-preview'].includes(node.className)) node.dataset.chatControl = '';
   });
   return shell;
 }
@@ -1732,6 +1770,8 @@ function updateChatAvailability() {
   document.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>('[data-chat-control]').forEach((node) => {
     node.disabled = disabled;
   });
+  const send = document.querySelector<HTMLButtonElement>('#sendButton');
+  if (send) send.disabled = disabled || composerSending.has(`${chatContext()}|${state.activeId}`);
   const note = document.querySelector<HTMLElement>('#offlineNote');
   if (note) {
     note.textContent = !steamOnline() ? 'Steam 未在线，聊天发送和素材操作不可用。' : '当前账号未被授权访问活动 Steam 账户。';
@@ -2493,41 +2533,203 @@ function activeIdOrWarn() {
   return '';
 }
 
-async function sendText() {
+async function sendText(): Promise<boolean> {
   const id = activeIdOrWarn();
   const input = document.querySelector<HTMLTextAreaElement>('#messageInput');
-  const msg = input?.value.trim() || '';
-  if (!id || !msg) return;
+  const draft = input?.value || '';
+  const msg = draft.trim();
+  if (!id || !msg) return false;
   const context = chatContext();
   try {
     const response = await api('/message', jsonBody({ id, msg }));
-    if (context !== chatContext() || id !== state.activeId) return;
+    if (!isRecord(response) || response.ok !== true) throw new Error('文字发送结果未确认，请先检查聊天记录。');
+    if (context !== chatContext() || id !== state.activeId) return true;
     if (isRecord(response)) for (const item of asMessages([response.item])) receiveHistoryMessage(item);
-    if (input) {
+    if (input && input.value === draft) {
       input.value = '';
       resizeComposerInput(input);
     }
     await loadHistory();
-    setFeedback('已发送', 'ok');
+    if (context === chatContext() && id === state.activeId) setFeedback('已发送', 'ok');
+    return true;
   } catch (error) {
-    setFeedback(errorMessage(error), 'error');
+    if (context === chatContext() && id === state.activeId) setFeedback(errorMessage(error), 'error');
+    return false;
   }
 }
 
-async function sendImage(payload: Record<string, string>) {
+function getImageDrafts(): ImageDraft[] {
+  return [...imageDrafts.values()].filter(item => item.context === chatContext() && item.peerId === state.activeId);
+}
+
+function releaseImageDraft(draft: ImageDraft) {
+  const image = document.querySelector<HTMLImageElement>('#lightboxImage');
+  if (image?.src === draft.url) {
+    image.src = '';
+    const box = document.querySelector<HTMLElement>('#lightbox');
+    if (box) box.hidden = true;
+  }
+  URL.revokeObjectURL(draft.url);
+}
+
+function removeImageDraft(id: number) {
+  const draft = imageDrafts.get(id);
+  if (!draft) return;
+  releaseImageDraft(draft);
+  imageDrafts.delete(id);
+  renderImageDrafts();
+}
+
+function clearImageDrafts() {
+  for (const draft of imageDrafts.values()) releaseImageDraft(draft);
+  imageDrafts.clear();
+  renderImageDrafts();
+}
+
+function renderImageDrafts(container = document.querySelector<HTMLElement>('#imageDrafts')) {
+  if (!container) return;
+  const drafts = getImageDrafts();
+  clear(container);
+  container.hidden = !drafts.length;
+  container.parentElement?.classList.toggle('has-image-drafts', Boolean(drafts.length));
+  for (const draft of drafts) {
+    const item = create('div', 'image-draft');
+    item.dataset.draftId = String(draft.id);
+    const name = draft.file.name || '剪贴板图片';
+    const preview = create('button', 'image-draft-preview');
+    preview.type = 'button';
+    preview.title = `预览 ${name}`;
+    preview.setAttribute('aria-label', `预览 ${name}`);
+    const image = create('img');
+    image.src = draft.url;
+    image.alt = name;
+    preview.append(image);
+    preview.addEventListener('click', () => openLightbox(draft.url));
+    const remove = chatIconButton('x', `移除 ${name}`, 'image-draft-remove');
+    remove.addEventListener('click', () => removeImageDraft(draft.id));
+    item.append(preview, remove);
+    container.append(item);
+  }
+}
+
+function queueImageDrafts(files: File[]) {
+  if (!canSendImages()) return;
+  for (const file of files) {
+    if (!file.type.startsWith('image/')) continue;
+    if (!file.size || file.size > 7 * 1024 * 1024) {
+      setFeedback(file.size ? '图片不能超过 7 MiB。' : '不能添加空图片。', 'warn');
+      continue;
+    }
+    if (getImageDrafts().length >= 10) { setFeedback('每个会话最多保留 10 张待发送图片。', 'warn'); break; }
+    const bytes = [...imageDrafts.values()].reduce((total, item) => total + item.file.size, 0);
+    if (bytes + file.size > 32 * 1024 * 1024) { setFeedback('待发送图片总大小不能超过 32 MiB。', 'warn'); continue; }
+    try {
+      const url = URL.createObjectURL(file);
+      const draft: ImageDraft = { id: ++imageDraftId, context: chatContext(), peerId: state.activeId, file, url };
+      imageDrafts.set(draft.id, draft);
+    } catch (_) { setFeedback('无法读取粘贴的图片', 'error'); }
+  }
+  renderImageDrafts();
+}
+
+async function sendComposer() {
+  if (!canSendImages()) return;
+  const context = chatContext();
+  const peerId = state.activeId;
+  const key = `${context}|${peerId}`;
+  if (composerSending.has(key)) return;
+  const drafts = getImageDrafts();
+  const text = document.querySelector<HTMLTextAreaElement>('#messageInput')?.value.trim();
+  if (!text && !drafts.length) return;
+  composerSending.add(key);
+  updateChatAvailability();
+  try {
+    if (text && !(await sendText())) return;
+    if (context !== chatContext() || peerId !== state.activeId || !canSendImages()) return;
+    const selected = drafts.filter(item => imageDrafts.has(item.id));
+    for (const item of selected) removeImageDraft(item.id);
+    sendFiles(selected.map(item => item.file));
+  } finally {
+    composerSending.delete(key);
+    updateChatAvailability();
+  }
+}
+
+function createImageTransfer(name: string, stage: ImageTransferStage): ImageTransfer {
+  const completed = [...imageTransfers.values()].filter(item => ['sent', 'failed', 'cancelled', 'unknown'].includes(item.stage));
+  for (const item of completed.slice(0, Math.max(0, completed.length - 19))) imageTransfers.delete(item.id);
+  const transfer: ImageTransfer = { id: ++imageTransferId, context: chatContext(), peerId: state.activeId,
+    name, stage, percent: stage === 'reading' || stage === 'uploading' ? 0 : null };
+  imageTransfers.set(transfer.id, transfer);
+  renderImageTransfers();
+  return transfer;
+}
+
+function updateImageTransfer(transfer: ImageTransfer, stage: ImageTransferStage, percent: number | null = null, error?: string) {
+  if (!imageTransfers.has(transfer.id)) return;
+  transfer.stage = stage; transfer.percent = percent; transfer.error = error;
+  renderImageTransfers();
+  if (stage === 'sent') setTimeout(() => {
+    if (imageTransfers.get(transfer.id)?.stage === 'sent') { imageTransfers.delete(transfer.id); renderImageTransfers(); }
+  }, 5000);
+}
+
+function renderImageTransfers(container = document.querySelector<HTMLElement>('#imageTransfers')) {
+  if (!container) return;
+  const transfers = [...imageTransfers.values()].filter(item => item.context === chatContext() && item.peerId === state.activeId);
+  clear(container);
+  container.hidden = !transfers.length;
+  const labels: Record<ImageTransferStage, string> = { reading: '读取图片', uploading: '上传到服务器', processing: '等待 Steam 处理', sent: '已发送', failed: '发送失败', cancelled: '已取消读取', unknown: '结果未确认' };
+  for (const transfer of transfers) {
+    const row = create('div', 'image-transfer');
+    row.dataset.transferId = String(transfer.id);
+    row.dataset.stage = transfer.stage;
+    const name = create('span', 'image-transfer-name', transfer.name);
+    name.title = transfer.name;
+    const determinate = transfer.percent !== null && ['reading', 'uploading', 'sent'].includes(transfer.stage);
+    const status = create('span', 'image-transfer-status', labels[transfer.stage] + (determinate && transfer.stage !== 'sent' ? ` ${transfer.percent}%` : ''));
+    const progress = create('progress', 'image-transfer-progress');
+    progress.max = 100;
+    progress.setAttribute('aria-label', `${transfer.name}：${labels[transfer.stage]}`);
+    if (determinate) progress.value = transfer.percent;
+    else progress.removeAttribute('value');
+    const finished = ['sent', 'failed', 'cancelled', 'unknown'].includes(transfer.stage);
+    if (finished && transfer.stage !== 'sent') progress.hidden = true;
+    const dismiss = chatIconButton('x', '关闭发送状态', 'image-transfer-dismiss');
+    dismiss.hidden = !finished;
+    dismiss.addEventListener('click', () => { imageTransfers.delete(transfer.id); renderImageTransfers(); });
+    row.append(name, status, progress, dismiss);
+    if (transfer.error) row.append(create('span', 'image-transfer-error', transfer.error));
+    container.append(row);
+  }
+}
+
+async function sendImage(payload: Record<string, string>, existing?: ImageTransfer) {
   const id = activeIdOrWarn();
   if (!id) return;
   const context = chatContext();
+  const current = () => context === chatContext() && id === state.activeId && state.view === 'chat';
   const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId;
+  const transfer = existing || createImageTransfer(payload.url ? '图片 URL' : '图片', payload.img ? 'uploading' : 'processing');
+  updateImageTransfer(transfer, payload.img ? 'uploading' : 'processing', payload.img ? 0 : null);
+  let response: unknown;
   try {
-    const response = await api('/image', jsonBody({ id, ...payload, ...(steamAccountId ? { steamAccountId } : {}) }));
-    if (context !== chatContext() || id !== state.activeId) return;
-    if (isRecord(response)) for (const item of asMessages([response.item])) receiveHistoryMessage(item);
-    await loadHistory();
-    setFeedback('图片已发送', 'ok');
+    response = await api('/image', jsonBody({ id, ...payload, ...(steamAccountId ? { steamAccountId } : {}) }), (percent) => {
+      if (payload.img && percent !== 100) updateImageTransfer(transfer, 'uploading', percent);
+      else updateImageTransfer(transfer, 'processing');
+    });
+    if (!isRecord(response) || response.ok !== true) throw Object.assign(new Error('发送结果未确认，请先检查聊天记录。'), { uncertain: true });
   } catch (error) {
-    setFeedback(errorMessage(error), 'error');
+    const message = errorMessage(error);
+    updateImageTransfer(transfer, isRecord(error) && error.uncertain ? 'unknown' : 'failed', null, message);
+    if (current()) setFeedback(message, 'error');
+    return;
   }
+  updateImageTransfer(transfer, 'sent', 100);
+  if (!current()) return;
+  if (isRecord(response)) for (const item of asMessages([response.item])) receiveHistoryMessage(item);
+  await loadHistory();
+  if (current()) setFeedback('图片已发送', 'ok');
 }
 
 function canSendImages() {
@@ -2545,7 +2747,7 @@ function handleImagePaste(event: ClipboardEvent) {
   const files = images.length ? images : Array.from(clipboard.files || []).filter((file) => file.type.startsWith('image/'));
   if (!files.length) return;
   event.preventDefault();
-  sendFiles(files);
+  queueImageDrafts(files);
 }
 
 function sendFiles(files: FileList | File[] | null) {
@@ -2554,25 +2756,34 @@ function sendFiles(files: FileList | File[] | null) {
   const target = state.activeId;
   const current = () => context === chatContext() && target === state.activeId && canSendImages();
   for (const file of Array.from(files).filter((file) => file.type.startsWith('image/'))) {
+    const transfer = createImageTransfer(file.name || '剪贴板图片', 'reading');
     // Base64 plus JSON must fit the server's 10 MiB request body limit.
     if (!file.size || file.size > 7 * 1024 * 1024) {
-      setFeedback(file.size ? '图片不能超过 7 MiB。' : '不能发送空图片。', 'warn');
+      const message = file.size ? '图片不能超过 7 MiB。' : '不能发送空图片。';
+      updateImageTransfer(transfer, 'failed', null, message);
+      setFeedback(message, 'warn');
       continue;
     }
     const reader = new FileReader();
     pendingImageReaders.add(reader);
+    reader.onprogress = (event) => {
+      if (pendingImageReaders.has(reader)) updateImageTransfer(transfer, 'reading', event.lengthComputable && event.total > 0 ? Math.floor(event.loaded / event.total * 100) : null);
+    };
     reader.onload = () => {
       if (!pendingImageReaders.delete(reader)) return;
-      if (current() && typeof reader.result === 'string') void sendImage({ img: reader.result });
+      if (current() && typeof reader.result === 'string') void sendImage({ img: reader.result }, transfer);
+      else updateImageTransfer(transfer, 'cancelled');
     };
     reader.onerror = () => {
-      pendingImageReaders.delete(reader);
+      if (!pendingImageReaders.delete(reader)) return;
+      updateImageTransfer(transfer, 'failed', null, '读取图片失败');
       if (current()) setFeedback('读取图片失败', 'error');
     };
-    reader.onabort = () => pendingImageReaders.delete(reader);
+    reader.onabort = () => { pendingImageReaders.delete(reader); updateImageTransfer(transfer, 'cancelled'); };
     try { reader.readAsDataURL(file); }
     catch (_) {
       pendingImageReaders.delete(reader);
+      updateImageTransfer(transfer, 'failed', null, '读取图片失败');
       if (current()) setFeedback('读取图片失败', 'error');
     }
   }

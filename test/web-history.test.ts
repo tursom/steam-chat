@@ -18,6 +18,7 @@ class Element {
   prepend(...nodes: Element[]) { this.children.unshift(...nodes); }
   replaceChildren(...nodes: Element[]) { this.children = nodes; }
   querySelector(): null { return null; }
+  removeAttribute() {}
   setAttribute() {}
   addEventListener() {}
 }
@@ -37,6 +38,7 @@ function harness() {
     __test: undefined as unknown
   };
   runInNewContext(`${source.slice(0, source.lastIndexOf('bootstrap().catch'))}
+    uploadRequest = (path, options) => fetch(path, options);
     renderMessage = (item) => { const row = document.createElement('article'); row.dataset.eventId = item.eventId; return row; };
     state.me = {id: 1}; state.activeId = 'peer'; state.steam.accessAllowed = true;
     resizeComposerInput = () => {};
@@ -45,7 +47,7 @@ function harness() {
       switchPeer: (id) => { state.activeId = id; resetHistory(); },
       detached: () => historyDetached, busy: () => historyBusy};`, sandbox);
   const api = sandbox.__test as {
-    sendText: () => Promise<void>;
+    sendText: () => Promise<boolean>;
     sendImage: (payload: Record<string, string>) => Promise<void>;
     loadHistory: (mode?: string, date?: string) => Promise<void>;
     loadConversations: (more?: boolean) => Promise<void>;
@@ -86,10 +88,22 @@ for (const kind of ['text', 'image'] as const) {
     assert.deepEqual(Array.from(api.state.conversations, entry => entry.id), ['peer']);
     assert.equal(api.state.conversations[0].preview, kind === 'text' ? 'sent' : '[图片]');
     pending[1].resolve({ items: [] });
-    await sending;
+    const result = await sending;
+    if (kind === 'text') assert.equal(result, true);
     assert.equal(api.state.conversations.length, 1);
   });
 }
+
+test('sendText returns false for empty input and failed requests, retaining failed text', async () => {
+  const { api, pending, nodes } = harness();
+  assert.equal(await api.sendText(), false);
+  assert.equal(pending.length, 0);
+  nodes['#messageInput'].value = 'retry this';
+  const sending = api.sendText();
+  pending[0].reject(new Error('send failed'));
+  assert.equal(await sending, false);
+  assert.equal(nodes['#messageInput'].value, 'retry this');
+});
 
 test('recent conversations update for other peers, move to the top and ignore older events', () => {
   const { api } = harness();
