@@ -3,6 +3,8 @@ import * as path from 'node:path';
 import type { ConversationSummary, HistoryItem, HistoryRecordInput, LoggerLike } from '../types';
 import { normalizeStoredMessage, type StoredMessage } from './history-message';
 
+export type SyncQuery = { steamAccountId: string; cursor?: string; limit?: number };
+export type SyncPage = { items: Array<HistoryItem & { syncId: string }>; nextCursor: string; hasMore: boolean; steamAccountId: string };
 export type HistoryQuery = { steamAccountId: string; id: string; limit?: number; before?: string; after?: string; at?: number };
 export type ConversationQuery = { steamAccountId: string; limit?: number; before?: string };
 export type HistoryPage = { items: HistoryItem[]; nextCursor?: string; previousCursor?: string };
@@ -11,6 +13,8 @@ export type LaneStatus = { state: string; queued: number; queuedBytes?: number; 
 export type StorageStatus = { jsonl: LaneStatus; rocksdb: LaneStatus };
 export interface HistoryStorage {
   append(input: HistoryRecordInput, options?: { notify?: boolean }): HistoryItem;
+  sync(options: SyncQuery): Promise<SyncPage>;
+  onDurable(listener: (item: HistoryItem) => void): () => void;
   history(options: HistoryQuery): Promise<HistoryPage>;
   conversations(options: ConversationQuery): Promise<ConversationPage>;
   status(): StorageStatus;
@@ -41,7 +45,7 @@ class WriterLane {
   private lastError?: string;
   private writeFailed = false;
   constructor(private kind: 'jsonl' | 'rocksdb', private filename: string, private options: Options,
-    private changed: () => void) { this.start(); }
+    private changed: () => void, private committed: (item: StoredMessage) => void = () => {}) { this.start(); }
 
   status(): LaneStatus {
     return { state: this.stopping ? 'closed' : !this.ready || this.writeFailed ? 'failed' : this.missed ? 'lagging' : 'healthy',
@@ -56,11 +60,11 @@ class WriterLane {
         stdio: ['ignore', 'ignore', 'inherit', 'ipc'], execArgv: []
       });
       this.child = child;
-      child.on('message', (message: { id: number; result?: unknown; error?: string; statusCode?: number }) => {
+      child.on('message', (message: { id: number; result?: unknown; error?: string; statusCode?: number; resetRequired?: boolean }) => {
         const call = this.pending.get(message.id);
         if (!call) return;
         this.pending.delete(message.id); clearTimeout(call.timer);
-        if (message.error) call.reject(Object.assign(new Error(message.error), { statusCode: message.statusCode || 503 }));
+        if (message.error) call.reject(Object.assign(new Error(message.error), { statusCode: message.statusCode || 503, resetRequired: message.resetRequired }));
         else call.resolve(message.result);
       });
       const failed = (error: Error) => {
@@ -89,7 +93,7 @@ class WriterLane {
     const child = this.child;
     if (!child?.connected) return Promise.reject(unavailable(`${this.kind} writer unavailable`));
     // Queries have their own admission ceiling; reserve room for durable writes and shutdown.
-    if ((method === 'history' || method === 'conversations') && this.pending.size >= 16) {
+    if ((method === 'history' || method === 'conversations' || method === 'sync') && this.pending.size >= 16) {
       return Promise.reject(unavailable('History query limit reached'));
     }
     return new Promise((resolve, reject) => {
@@ -128,6 +132,7 @@ class WriterLane {
         try {
           await this.rpc('append', job.item);
           this.queue.shift(); this.queuedBytes -= job.bytes; this.durable++; this.writeFailed = false; this.changed();
+          this.committed(job.item);
         } catch (error) {
           this.writeFailed = true;
           this.lastError = error instanceof Error ? error.message : String(error);
@@ -173,6 +178,7 @@ class WriterLane {
 export function createHistoryStorage(options: Options = {}): HistoryStorage {
   const { DATA_DIR } = require('../paths');
   const data: string = DATA_DIR;
+  const durableListeners = new Set<(item: HistoryItem) => void>();
   const messages = new Set<(item: HistoryItem) => void>();
   const listeners = new Set<(status: StorageStatus) => void>();
   const recent = new Map<string, { item: StoredMessage; expires: number; bytes: number; notified: boolean }>();
@@ -218,15 +224,21 @@ export function createHistoryStorage(options: Options = {}): HistoryStorage {
       }
       return result;
     },
+    sync: (query) => rocksdb.query('sync', query),
+    onDurable(listener) { durableListeners.add(listener); return () => durableListeners.delete(listener); },
     history: (query) => rocksdb.query('history', query),
     conversations: (query) => rocksdb.query('conversations', query),
     status: () => ({ jsonl: jsonl.status(), rocksdb: rocksdb.status() }),
     canSend: () => !closed && (jsonl.status().writable || rocksdb.status().writable),
     onMessage(listener) { messages.add(listener); return () => messages.delete(listener); },
     onStatus(listener) { listeners.add(listener); return () => listeners.delete(listener); },
-    async close() { closed = true; await Promise.all([jsonl.close(), rocksdb.close()]); listeners.clear(); messages.clear(); recent.clear(); recentBytes = 0; }
+    async close() { closed = true; await Promise.all([jsonl.close(), rocksdb.close()]); listeners.clear(); messages.clear(); durableListeners.clear(); recent.clear(); recentBytes = 0; }
   };
   jsonl = new WriterLane('jsonl', options.logPath || process.env.STEAM_CHAT_LOG_PATH || path.join(data, 'logs', 'chat.jsonl'), options, changed);
-  rocksdb = new WriterLane('rocksdb', options.dbPath || process.env.STEAM_CHAT_DB_PATH || path.join(data, 'chat.rocksdb'), options, changed);
+  rocksdb = new WriterLane('rocksdb', options.dbPath || process.env.STEAM_CHAT_DB_PATH || path.join(data, 'chat.rocksdb'), options, changed, (item) => {
+    for (const listener of durableListeners) {
+      try { listener(item); } catch (_) { options.logger?.warn?.('History durable listener failed'); }
+    }
+  });
   return storage;
 }

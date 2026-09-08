@@ -51,6 +51,13 @@ export function recentKey(account: string, time: number, peer: string): Buffer {
   return key;
 }
 
+export function syncKey(account: string, sequence: bigint): Buffer {
+  const key = Buffer.alloc(17);
+  accountPrefix(0x22, account).copy(key);
+  key.writeBigUInt64BE(uint64(sequence, 'sequence'), 9);
+  return key;
+}
+
 export function eventKey(eventId: string): Buffer {
   if (!/^[0-9a-f]{32}$/.test(eventId)) throw new Error('Invalid eventId');
   return Buffer.concat([Buffer.from([0x40]), Buffer.from(eventId, 'hex')]);

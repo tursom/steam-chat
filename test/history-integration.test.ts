@@ -27,6 +27,8 @@ function fakeStorage() {
       for (const listener of listeners) listener(item);
       return item;
     },
+    async sync(query) { return { items: [], nextCursor: 'next', hasMore: false, steamAccountId: query.steamAccountId }; },
+    onDurable() { return () => {}; },
     async history(query) { queries.push(query); return { items: records.map(normalizeHistoryItem), nextCursor: 'next' }; },
     async conversations(query) { queries.push(query); return { items: [], nextCursor: 'next' }; },
     status: () => health,

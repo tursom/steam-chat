@@ -295,6 +295,7 @@ function errorPayload(error: unknown): UnknownRecord {
   if (isRecord(error) && typeof error.steamStatus === 'string') {
     payload.steamStatus = error.steamStatus;
   }
+  if (isRecord(error) && error.resetRequired === true) payload.resetRequired = true;
   return payload;
 }
 
@@ -466,7 +467,7 @@ function createChatService(options: ChatServiceOptions = {}) {
   const steamLoginService = options.steamLoginService;
   const legacyAuth = createAuthChecker(config.auth);
   const clients = new Set<WsConnection>();
-  const wsSessions = new Map<WsConnection, AppSession | null>();
+  const wsRequests = new Map<WsConnection, IncomingMessage>();
   const recentSentText = new Map<string, number>();
   let disposeSteamEvents = () => {};
 
@@ -573,8 +574,17 @@ function createChatService(options: ChatServiceOptions = {}) {
     };
   }
 
+  function liveWsSession(ws: WsConnection): AppSession | null {
+    if (!sessionManager) return null;
+    const req = wsRequests.get(ws);
+    const session = req ? sessionManager.getSession(req) : null;
+    if (!session) ws.close(1008, 'Session expired or revoked');
+    return session;
+  }
+
   function wsAccessContext(ws: WsConnection, needsOnline: boolean): SteamAccessContext {
-    const session = wsSessions.get(ws) || null;
+    const session = liveWsSession(ws);
+    if (sessionManager && !session) throw Object.assign(new Error('Unauthorized'), { statusCode: 401 });
     if (needsOnline) requireSteamOnline();
     if (!sessionManager || !authStore) {
       const active = ensureActiveSteamAccount();
@@ -592,7 +602,7 @@ function createChatService(options: ChatServiceOptions = {}) {
 
   function canWsReceiveActiveAccount(ws: WsConnection): boolean {
     if (!sessionManager || !authStore) return true;
-    const session = wsSessions.get(ws);
+    const session = liveWsSession(ws);
     const active = ensureActiveSteamAccount();
     return Boolean(session && active && authStore.canAccessSteamAccount(session.user.id, active.id));
   }
@@ -948,6 +958,31 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
   }
 
+  function validateAccountPrecondition(requested: unknown): void {
+    if (requested !== undefined && (typeof requested !== 'string' || !/^\d{17}$/.test(requested))) {
+      throw Object.assign(new Error('steamAccountId must be a SteamID64 string'), { statusCode: 400 });
+    }
+  }
+
+  function checkAccountPrecondition(access: SteamAccessContext, requested: unknown): void {
+    validateAccountPrecondition(requested);
+    if (requested !== undefined && requested !== access.steamAccountId) {
+      throw Object.assign(new Error('Steam account changed before sending'), { statusCode: 409 });
+    }
+  }
+
+  function httpSendAuthorization(req: IncomingMessage, access: SteamAccessContext, requested: unknown): () => void {
+    checkAccountPrecondition(access, requested);
+    // Capture the pre-body account, and recheck access at every actual send attempt.
+    return () => {
+      const current = requireSteamAccountAccess(req, true);
+      checkAccountPrecondition(current, requested);
+      if (access.steamAccountId !== current.steamAccountId) {
+        throw Object.assign(new Error('Steam account changed before sending'), { statusCode: 409 });
+      }
+    };
+  }
+
   // First version is active-account-only; a caller-supplied account is never authority.
   function historyAccount(access: SteamAccessContext, requested?: unknown): string {
     if (!access.steamAccountId) throw steamAccountUnavailable();
@@ -991,7 +1026,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
   }
 
-  async function sendTextMessage(id: unknown, msg: unknown, steamAccountId?: string): Promise<HistoryItem> {
+  async function sendTextMessage(id: unknown, msg: unknown, steamAccountId?: string, authorize?: () => void): Promise<HistoryItem> {
     steamAccountId = steamAccountId || ensureActiveSteamAccount()?.steamId || currentSteamStatus().steamId || undefined;
     checkSend(steamAccountId);
     const selfName = settleMetadata(getSelfName(steamAccountId), 'Me');
@@ -1003,6 +1038,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
     const message = String(msg);
     const result = await withSteamRetry(() => {
+      authorize?.();
       checkSend(steamAccountId);
       const sender = steamUser.chat?.sendFriendMessage || steamUser.sendFriendMessage;
       const context = steamUser.chat?.sendFriendMessage ? steamUser.chat : steamUser;
@@ -1026,7 +1062,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     return persistSent(record);
   }
 
-  async function sendImageMessage(id: unknown, body: ImageBody, steamAccountId?: string): Promise<HistoryItem> {
+  async function sendImageMessage(id: unknown, body: ImageBody, steamAccountId?: string, authorize?: () => void): Promise<HistoryItem> {
     steamAccountId = steamAccountId || ensureActiveSteamAccount()?.steamId || currentSteamStatus().steamId || undefined;
     checkSend(steamAccountId);
     const selfName = settleMetadata(getSelfName(steamAccountId), 'Me');
@@ -1044,12 +1080,14 @@ function createChatService(options: ChatServiceOptions = {}) {
     } else {
       throw Object.assign(new Error('img or url is required'), { statusCode: 400 });
     }
-    const imageArgs = steamCommunity.sendImageToUser.length >= 4 ? [id, imageBuffer, 'image.png'] : [id, imageBuffer];
+    const imageArgs = steamCommunity.sendImageToUser.length >= 4 ? [id, imageBuffer, {}] : [id, imageBuffer];
     const result = await withSteamRetry(() => {
+      authorize?.();
       checkSend(steamAccountId);
       return callMaybeCallback(steamCommunity.sendImageToUser!, steamCommunity, imageArgs);
     }, true);
-    if (!message && isRecord(result) && typeof result.url === 'string') message = result.url;
+    if (typeof result === 'string' && result) message = result;
+    else if (isRecord(result) && typeof result.url === 'string' && result.url) message = result.url;
     const record: HistoryRecordInput = {
       type: historyStorage ? 'image' : 'message',
       echo: true,
@@ -1121,6 +1159,21 @@ function createChatService(options: ChatServiceOptions = {}) {
       requireLegacyOrSession(req);
 
       if (req.method === 'GET') {
+        if (url.pathname === '/api/messages/sync') {
+          if (!sessionManager || !authStore) throw Object.assign(new Error('Session authentication required'), { statusCode: 401 });
+          const access = requireSteamAccountAccess(req, false);
+          const requestedAccount = url.searchParams.get('steamAccountId') ?? undefined;
+          validateAccountPrecondition(requestedAccount);
+          const steamAccountId = historyAccount(access, requestedAccount);
+          if (!historyStorage) throw Object.assign(new Error('History storage unavailable'), { statusCode: 503 });
+          const page = await historyStorage.sync({ steamAccountId,
+            cursor: url.searchParams.has('cursor') ? url.searchParams.get('cursor')! : undefined,
+            limit: url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : undefined });
+          const current = requireSteamAccountAccess(req, false);
+          historyAccount(current, steamAccountId);
+          jsonResponse(res, 200, page, { 'Cache-Control': 'no-store' });
+          return;
+        }
         if (url.pathname === '/api/config') {
           jsonResponse(res, 200, { wsPath: config.wsPath });
           return;
@@ -1205,7 +1258,9 @@ function createChatService(options: ChatServiceOptions = {}) {
       if (req.method === 'POST' && (url.pathname === '/' || url.pathname === '/message')) {
         const access = requireSteamAccountAccess(req, true);
         const body = await readJsonBody(req);
-        const item = await sendTextMessage(body.id, body.msg, access.steamAccountId);
+        const authorize = httpSendAuthorization(req, access, body.steamAccountId);
+        authorize();
+        const item = await sendTextMessage(body.id, body.msg, access.steamAccountId, authorize);
         jsonResponse(res, 200, { ok: true, item });
         return;
       }
@@ -1213,7 +1268,9 @@ function createChatService(options: ChatServiceOptions = {}) {
       if (req.method === 'POST' && (url.pathname === '/image' || url.pathname === '/img')) {
         const access = requireSteamAccountAccess(req, true);
         const body = await readJsonBody(req);
-        const item = await sendImageMessage(body.id, body, access.steamAccountId);
+        const authorize = httpSendAuthorization(req, access, body.steamAccountId);
+        authorize();
+        const item = await sendImageMessage(body.id, body, access.steamAccountId, authorize);
         jsonResponse(res, 200, { ok: true, item });
         return;
       }
@@ -1236,21 +1293,40 @@ function createChatService(options: ChatServiceOptions = {}) {
 
     const requestId = typeof payload.requestId === 'string' ? payload.requestId : '';
     const type = payload.type;
-    const reply = (message: UnknownRecord) => sendWs(ws, requestId ? { requestId, ...message } : message);
+    let responseAccount: string | undefined;
+    const reply = (message: UnknownRecord) => {
+      if (sessionManager && message.type !== 'error') {
+        if (!liveWsSession(ws)) return;
+        if (responseAccount) historyAccount(wsAccessContext(ws, false), responseAccount);
+      }
+      sendWs(ws, requestId ? { requestId, ...message } : message);
+    };
     try {
+      if (sessionManager && !liveWsSession(ws)) throw Object.assign(new Error('Unauthorized'), { statusCode: 401 });
       if (type === 'ping') {
         reply({ type: 'pong' });
         return;
       }
+      if (sessionManager) responseAccount = wsAccessContext(ws, false).steamAccountId;
       if (type === 'send_message' || type === 'msg') {
         const access = wsAccessContext(ws, true);
-        const item = await sendTextMessage(payload.id, payload.msg || payload.message || '', access.steamAccountId);
+        checkAccountPrecondition(access, payload.steamAccountId);
+        const item = await sendTextMessage(payload.id, payload.msg || payload.message || '', access.steamAccountId,
+          () => {
+            if (payload.steamAccountId !== undefined) checkAccountPrecondition(wsAccessContext(ws, true), payload.steamAccountId);
+            if (sessionManager) historyAccount(wsAccessContext(ws, true), access.steamAccountId);
+          });
         reply({ type: 'message_sent', item });
         return;
       }
       if (type === 'send_image' || type === 'img') {
         const access = wsAccessContext(ws, true);
-        const item = await sendImageMessage(payload.id, payload, access.steamAccountId);
+        checkAccountPrecondition(access, payload.steamAccountId);
+        const item = await sendImageMessage(payload.id, payload, access.steamAccountId,
+          () => {
+            if (payload.steamAccountId !== undefined) checkAccountPrecondition(wsAccessContext(ws, true), payload.steamAccountId);
+            if (sessionManager) historyAccount(wsAccessContext(ws, true), access.steamAccountId);
+          });
         reply({ type: 'image_sent', item });
         return;
       }
@@ -1341,9 +1417,8 @@ function createChatService(options: ChatServiceOptions = {}) {
       legacyAuth.challengeUpgrade(socket);
       return;
     }
-    const session = sessionManager?.getSession(req) || null;
     wss.handleUpgrade(req, socket, head, (ws: WsConnection) => {
-      wsSessions.set(ws, session);
+      wsRequests.set(ws, req);
       wss.emit('connection', ws, req);
     });
   });
@@ -1358,23 +1433,35 @@ function createChatService(options: ChatServiceOptions = {}) {
     ws.on('message', (raw: RawData) => { if (!stopping) void track(handleWsMessage(ws, raw)); });
     ws.on('close', () => {
       clients.delete(ws);
-      wsSessions.delete(ws);
+      wsRequests.delete(ws);
     });
     ws.on('error', () => {
       clients.delete(ws);
-      wsSessions.delete(ws);
+      wsRequests.delete(ws);
     });
   });
 
   const disposeStorageMessages = historyStorage?.onMessage((item) => {
     for (const ws of clients) {
       if (sessionManager && authStore) {
-        const session = wsSessions.get(ws);
+        const session = liveWsSession(ws);
         if (!session) continue;
         const account = authStore.listSteamAccountsForUser(session.user.id).find((account) => account.steamId === item.steamAccountId);
         if (!account || !authStore.canAccessSteamAccount(session.user.id, account.id)) continue;
       }
       sendWs(ws, { type: 'message', ...item });
+    }
+  });
+
+  const disposeDurableMessages = historyStorage?.onDurable((item) => {
+    // Sync is session-only even when the service also supports legacy Web access.
+    if (!sessionManager || !authStore) return;
+    for (const ws of clients) {
+      const session = liveWsSession(ws);
+      const active = authStore.getActiveSteamAccount(false);
+      if (!session || !active || active.steamId !== item.steamAccountId ||
+          !authStore.canAccessSteamAccount(session.user.id, active.id)) continue;
+      sendWs(ws, { type: 'sync_available', steamAccountId: item.steamAccountId });
     }
   });
 
@@ -1410,6 +1497,7 @@ function createChatService(options: ChatServiceOptions = {}) {
       });
       while (pending.size) await Promise.allSettled([...pending]);
       disposeStorageMessages?.();
+      disposeDurableMessages?.();
     },
     sendTextMessage: (...args: Parameters<typeof sendTextMessage>) => track(sendTextMessage(...args)),
     sendImageMessage: (...args: Parameters<typeof sendImageMessage>) => track(sendImageMessage(...args)),

@@ -54,6 +54,7 @@ async function run(method: string, value: any): Promise<any> {
     }
     return database.put(item);
   }
+  if (method === 'sync') return database.sync(value);
   if (method === 'history') return database.history(value);
   if (method === 'conversations') return database.conversations(value);
   if (method === 'close') {
@@ -71,7 +72,8 @@ process.on('message', (message: { id: number; method: string; value: unknown }) 
       process.send?.({ id: message.id, result });
     } catch (error) {
       process.send?.({ id: message.id, error: error instanceof Error ? error.message : String(error),
-        statusCode: (error as { statusCode?: number }).statusCode });
+        statusCode: (error as { statusCode?: number }).statusCode,
+        resetRequired: (error as { resetRequired?: boolean }).resetRequired });
     }
   });
 });

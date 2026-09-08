@@ -1,5 +1,9 @@
 # Offline History Operations
 
+For schema-2 sync-index upgrades, cursor resets and client polling, see
+[durable message sync](android-durable-sync.md). Back up before opening an older
+DB with the new build; schema-1 binaries cannot reopen an upgraded database.
+
 These commands are explicit maintenance, not the realtime write path. Read
 [the storage design](chat-history-lsm-storage.md) for the independent dual-writer
 contract. Run from `steam-chat`. `npm run history:maintain -- ...` builds and runs

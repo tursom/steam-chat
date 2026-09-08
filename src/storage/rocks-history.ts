@@ -3,13 +3,14 @@ import { mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import { RocksDatabase, Transaction } from '@harperfast/rocksdb-js';
 import type { ConversationSummary, HistoryItem } from '../types';
-import type { HistoryQuery, HistoryPage, ConversationQuery, ConversationPage } from './history-storage';
+import type { HistoryQuery, HistoryPage, ConversationQuery, ConversationPage, SyncQuery, SyncPage } from './history-storage';
 import { canonicalMessage } from './history-message';
-import { accountPrefix, conversationKey, messageKey, recentKey, eventKey, prefixSuccessor, encodeCursor, decodeCursor } from './history-key';
+import { accountPrefix, conversationKey, messageKey, recentKey, eventKey, prefixSuccessor, encodeCursor, decodeCursor, syncKey, decodeMessageKey } from './history-key';
 const { previewForMessage } = require('./chat-log');
 
 const META = Buffer.from([0x01, 0x01]);
 const ALLOCATOR = Buffer.from([0x01, 0x02]);
+const SYNC_UPGRADE = Buffer.from([0x01, 0x03]);
 type Summary = { summary: ConversationSummary; lastKey: string };
 const encode = (value: unknown) => Buffer.from(JSON.stringify({ version: 1, value }));
 function decode<T>(value: Buffer): T {
@@ -49,20 +50,52 @@ export class RocksHistoryStore {
         const raw = await txn.get(META);
         if (raw) {
           const meta = decode<{ schemaVersion: number; codecVersion: number; generation: string }>(raw);
-          if (meta.schemaVersion !== 1 || meta.codecVersion !== 1 || !/^[a-f0-9]{32}$/.test(meta.generation)) {
+          if (![1, 2].includes(meta.schemaVersion) || meta.codecVersion !== 1 || !/^[a-f0-9]{32}$/.test(meta.generation)) {
             throw new Error('Unsupported history schema or codec');
           }
           this.generation = meta.generation;
+          // Fence old binaries before the first backfill checkpoint can be written.
+          if (meta.schemaVersion === 1) await txn.put(META, encode({ schemaVersion: 2, codecVersion: 1, generation: meta.generation }));
           if (!(await txn.get(ALLOCATOR))) throw new Error('Missing history record allocator');
         } else {
           for (const _ of txn.getRange({ limit: 1 })) throw new Error('Unversioned nonempty history database');
           this.generation = randomBytes(16).toString('hex');
-          await txn.put(META, encode({ schemaVersion: 1, codecVersion: 1, generation: this.generation }));
+          await txn.put(META, encode({ schemaVersion: 2, codecVersion: 1, generation: this.generation }));
           await txn.put(ALLOCATOR, Buffer.alloc(8));
         }
       });
+      await this.upgradeSyncIndex();
       await this.db.flush({ allowWriteStall: true });
     } catch (error) { this.db.close(); throw error; }
+  }
+
+  private async upgradeSyncIndex() {
+    const meta = decode<{ schemaVersion: number; syncIndexVersion?: number }>(await this.db.get(META));
+    if (meta.syncIndexVersion === 1) return;
+    // Index and checkpoint share a transaction. No reads/writes are admitted until complete.
+    let checkpoint: Buffer | undefined = await this.db.get(SYNC_UPGRADE);
+    while (true) {
+      const done = await this.transaction(async (txn) => {
+        let count = 0;
+        let last = checkpoint;
+        for (const { key } of txn.getRange({ start: checkpoint ?? Buffer.from([0x10]),
+          end: Buffer.from([0x11]), exclusiveStart: !!checkpoint, limit: 500 })) {
+          const message = Buffer.from(key);
+          const { steamAccountId, recordId } = decodeMessageKey(message);
+          await txn.put(syncKey(steamAccountId, recordId), message);
+          last = message;
+          count++;
+        }
+        if (count < 500) {
+          await txn.put(META, encode({ schemaVersion: 2, codecVersion: 1, generation: this.generation, syncIndexVersion: 1 }));
+          await txn.remove(SYNC_UPGRADE);
+        } else if (last) await txn.put(SYNC_UPGRADE, last);
+        checkpoint = last;
+        return count < 500;
+      });
+      await this.db.flush({ allowWriteStall: true });
+      if (done) return;
+    }
   }
 
   private run<T>(operation: () => Promise<T>): Promise<T> {
@@ -121,6 +154,7 @@ export class RocksHistoryStore {
         }
         await txn.put(key, encode(item));
         await txn.put(mapping, key);
+        await txn.put(syncKey(account, id), key);
         await txn.put(ALLOCATOR, next);
         await txn.put(summaryKey, encode(state));
         return item;
@@ -129,6 +163,39 @@ export class RocksHistoryStore {
       // including retries of transactions whose earlier flush failed after commit.
       await this.db.flush({ allowWriteStall: true });
       return result;
+    });
+  }
+
+  sync(query: SyncQuery): Promise<SyncPage> {
+    return this.run(async () => {
+      const prefix = accountPrefix(0x22, query.steamAccountId);
+      const limit = limitOf(query.limit);
+      let boundary = syncKey(query.steamAccountId, 0n);
+      if (query.cursor !== undefined) {
+        try {
+          boundary = decodeCursor(query.cursor, this.generation, prefix, 17);
+          if (boundary.readBigUInt64BE(9) !== 0n && !(await this.db.get(boundary))) throw new Error('Missing sync boundary');
+        } catch (_) {
+          throw Object.assign(new Error('Invalid or stale sync cursor'), { statusCode: 409, resetRequired: true });
+        }
+      }
+      // A prior put can have committed but failed its flush. Never advance a durable
+      // client cursor over those rows until the durability gate succeeds.
+      await this.db.flush({ allowWriteStall: true });
+      return this.transaction(async (txn) => {
+        const items: SyncPage['items'] = [];
+        let last = boundary;
+        let hasMore = false;
+        for (const { key, value } of txn.getRange({ start: boundary, end: prefixSuccessor(prefix),
+          exclusiveStart: true, limit: limit + 1 })) {
+          if (items.length === limit) { hasMore = true; break; }
+          const item = decode<HistoryItem>(await txn.get(value));
+          if (!item.eventId) throw new Error('Missing sync eventId');
+          items.push({ ...item, syncId: item.eventId });
+          last = Buffer.from(key);
+        }
+        return { items, nextCursor: encodeCursor(this.generation, last), hasMore, steamAccountId: query.steamAccountId };
+      });
     });
   }
 

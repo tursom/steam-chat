@@ -1,0 +1,14 @@
+.gradle/
+.kotlin/
+**/build/
+local.properties
+*.jks
+*.keystore
+*.apk
+*.aab
+
+# These are source packages, not the root application's runtime data directory.
+!app/src/main/java/io/github/steamchat/android/data/
+!app/src/main/java/io/github/steamchat/android/data/**
+!app/src/test/java/io/github/steamchat/android/data/
+!app/src/test/java/io/github/steamchat/android/data/**

@@ -35,8 +35,12 @@ test('normalization assigns cross-copy identity without either writer', () => {
 
 test('two independent copies contain the same event and DB is immediately queryable after its own commit', async (t) => {
   const { storage, logPath } = await fixture(t);
+  const durable: string[] = [];
+  storage.onDurable((item) => durable.push(item.eventId!));
   const item = storage.append(message());
+  assert.deepEqual(durable, []);
   await until(() => storage.status().rocksdb.durable === 1 && storage.status().jsonl.durable === 1);
+  assert.deepEqual(durable, [item.eventId]);
   const page = await storage.history({ steamAccountId: account, id: peer });
   assert.equal(page.items[0].eventId, item.eventId);
   const record = JSON.parse((await fs.readFile(logPath, 'utf8')).trim());
@@ -75,8 +79,11 @@ test('historical supplementation does not broadcast old messages but a live coun
 
 test('RocksDB open failure does not prevent JSONL durable writes', async (t) => {
   const { storage, logPath } = await fixture(t, { dbPath: '/dev/null/no-database' });
+  let hints = 0;
+  storage.onDurable(() => hints++);
   storage.append(message());
   await until(() => storage.status().jsonl.durable === 1);
+  assert.equal(hints, 0);
   assert.equal(JSON.parse((await fs.readFile(logPath, 'utf8')).trim()).message, 'hello');
   assert.equal(storage.status().rocksdb.durable, 0);
   assert.equal(storage.canSend(), true);
