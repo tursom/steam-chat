@@ -22,6 +22,7 @@ def signed_request(url, secret, payload, timestamp):
     signature = hmac.new(secret.encode(), stamp.encode() + b'.' + payload, hashlib.sha256).hexdigest()
     return urllib.request.Request(url, data=payload, method='POST', headers={
         'Content-Type': 'application/json', 'X-Deploy-Timestamp': stamp, 'X-Deploy-Signature': signature,
+        'User-Agent': 'steam-chat-deploy/1.0',
     })
 
 

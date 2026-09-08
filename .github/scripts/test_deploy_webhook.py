@@ -36,6 +36,7 @@ class ClientTest(unittest.TestCase):
         self.assertEqual(req.get_header('X-deploy-signature'), expected)
         self.assertEqual(req.data, payload)
         self.assertEqual(req.method, 'POST')
+        self.assertEqual(req.get_header('User-agent'), 'steam-chat-deploy/1.0')
 
     def test_redirects_never_forward_signed_requests(self):
         self.assertIsNone(client.NoRedirect().redirect_request(None, None, 307, '', {}, 'https://other.test'))
