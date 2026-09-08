@@ -27,7 +27,7 @@ async function run() {
       let socket;
       let previewImage;
       const writes = [];
-      const history = [];
+      const history = Array.from({ length: 30 }, (_, i) => ({ id: peer, eventId: `history-${i}`, type: 'message', message: `History ${i}` }));
       const errors = [];
       page.on('pageerror', error => errors.push(error.message));
       await page.routeWebSocket(/.*/, connection => { socket = connection; });
@@ -50,11 +50,17 @@ async function run() {
       });
       await page.goto('http://steam-chat.test');
       await page.locator('.list-item').first().click();
+      await page.waitForFunction(() => document.querySelectorAll('.msg-row').length === 30);
+      await page.locator('#messages').hover();
+      await page.mouse.wheel(0, -800);
+      await page.waitForTimeout(100);
       await page.locator('#messageInput').fill('Optimistic text');
       await page.locator('#sendButton').click();
       const row = page.locator('.msg-row').filter({ hasText: 'Optimistic text' });
       await row.waitFor({ timeout: 3000 });
       assert.match(await row.innerText(), /发送中/);
+      await page.waitForTimeout(50);
+      assert.ok(await page.locator('#messages').evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop < 2), 'sending text must scroll to the bottom');
       assert.equal(await page.locator('#messageInput').inputValue(), '');
       await page.waitForTimeout(50);
       assert.equal(writes.length, 1);
@@ -110,6 +116,9 @@ async function run() {
         return canvas.toDataURL('image/png');
       });
       previewImage = Buffer.from(dataUrl.split(',')[1], 'base64');
+      await page.locator('#messages').hover();
+      await page.mouse.wheel(0, -800);
+      await page.waitForTimeout(100);
       await page.locator('input[type="file"]').setInputFiles({ name: 'pending.png', mimeType: 'image/png', buffer: previewImage });
       const preview = page.locator('.outgoing-image-preview');
       await preview.waitFor({ timeout: 3000 });
@@ -117,6 +126,7 @@ async function run() {
       assert.match(await page.locator('.msg-row').filter({ has: preview }).innerText(), /发送中/);
       await page.waitForTimeout(50);
       assert.equal(writes.length, 5);
+      assert.ok(await page.locator('#messages').evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop < 2), 'sending images must scroll to the bottom');
       if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, `steam-chat-outgoing-pending-${width}.png`) });
       const imageItem = { ...item, eventId: 'image-confirmed', type: 'image', message: 'https://images.example.test/confirmed.png' };
       history.push(imageItem);

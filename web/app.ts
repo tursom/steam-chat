@@ -251,6 +251,7 @@ let historyBefore = '';
 let historyAfter = '';
 let historyAt = '';
 let historyBusy = false;
+let historyBrowsingRequest = false;
 let historyDetached = false;
 let historyLive: MessageItem[] = [];
 let historyScroll: { dispose: () => void; following: () => boolean } | null = null;
@@ -281,7 +282,7 @@ function resetHistory() {
   historyItems = [];
   historyLive = [];
   historyBefore = historyAfter = historyAt = '';
-  historyBusy = historyDetached = false;
+  historyBusy = historyDetached = historyBrowsingRequest = false;
   renderHistory([]);
   updateHistoryControls();
 }
@@ -2034,6 +2035,7 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
   const request = ++historyRequest;
   const current = () => request === historyRequest && target === state.activeId && context === chatContext() && messages === document.querySelector('#messages');
   historyBusy = true;
+  historyBrowsingRequest = mode !== 'latest';
   updateHistoryControls();
   try {
     const params = new URLSearchParams({ id: target, limit: String(state.historyLimit) });
@@ -2082,6 +2084,7 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
   } finally {
     if (current()) {
       historyBusy = false;
+      historyBrowsingRequest = false;
       updateHistoryControls();
     }
   }
@@ -2196,11 +2199,11 @@ function visibleOutgoing() {
     && (!entry.eventId || !historyItems.some(item => item.eventId === entry.eventId)));
 }
 
-function refreshOutgoing() {
+function refreshOutgoing(forceBottom = false) {
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages) return;
   const top = messages.scrollTop;
-  const following = !historyDetached && (historyScroll?.following() ?? messages.scrollHeight - top - messages.clientHeight < 48);
+  const following = forceBottom || (!historyDetached && (historyScroll?.following() ?? messages.scrollHeight - top - messages.clientHeight < 48));
   renderHistory(historyItems);
   if (!following) {
     messages.scrollTop = top;
@@ -2209,10 +2212,20 @@ function refreshOutgoing() {
 }
 
 function beginOutgoing(id: string, message: string, type = 'message') {
+  const returnToLatest = historyDetached || historyBrowsingRequest;
+  if (returnToLatest) {
+    if (historyDetached) historyItems = [];
+    historyRequest += 1;
+    historyBusy = historyDetached = historyBrowsingRequest = false;
+    historyBefore = historyAfter = historyAt = '';
+    const date = document.querySelector<HTMLInputElement>('#historyDate');
+    if (date) date.value = '';
+  }
   const entry: OutgoingMessage = { localId: ++outgoingId, context: chatContext(), state: 'sending',
     item: { id, message, type, echo: true, name: '我', sentAt: new Date().toISOString() } };
   outgoingMessages.set(entry.localId, entry);
-  refreshOutgoing();
+  refreshOutgoing(true);
+  if (returnToLatest) void loadHistory();
   return entry;
 }
 
@@ -2380,8 +2393,8 @@ function appendSupportedBbcode(
   }
 
   if (tag === 'emoticon') {
-    const name = body.trim();
-    if (attributes.trim() || !/^[A-Za-z0-9_+\-.]+$/.test(name)) return false;
+    const name = normalizeEmoticonName(body.trim());
+    if (attributes.trim() || !name) return false;
     container.append(emoticonNode(name));
     return true;
   }
@@ -2596,6 +2609,12 @@ function openGraphNode(preview: OpenGraphPreview) {
   return card;
 }
 
+function normalizeEmoticonName(value: string): string {
+  const wrapped = value.match(/^([:\u02d0])([A-Za-z0-9_+\-.]+)\1$/);
+  const name = wrapped ? wrapped[2] : value;
+  return /^[A-Za-z0-9_+\-.]+$/.test(name) ? name : '';
+}
+
 function emoticonNode(name: string) {
   const image = document.createElement('img');
   image.className = 'emoticon';
@@ -2645,14 +2664,14 @@ function steamImageNode(preview: SteamImagePreview) {
 }
 
 function appendInlineMessageText(container: HTMLElement, text: string) {
-  const pattern = /:([A-Za-z0-9_+\-.]+):|(https?:\/\/[^\s<>"'\[\]]+)/gi;
+  const pattern = /(?<![A-Za-z0-9_]):([A-Za-z0-9_+\-.]+):(?![A-Za-z0-9_])|\u02d0([A-Za-z0-9_+\-.]+)\u02d0|(https?:\/\/[^\s<>"'\[\]]+)/gi;
   let lastIndex = 0;
   for (const match of text.matchAll(pattern)) {
     if (match.index > lastIndex) container.append(document.createTextNode(text.slice(lastIndex, match.index)));
-    if (match[1]) {
-      container.append(emoticonNode(match[1]));
-    } else if (match[2]) {
-      container.append(externalLink('', match[2], match[2]));
+    if (match[1] || match[2]) {
+      container.append(emoticonNode(match[1] || match[2]));
+    } else if (match[3]) {
+      container.append(externalLink('', match[3], match[3]));
     }
     lastIndex = match.index + match[0].length;
   }
@@ -2945,27 +2964,29 @@ function renderPicker(container: HTMLElement) {
   function fill(type: 'emoticons' | 'stickers') {
     container.dataset.inventoryType = type;
     clear(grid);
-    const source = (type === 'emoticons' ? state.emoticons : state.stickers).slice(0, 160);
+    const source = type === 'emoticons' ? state.emoticons : state.stickers;
     if (!source.length) {
       grid.append(create('div', 'empty small', '暂无素材'));
       return;
     }
     for (const item of source) {
       const rawName = String(item.name || '');
-      const name = type === 'emoticons' ? rawName.replace(/^:+|:+$/g, '') : rawName;
-      if (!name) continue;
+      const name = type === 'emoticons' ? normalizeEmoticonName(rawName) : rawName;
+      if (!name || (type === 'stickers' && /[\[\]"\\\x00-\x1f]/.test(name))) continue;
+      const title = typeof item.title === 'string' && item.title ? item.title : name;
       const button = create('button');
       button.type = 'button';
       const image = document.createElement('img');
       image.src = type === 'emoticons'
         ? emoticonImageUrl(name)
-        : `/proxy/sticker/${encodeURIComponent(name)}`;
-      image.alt = name;
-      button.append(image, create('span', '', name));
+        : httpUrl(item.imageUrl) ? proxiedImageUrl(httpUrl(item.imageUrl)) : `/proxy/sticker/${encodeURIComponent(name)}`;
+      image.alt = title;
+      image.loading = 'lazy';
+      button.append(image, create('span', '', title));
       button.addEventListener('click', () => {
         const input = document.querySelector<HTMLTextAreaElement>('#messageInput');
         if (!input) return;
-        input.value += type === 'emoticons' ? `:${name}:` : `[sticker type="${name}" limit="0"][/sticker]`;
+        input.value += type === 'emoticons' ? `[emoticon]${name}[/emoticon]` : `[sticker type="${name}" limit="0"][/sticker]`;
         input.focus();
       });
       grid.append(button);

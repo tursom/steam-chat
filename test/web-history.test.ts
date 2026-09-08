@@ -222,7 +222,7 @@ test('date views exclude provisional messages and old confirmed sends never reap
   assert.equal(messages.children[0].dataset.eventId, 'newest');
 });
 
-test('optimistic append and confirmation preserve reading position and following intent', async () => {
+test('sending follows bottom, but subsequent manual reading is preserved on confirmation', async () => {
   const { api, pending, nodes, messages, resize } = harness(true);
   const loading = api.loadHistory();
   pending[0].resolve({ items: [item('a'), item('b'), item('c'), item('d')] });
@@ -233,12 +233,53 @@ test('optimistic append and confirmation preserve reading position and following
   nodes['#messageInput'].value = 'hello';
   const sending = api.sendText();
   assert.equal(messages.children[0], existingRow);
-  assert.equal(messages.scrollTop, 20);
+  assert.equal(messages.scrollTop, messages.scrollHeight);
+  assert.equal(messages.dataset.followBottom, 'true');
+  messages.dispatch('wheel', { deltaY: -100 });
+  messages.scrollTop = 20;
+  messages.dispatch('scroll');
   pending[1].resolve({ ok: true, item: { ...item('confirmed'), echo: true } });
   await sending;
   resize();
   assert.equal(messages.scrollTop, 20);
   assert.equal(messages.dataset.followBottom, 'false');
+});
+
+for (const type of ['text', 'image']) {
+  test(`${type} send leaves date history and shows the outgoing message at bottom`, async () => {
+    const { api, pending, nodes, messages, resize } = harness(true);
+    const past = api.loadHistory('date', '2026-01-02T13:45');
+    pending[0].resolve({ items: [item('past')] });
+    await past;
+    nodes['#messageInput'].value = 'new message';
+    const sending = type === 'text' ? api.sendText() : api.sendImage({ img: 'data:image/png;base64,YWJj' });
+    assert.equal(api.detached(), false);
+    assert.equal(messages.children[0].dataset.sendState, 'sending');
+    assert.equal(pending[1].url.pathname, '/api/history');
+    pending[1].resolve({ items: [item('latest')] });
+    await new Promise(resolve => setImmediate(resolve));
+    resize();
+    assert.equal(messages.scrollTop, messages.scrollHeight);
+    pending[2].resolve({ ok: true, item: { ...item('confirmed'), echo: true } });
+    await sending;
+    resize();
+    assert.equal(messages.scrollTop, messages.scrollHeight);
+  });
+}
+
+test('a date response started before sending cannot pull the view back into the past', async () => {
+  const { api, pending, nodes, messages } = harness();
+  const past = api.loadHistory('date', '2026-01-02T13:45');
+  nodes['#messageInput'].value = 'new message';
+  const sending = api.sendText();
+  pending[0].resolve({ items: [item('past')] });
+  await past;
+  assert.equal(api.detached(), false);
+  assert.equal(messages.children[0].dataset.sendState, 'sending');
+  pending[1].resolve({ items: [item('latest')] });
+  pending[2].resolve({ ok: true, item: { ...item('confirmed'), echo: true } });
+  await sending;
+  assert.equal(api.items().some(entry => entry.eventId === 'past'), false);
 });
 
 test('latest history follows late row growth and a newly visible viewport', async () => {

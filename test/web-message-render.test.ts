@@ -394,6 +394,35 @@ test('web chat renders Steam emoticon BBCode and complete sticker types', () => 
   ]);
 });
 
+for (const token of [':wave:', '\u02d0wave\u02d0', '[emoticon]wave[/emoticon]', '[emoticon]:wave:[/emoticon]', '[emoticon]\u02d0wave\u02d0[/emoticon]']) {
+  test(`emoticon delimiters render without leaking into text: ${token}`, () => {
+    const { renderMessage } = loadWebTestApi();
+    const rendered = renderMessage({ id: '1', name: 'Alice', message: `before ${token} after` });
+    assert.equal(rendered.findAllByClass('emoticon').length, 1);
+    assert.equal(rendered.textContent, 'Alicebefore  after');
+    assert.equal(rendered.findByClass('emoticon')!.alt, ':wave:');
+  });
+}
+
+test('emoticon parsing preserves literal surrounding punctuation and ordinary text', () => {
+  const { renderMessage } = loadWebTestApi();
+  const rendered = renderMessage({ id: '1', name: 'Alice', message: '::wave:: :[emoticon]wave[/emoticon]: 12:30:45 https://example.com/:wave: word:value:tail' });
+  assert.equal(rendered.textContent, 'Alice:: :: 12:30:45 https://example.com/:wave: word:value:tail');
+  assert.equal(rendered.findAllByClass('emoticon').length, 2);
+});
+
+test('sticker picker uses inventory thumbnail but sends the internal type', async () => {
+  const api = loadWebTestApi();
+  const view = api.mountChatView();
+  api.setMediaInventory([], [{ name: 'show love', title: 'Localized title', imageUrl: 'https://community.cloudflare.steamstatic.com/economy/image/hash' }]);
+  const picker = api.createElement('div');
+  picker.dataset.inventoryType = 'stickers';
+  api.renderPicker(picker);
+  assert.equal(picker.findByTag('img')!.src, `/proxy/image?url=${encodeURIComponent('https://community.cloudflare.steamstatic.com/economy/image/hash')}`);
+  await picker.findByClass('picker-grid')!.findByTag('button')!.dispatch('click');
+  assert.equal(view.findById('messageInput')!.value, '[sticker type="show love" limit="0"][/sticker]');
+});
+
 test('web chat proxies emoticon picker thumbnails', () => {
   const { createElement, renderPicker, setMediaInventory } = loadWebTestApi();
   setMediaInventory([{ name: ':steamhappy:' }], []);
@@ -407,15 +436,24 @@ test('web chat proxies emoticon picker thumbnails', () => {
   );
 });
 
-for (const name of ['steamhappy', ':steamhappy:']) {
-  test(`picker inserts one colon pair for ${name}`, async () => {
+test('picker exposes the complete inventory and rejects unsafe sticker markup', () => {
+  const api = loadWebTestApi();
+  api.setMediaInventory([], [...Array.from({ length: 161 }, (_, i) => ({ name: `sticker${i}` })), { name: 'bad" type="other' }]);
+  const picker = api.createElement('div');
+  picker.dataset.inventoryType = 'stickers';
+  api.renderPicker(picker);
+  assert.equal(picker.findByClass('picker-grid')!.findAllByTag('button').length, 161);
+});
+
+for (const name of ['steamhappy', ':steamhappy:', '\u02d0steamhappy\u02d0']) {
+  test(`picker inserts native emoticon markup for ${name}`, async () => {
     const api = loadWebTestApi();
     const view = api.mountChatView();
     api.setMediaInventory([{ name }], []);
     const picker = api.createElement('div');
     api.renderPicker(picker);
     await picker.findByClass('picker-grid')!.findByTag('button')!.dispatch('click');
-    assert.equal(view.findById('messageInput')!.value, ':steamhappy:');
+    assert.equal(view.findById('messageInput')!.value, '[emoticon]steamhappy[/emoticon]');
   });
 }
 

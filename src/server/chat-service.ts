@@ -69,6 +69,7 @@ type SteamChatApi = {
 };
 
 type SteamUserLike = {
+  steamID?: unknown;
   chat?: SteamChatApi;
   sendFriendMessage?: CallbackStyleFunction;
   getEmoticonList?: CallbackStyleFunction;
@@ -82,6 +83,8 @@ type SteamUserLike = {
 };
 
 type SteamCommunityLike = {
+  steamID?: unknown;
+  getUserInventoryContents?: CallbackStyleFunction;
   sendImageToUser?: CallbackStyleFunction;
 };
 
@@ -91,6 +94,7 @@ type EmoticonPayload = {
 };
 
 type GetEmoticonsOptions = {
+  steamCommunity?: SteamCommunityLike;
   steamUser?: SteamUserLike;
   waitForLogin: Waiter;
   waitForWebSession: Waiter;
@@ -1045,7 +1049,12 @@ function createChatService(options: ChatServiceOptions = {}) {
       const sender = steamUser.chat?.sendFriendMessage || steamUser.sendFriendMessage;
       const context = steamUser.chat?.sendFriendMessage ? steamUser.chat : steamUser;
       if (!sender) throw new Error('Steam chat sender is unavailable');
-      return callMaybeCallback(sender, context, [id, message]);
+      const args: unknown[] = [id, message];
+      // The SDK's default command-parsing mode escapes literal BBCode brackets.
+      if (steamUser.chat?.sendFriendMessage && /\[(?:sticker\b[^\]]*\]|emoticon\])/i.test(message)) {
+        args.push({ containsBbCode: false });
+      }
+      return callMaybeCallback(sender, context, args);
     });
     remember(recentSentText, `${id}:${message}`);
     const record: HistoryRecordInput = {
@@ -1187,7 +1196,7 @@ function createChatService(options: ChatServiceOptions = {}) {
         }
         if (url.pathname === '/api/emoticons') {
           requireSteamAccountAccess(req, true);
-          const data = await getEmoticons({ steamUser, waitForLogin, waitForWebSession });
+          const data = await getEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession });
           jsonResponse(res, 200, data);
           return;
         }
@@ -1382,7 +1391,7 @@ function createChatService(options: ChatServiceOptions = {}) {
       }
       if (type === 'get_emoticons' || type === 'emoticons') {
         wsAccessContext(ws, true);
-        reply({ type: 'emoticons', ...(await getEmoticons({ steamUser, waitForLogin, waitForWebSession })) });
+        reply({ type: 'emoticons', ...(await getEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession })) });
         return;
       }
       if (type === 'get_friends' || type === 'friends') {
@@ -1514,20 +1523,37 @@ function createChatService(options: ChatServiceOptions = {}) {
   };
 }
 
-async function defaultGetEmoticons({ steamUser, waitForLogin, waitForWebSession }: GetEmoticonsOptions): Promise<EmoticonPayload> {
+async function defaultGetEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession }: GetEmoticonsOptions): Promise<EmoticonPayload> {
   await resolveWaiter(waitForLogin);
   await resolveWaiter(waitForWebSession);
   const source = steamUser?.getEmoticonList || steamUser?.chat?.getEmoticonList;
-  if (!source) return { emoticons: [], stickers: [] };
-  const context = steamUser?.getEmoticonList ? steamUser : steamUser.chat;
-  const response = await callMaybeCallback(source, context, []);
+  const context = steamUser?.getEmoticonList ? steamUser : steamUser?.chat;
+  const response = source ? await callMaybeCallback(source, context, []) : null;
   const entries = (value: unknown): unknown[] => Array.isArray(value) ? value : isRecord(value) ? Object.values(value) : [];
   const emoticons = isRecord(response)
     ? entries(response.emoticons || response.emoticon_list)
     : [];
-  const stickers = isRecord(response)
+  let stickers = isRecord(response)
     ? entries(response.stickers || response.sticker_list)
     : [];
+  const steamId = steamUser?.steamID || steamCommunity?.steamID;
+  if (steamCommunity?.getUserInventoryContents && steamId) {
+    // The SDK joins asset descriptions and follows all inventory pages, including non-tradable items.
+    const inventory = await callMaybeCallback(steamCommunity.getUserInventoryContents, steamCommunity, [steamId, 753, 6, false]);
+    const owned = new Map<string, { name: string; title: string; imageUrl: string }>();
+    for (const item of entries(inventory)) {
+      if (!isRecord(item) || !Array.isArray(item.tags) || !item.tags.some(tag =>
+        isRecord(tag) && tag.category === 'item_class' && tag.internal_name === 'item_class_11')) continue;
+      // Community market hash names carry the app prefix; localized names are display-only.
+      const hashName = typeof item.market_hash_name === 'string' ? item.market_hash_name : '';
+      const name = hashName.replace(/^\d+-/, '');
+      if (!name || /[\[\]"\\\x00-\x1f]/.test(name)) continue;
+      const imageUrl = typeof item.icon_url === 'string' && item.icon_url
+        ? `https://community.cloudflare.steamstatic.com/economy/image/${item.icon_url}` : '';
+      owned.set(name, { name, title: typeof item.name === 'string' ? item.name : name, imageUrl });
+    }
+    stickers = [...owned.values()];
+  }
   return { emoticons, stickers };
 }
 
