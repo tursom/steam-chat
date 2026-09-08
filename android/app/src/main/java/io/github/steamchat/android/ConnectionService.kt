@@ -45,6 +45,32 @@ internal object ChatNotifications {
     const val SERVICE_ID = 1
     private const val CONNECTION = "connection"
     private const val MESSAGES = "messages"
+    fun settingsIntent(context: Context): Intent = Intent(android.provider.Settings.ACTION_CHANNEL_NOTIFICATION_SETTINGS)
+        .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName)
+        .putExtra(android.provider.Settings.EXTRA_CHANNEL_ID, MESSAGES)
+    fun settingsSummary(context: Context): String {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled()) return "系统通知未允许"
+        val channel = manager.getNotificationChannel(MESSAGES) ?: return "消息通知类别未创建"
+        val importance = when {
+            channel.importance == NotificationManager.IMPORTANCE_NONE -> "消息通知已关闭"
+            channel.importance >= NotificationManager.IMPORTANCE_HIGH -> "高重要性"
+            else -> "非高重要性"
+        }
+        return "$importance · ${if (channel.sound == null) "无提示音" else "有提示音"}"
+    }
+    fun test(context: Context): Boolean {
+        channels(context)
+        if (Build.VERSION.SDK_INT >= 33 && ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) return false
+        val manager = context.getSystemService(NotificationManager::class.java)
+        if (!manager.areNotificationsEnabled() || manager.getNotificationChannel(MESSAGES)?.importance == NotificationManager.IMPORTANCE_NONE) return false
+        val notification = NotificationCompat.Builder(context, MESSAGES)
+            .setSmallIcon(android.R.drawable.stat_notify_chat).setContentTitle("Steam Chat")
+            .setContentText("通知测试").setCategory(NotificationCompat.CATEGORY_MESSAGE)
+            .setVisibility(NotificationCompat.VISIBILITY_PRIVATE).setAutoCancel(true)
+            .setTimeoutAfter(15000).setContentIntent(intent(context)).build()
+        return runCatching { manager.notify("notification-test", 3, notification); true }.getOrDefault(false)
+    }
     fun channels(context: Context) {
         context.getSystemService(NotificationManager::class.java).createNotificationChannels(listOf(
             NotificationChannel(CONNECTION, "连接状态", NotificationManager.IMPORTANCE_LOW),

@@ -19,6 +19,25 @@ class NotificationBehaviorTest {
     private val state = AppState(loggedIn = true, accessAllowed = true)
     private fun message(peer: String, text: String = "private message") = Message(peer, peer, "Friend", text, false, "2026-09-07T12:00:00Z")
 
+    @Test fun messageChannelIsHighImportanceAndTestNotificationUsesTheSameChannel() {
+        ChatNotifications.channels(context)
+        assertEquals(NotificationManager.IMPORTANCE_HIGH, manager.getNotificationChannel("messages").importance)
+        assertEquals(NotificationManager.IMPORTANCE_LOW, manager.getNotificationChannel("connection").importance)
+        assertTrue(ChatNotifications.test(context))
+        val posted = manager.activeNotifications.single()
+        assertEquals("notification-test", posted.tag)
+        assertEquals("messages", posted.notification.channelId)
+        assertEquals("通知测试", posted.notification.extras.getString(Notification.EXTRA_TEXT))
+        assertEquals("messages", ChatNotifications.settingsIntent(context).getStringExtra(android.provider.Settings.EXTRA_CHANNEL_ID))
+    }
+
+    @Test fun channelStatusReportsUserLoweredImportanceWithoutResettingIt() {
+        manager.createNotificationChannel(android.app.NotificationChannel("messages", "聊天消息", NotificationManager.IMPORTANCE_LOW).apply { setSound(null, null) })
+        ChatNotifications.channels(context)
+        assertEquals(NotificationManager.IMPORTANCE_LOW, manager.getNotificationChannel("messages").importance)
+        assertEquals("非高重要性 · 无提示音", ChatNotifications.settingsSummary(context))
+    }
+
     @Test fun privateNotificationOmitsContentAndOpensExactConversation() {
         ChatNotifications.channels(context)
         ChatNotifications.message(context, state, message("peer1"))

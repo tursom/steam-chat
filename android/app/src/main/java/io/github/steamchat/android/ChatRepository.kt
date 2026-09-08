@@ -5,9 +5,11 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.Uri
+import android.os.SystemClock
 import android.util.Base64
 import androidx.core.content.ContextCompat
 import io.github.steamchat.android.data.ChatCache
+import io.github.steamchat.android.data.MediaDiskCache
 import io.github.steamchat.android.data.Protocol
 import io.github.steamchat.android.data.SessionVault
 import kotlinx.coroutines.*
@@ -36,6 +38,7 @@ class ChatRepository(private val context: Context) {
     private val gate = Mutex()
     private val vault = SessionVault(context)
     private val cache = ChatCache(context)
+    private val mediaCache = MediaDiskCache(java.io.File(context.cacheDir, "media-v1"))
     private val settings = context.getSharedPreferences("chat-settings", Context.MODE_PRIVATE)
     private val mutable = MutableStateFlow(AppState(backgroundEnabled = settings.getBoolean("background", true), notificationPreview = settings.getBoolean("preview", false), notificationsEnabled = settings.getBoolean("notifications", true)))
     val state: StateFlow<AppState> = mutable.asStateFlow()
@@ -54,7 +57,13 @@ class ChatRepository(private val context: Context) {
     private var wsPath = "/ws"
     private var reconnectAt = 0L
     private var attempts = 0
-    private var httpRetryAt = 0L
+    @Volatile private var httpRetryAt = 0L
+    private var syncAt = 0L
+    private var now: () -> Long = SystemClock::elapsedRealtime
+    private class MetadataRefresh(var job: Job? = null, var nextAt: Long = 0)
+    private val friendsRefresh = MetadataRefresh()
+    private val mediaRefresh = MetadataRefresh()
+    private var metadataVersion = 0L
     private var worker: Job? = null
     private val hints = Channel<Unit>(Channel.CONFLATED)
     private val outgoing = linkedMapOf<String, Outgoing>()
@@ -77,7 +86,13 @@ class ChatRepository(private val context: Context) {
         }
         runCatching {
             (context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
-                override fun onAvailable(network: Network) { hints.trySend(Unit) }
+                override fun onAvailable(network: Network) {
+                    scope.launch { gate.withLock {
+                        if (httpRetryAt > now() + 1000) httpRetryAt = now() + 1000
+                        if (reconnectAt > now() + 1000) reconnectAt = now() + 1000
+                        hints.trySend(Unit)
+                    } }
+                }
                 override fun onLost(network: Network) { hints.trySend(Unit) }
             })
         }
@@ -153,10 +168,13 @@ class ChatRepository(private val context: Context) {
     private fun endSession(error: String) {
         sessionEnding = true
         generation++
+        cancelMetadata()
+        httpRetryAt = 0; syncAt = 0; reconnectAt = 0; attempts = 0
         cookie = ""; expires = 0; vault.clear()
         worker?.cancel(); worker = null
         socket?.cancel(); socket = null
         client.dispatcher.cancelAll()
+        mediaCache.clear()
         cache.clearAll()
         cacheScope = ""; accountSteamId = ""; userId = ""; outgoing.clear()
         mutable.update { AppState(server = it.server, error = error, backgroundEnabled = it.backgroundEnabled, notificationPreview = it.notificationPreview, notificationsEnabled = it.notificationsEnabled) }
@@ -167,18 +185,30 @@ class ChatRepository(private val context: Context) {
     private fun startWorker() {
         if (!allowed() || worker?.isActive == true) return
         worker = scope.launch {
+            var syncRequested = true
             while (isActive && allowed()) {
-                gate.withLock {
+                val wait = gate.withLock {
                     try {
                         if (cookie.isNotEmpty()) {
-                            if (!state.value.loggedIn) validateSession()
-                            if (state.value.loggedIn) catchUp()
-                            if (state.value.accessAllowed && socket == null && System.currentTimeMillis() >= reconnectAt) connectSocket()
+                            if ((syncRequested || now() >= syncAt || (httpRetryAt > 0 && now() >= httpRetryAt)) && now() >= httpRetryAt) {
+                                if (!state.value.loggedIn) validateSession()
+                                if (state.value.loggedIn) catchUp()
+                                httpRetryAt = 0
+                                syncAt = now() + 30_000
+                                syncRequested = false
+                            }
+                            if (state.value.accessAllowed && socket == null && now() >= maxOf(reconnectAt, httpRetryAt)) connectSocket()
                         }
-                    } catch (e: CancellationException) { throw e } catch (e: Exception) { handleFailure(e) }
+                    } catch (e: CancellationException) { throw e } catch (e: Exception) {
+                        handleFailure(e)
+                    }
+                    val nextSync = if (httpRetryAt > 0) httpRetryAt else if (syncRequested) now() else syncAt
+                    val nextReconnect = if (state.value.accessAllowed && socket == null) reconnectAt else Long.MAX_VALUE
+                    // A failed HTTP config request also respects the sync retry deadline.
+                    val next = minOf(nextSync, maxOf(nextReconnect, httpRetryAt))
+                    (next - now()).coerceAtLeast(1)
                 }
-                withTimeoutOrNull(30_000) { hints.receive() }
-                delay((httpRetryAt - System.currentTimeMillis()).coerceAtLeast(1000))
+                syncRequested = withTimeoutOrNull(wait) { hints.receive(); true } ?: false
             }
         }
         updateService()
@@ -223,22 +253,88 @@ class ChatRepository(private val context: Context) {
             if (!more) break
             if (pageNumber == 49) hints.trySend(Unit)
         }
-        if (online) {
-            val friends = JSONArray(request("/api/friends"))
-            mutable.update { it.copy(friends = (0 until friends.length()).map { index -> friends.getJSONObject(index).let { f -> Friend(f.getString("id"), f.optString("name"), f.optString("avatar"), f.optBoolean("online"), f.optString("gameName")) } }) }
-            if (state.value.emoticons.isEmpty() && state.value.stickers.isEmpty()) {
-                val media = json("/api/emoticons")
-                mutable.update { it.copy(emoticons = mediaNames(media.optJSONArray("emoticons")), stickers = mediaNames(media.optJSONArray("stickers"))) }
+        httpRetryAt = 0
+        if (online) refreshMetadata()
+        publishCache()
+    }
+    private fun cancelMetadata() {
+        metadataVersion++
+        for (refresh in listOf(friendsRefresh, mediaRefresh)) {
+            refresh.job?.cancel(); refresh.job = null; refresh.nextAt = 0
+        }
+    }
+    private fun refreshMetadata() {
+        val root = base ?: return
+        val capturedCookie = cookie
+        val version = generation
+        val account = cacheScope
+        val metadata = metadataVersion
+        fun current() = version == generation && metadata == metadataVersion && account == cacheScope &&
+            cookie == capturedCookie && !sessionEnding && state.value.accessAllowed
+        fun launchRefresh(refresh: MetadataRefresh, path: String, interval: Long, publish: (String) -> Unit) {
+            if (refresh.job?.isActive == true || now() < refresh.nextAt) return
+            refresh.job = scope.launch {
+                try {
+                    val body = metadataRequest(root, capturedCookie, path)
+                    gate.withLock {
+                        if (!current()) return@withLock
+                        publish(body)
+                        refresh.nextAt = now() + interval
+                    }
+                } catch (e: CancellationException) { throw e } catch (e: Exception) {
+                    gate.withLock {
+                        if (!current()) return@withLock
+                        refresh.nextAt = now() + 30_000
+                        if (e is HttpFailure && e.status in listOf(401, 403)) handleFailure(e)
+                    }
+                }
             }
         }
-        publishCache()
+        launchRefresh(friendsRefresh, "/api/friends", 60_000) { body ->
+            val friends = JSONArray(body)
+            val parsed = (0 until friends.length()).map { index -> friends.getJSONObject(index).let { f ->
+                Friend(f.getString("id"), f.optString("name"), f.optString("avatar"), f.optBoolean("online"), f.optString("gameName"))
+            } }
+            mutable.update { state ->
+                if (!current()) state else state.copy(friends = parsed, conversations = state.conversations.map { conversation ->
+                    parsed.find { it.id == conversation.id }?.let { conversation.copy(name = it.name, avatar = it.avatar) } ?: conversation
+                })
+            }
+        }
+        launchRefresh(mediaRefresh, "/api/emoticons", 30 * 60_000) { body ->
+            val media = JSONObject(body)
+            val emoticons = mediaNames(media.optJSONArray("emoticons"))
+            val stickers = mediaNames(media.optJSONArray("stickers"))
+            mutable.update { if (current()) it.copy(emoticons = emoticons, stickers = stickers) else it }
+        }
+    }
+    // Metadata never rotates credentials; only serialized authoritative requests may do that.
+    private suspend fun metadataRequest(root: HttpUrl, capturedCookie: String, path: String): String = suspendCancellableCoroutine { continuation ->
+        val url = Protocol.endpoint(root, path)
+        require(url.isHttps && url.host == root.host && url.port == root.port && url.encodedPath.startsWith(root.encodedPath))
+        val call = client.newCall(Request.Builder().url(url).header("Cookie", capturedCookie).build())
+        continuation.invokeOnCancellation { call.cancel() }
+        call.enqueue(object : Callback {
+            override fun onFailure(call: Call, e: IOException) { continuation.resumeWith(Result.failure(e)) }
+            override fun onResponse(call: Call, response: Response) {
+                val result = runCatching {
+                    response.use {
+                        if (!it.isSuccessful) throw HttpFailure(it.code)
+                        it.body?.byteStream()?.use { stream -> String(bounded(stream, 4 * 1024 * 1024), Charsets.UTF_8) } ?: "{}"
+                    }
+                }
+                continuation.resumeWith(result)
+            }
+        })
     }
     private fun mediaNames(items: JSONArray?): List<String> = if (items == null) emptyList() else (0 until items.length()).mapNotNull {
         when (val item = items.opt(it)) { is String -> item; is JSONObject -> item.optString("name", item.optString("type")).takeIf(String::isNotEmpty); else -> null }
     }
     private fun hideAccount(reason: String = "无 Steam 账户访问权限") {
+        cancelMetadata()
         socket?.cancel(); socket = null
         cacheScope = ""; accountSteamId = ""; outgoing.clear()
+        mediaCache.close()
         mutable.update { it.copy(activeAccountId = "", accessAllowed = false, steamOnline = false, connected = false, connectionText = reason, conversations = emptyList(), friends = emptyList(), messages = emptyList(), emoticons = emptyList(), stickers = emptyList(), selectedPeer = "", selectedName = "") }
         ChatNotifications.clearMessages(context)
     }
@@ -271,7 +367,8 @@ class ChatRepository(private val context: Context) {
                     if (status == 401) { endSession("登录已过期，请重新登录"); return@launchAction }
                     if (status == 403) { hideAccount(); return@launchAction }
                     attempts = (attempts + 1).coerceAtMost(6)
-                    reconnectAt = System.currentTimeMillis() + Random.nextLong(1000, (1000L shl attempts).coerceAtMost(60_000))
+                    reconnectAt = now() + Random.nextLong(1000, (1000L shl attempts).coerceAtMost(60_000))
+                    hints.trySend(Unit)
                     mutable.update { it.copy(connected = false, connectionText = "连接已断开，等待重连") }
                 }
             }
@@ -282,9 +379,13 @@ class ChatRepository(private val context: Context) {
         if (error is CancellationException) return
         when ((error as? HttpFailure)?.status) {
             401 -> endSession("登录已过期，请重新登录")
-            403 -> { hideAccount(); mutable.update { it.copy(error = "访问被拒绝；如需修改密码，请前往网页版") } }
+            403 -> {
+                hideAccount()
+                httpRetryAt = now() + 30_000
+                mutable.update { it.copy(error = "访问被拒绝；如需修改密码，请前往网页版") }
+            }
             else -> {
-                httpRetryAt = System.currentTimeMillis() + 30_000
+                httpRetryAt = now() + 30_000
                 mutable.update { it.copy(loading = false, error = if (error is HttpFailure) "服务器请求失败 (${error.status})" else "网络或数据处理失败，请检查服务器后重试") }
                 if (cookie.isNotEmpty() && !state.value.loggedIn) {
                     // Restore remains retryable after an offline process start, but no cache is exposed.
@@ -363,7 +464,9 @@ class ChatRepository(private val context: Context) {
     suspend fun imageBytes(source: String): ByteArray? = withContext(Dispatchers.IO) {
         val version = generation
         val account = cacheScope
-        if (!state.value.accessAllowed) return@withContext null
+        if (!state.value.loggedIn || !state.value.accessAllowed || account.isEmpty() || sessionEnding || cookie.isEmpty()) return@withContext null
+        fun authorized() = version == generation && account == cacheScope && !sessionEnding &&
+            state.value.loggedIn && state.value.accessAllowed && cookie.isNotEmpty() && expires > System.currentTimeMillis()
         try {
             val root = base ?: return@withContext null
             val url = if (source.startsWith("https://") || source.startsWith("http://")) {
@@ -375,11 +478,15 @@ class ChatRepository(private val context: Context) {
                 require(relative.startsWith("proxy/image?") || relative.startsWith("proxy/sticker/"))
                 Protocol.endpoint(root, relative)
             }
+            val imagePath = Protocol.endpoint(root, "/proxy/image").encodedPath
+            val stickerPath = Protocol.endpoint(root, "/proxy/sticker/").encodedPath
+            require(url.encodedPath == imagePath || url.encodedPath.startsWith(stickerPath))
             if (expires <= System.currentTimeMillis()) throw HttpFailure(401)
-            client.newCall(Request.Builder().url(url).header("Cookie", cookie).build()).execute().use {
+            val mediaClient = mediaCache.client(account, client, ::authorized) ?: return@withContext null
+            mediaClient.newCall(Request.Builder().url(url).header("Cookie", cookie).build()).execute().use {
                 if (!it.isSuccessful) throw HttpFailure(it.code)
                 val bytes = it.body?.byteStream()?.use { stream -> bounded(stream, 10 * 1024 * 1024) }
-                if (version == generation && account == cacheScope && state.value.accessAllowed) bytes else null
+                if (authorized()) bytes else null
             }
         } catch (e: CancellationException) { throw e } catch (e: Exception) {
             if (version == generation && account == cacheScope && e is HttpFailure && e.status in listOf(401, 403)) launchAction { handleFailure(e) }

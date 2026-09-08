@@ -231,11 +231,15 @@ private fun ContactRow(name: String, avatar: String, preview: String, time: Stri
 internal fun EmptyState(text: String) { Box(Modifier.fillMaxWidth().padding(32.dp), contentAlignment = Alignment.Center) { Text(text, color = Muted) } }
 
 @Composable
-private fun SettingsScreen(state: AppState, repository: ChatRepository, loader: UiImageLoader, notificationsAllowed: Boolean,
+internal fun SettingsScreen(state: AppState, repository: ChatRepository, loader: UiImageLoader, notificationsAllowed: Boolean,
                            requestNotifications: () -> Unit, openNotificationSettings: () -> Unit) {
     val context = LocalContext.current
     var logout by remember { mutableStateOf(false) }
     var battery by remember { mutableStateOf(false) }
+    var channelSummary by remember { mutableStateOf(ChatNotifications.settingsSummary(context)) }
+    androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+        channelSummary = ChatNotifications.settingsSummary(context)
+    }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).background(Color(0xFFF8FAF9))) {
         Text("设置", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.fillMaxWidth().background(Color.White).padding(22.dp))
         Row(Modifier.fillMaxWidth().background(Color.White).padding(22.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -247,6 +251,12 @@ private fun SettingsScreen(state: AppState, repository: ChatRepository, loader: 
         SettingToggle("通知显示消息内容", "仅影响此设备的通知预览", state.notificationPreview, repository::setNotificationPreview)
         SettingToggle("消息提醒", "此设备的新消息通知", state.notificationsEnabled, repository::setNotificationsEnabled)
         SettingAction("系统通知权限", if (notificationsAllowed) "已允许；各通知类别仍由系统控制" else "未允许，点击申请或前往系统设置", if (notificationsAllowed) openNotificationSettings else requestNotifications)
+        SettingAction("消息通知类别", channelSummary, openNotificationSettings)
+        SettingAction("发送测试通知", "此设备") {
+            val posted = ChatNotifications.test(context)
+            Toast.makeText(context, if (posted) "已发送测试通知" else "系统未允许消息通知", Toast.LENGTH_SHORT).show()
+            channelSummary = ChatNotifications.settingsSummary(context)
+        }
         SectionLabel("连接与设备")
         SettingAction("后端地址", state.server) { logout = true }
         SettingAction("连接状态", "${state.connectionText} · Steam ${if (state.steamOnline) "在线" else "离线"} · ${if (state.accessAllowed) "有访问权限" else "无访问权限"}") { repository.refresh() }

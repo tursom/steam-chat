@@ -9,6 +9,8 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
+import io.github.steamchat.android.ChatNotifications
 import io.github.steamchat.android.AppState
 import io.github.steamchat.android.ChatRepository
 import io.github.steamchat.android.Message
@@ -51,6 +53,26 @@ class NativeScreenTest {
         compose.onNodeWithText("Emoji").assertIsDisplayed().performClick()
         compose.onNodeWithText("😀").assertIsDisplayed()
         screenshot("android-emoji")
+    }
+
+    @Test fun notificationSettingsRenderAndPostALocalTestOnAndroid15() {
+        val context = RuntimeEnvironment.getApplication()
+        org.robolectric.Shadows.shadowOf(context).grantPermissions(android.Manifest.permission.POST_NOTIFICATIONS)
+        ChatNotifications.channels(context)
+        val repository = ChatRepository(context)
+        val state = AppState(loggedIn = true, username = "orbit", accessAllowed = true)
+        val loader = UiImageLoader(repository)
+        compose.setContent {
+            SteamChatTheme { SettingsScreen(state, repository, loader, true, {}, {}) }
+        }
+        compose.onNodeWithText("消息通知类别").performScrollTo().assertIsDisplayed()
+        compose.onNodeWithText("发送测试通知").performScrollTo().assertIsDisplayed().performClick()
+        compose.runOnIdle {
+            val notice = context.getSystemService(android.app.NotificationManager::class.java).activeNotifications.single()
+            org.junit.Assert.assertEquals("notification-test", notice.tag)
+            org.junit.Assert.assertEquals("messages", notice.notification.channelId)
+        }
+        screenshot("android-notification-settings")
     }
 
     private fun screenshot(name: String) {

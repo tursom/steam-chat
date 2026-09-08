@@ -86,6 +86,9 @@ class MainActivity : ComponentActivity() {
         } else openNotificationSettings()
     }
     private fun openNotificationSettings() {
-        runCatching { startActivity(Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName)) }
+        runCatching {
+            startActivity(if (NotificationManagerCompat.from(this).areNotificationsEnabled()) ChatNotifications.settingsIntent(this)
+                else Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, packageName))
+        }
     }
 }

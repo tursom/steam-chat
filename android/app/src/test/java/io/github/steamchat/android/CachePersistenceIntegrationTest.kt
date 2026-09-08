@@ -42,6 +42,24 @@ class CachePersistenceIntegrationTest {
         assertEquals(0, cache.conversations(scope).single().unread)
     }
 
+    @Test fun incomingOutsideVisibleConversationCreatesSystemNotification() {
+        val context = RuntimeEnvironment.getApplication()
+        ChatNotifications.channels(context)
+        val state = AppState(loggedIn = true, accessAllowed = true)
+        val manager = context.getSystemService(android.app.NotificationManager::class.java)
+        cache.ingest(scope, JSONArray(), "initial", false, "")
+        for ((index, visible) in listOf("", "other-peer").withIndex()) {
+            val notices = cache.ingest(scope, JSONArray().put(item("notice-$index")), "cursor-$index", false, visible)
+            assertEquals(1, notices.size)
+            notices.forEach { ChatNotifications.message(context, state, it) }
+            assertEquals("peer:peer1", manager.activeNotifications.single().tag)
+            ChatNotifications.clearMessages(context)
+        }
+        val visibleNotices = cache.ingest(scope, JSONArray().put(item("visible")), "last", false, "peer1")
+        assertTrue(visibleNotices.isEmpty())
+        assertTrue(manager.activeNotifications.isEmpty())
+    }
+
     @Test fun aMalformedPageRollsBackBothMessagesAndCursor() {
         cache.ingest(scope, JSONArray(), "before", false, "")
         try {
