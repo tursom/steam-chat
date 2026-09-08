@@ -249,6 +249,7 @@ let historyAt = '';
 let historyBusy = false;
 let historyDetached = false;
 let historyLive: MessageItem[] = [];
+const pendingImageReaders = new Set<FileReader>();
 let conversationsBefore = '';
 let conversationsBusy = false;
 const recentConversationUpdates = new Map<string, ListEntry>();
@@ -259,6 +260,8 @@ function chatContext() {
 }
 
 function resetHistory() {
+  for (const reader of pendingImageReaders) reader.abort();
+  pendingImageReaders.clear();
   historyRequest += 1;
   historyItems = [];
   historyLive = [];
@@ -1666,6 +1669,7 @@ function renderComposer() {
   input.rows = 1;
   input.placeholder = '发送消息';
   input.setAttribute('aria-label', '消息');
+  input.addEventListener('paste', handleImagePaste);
   input.addEventListener('input', () => resizeComposerInput(input));
   input.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && !event.shiftKey) {
@@ -2514,8 +2518,9 @@ async function sendImage(payload: Record<string, string>) {
   const id = activeIdOrWarn();
   if (!id) return;
   const context = chatContext();
+  const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId;
   try {
-    const response = await api('/image', jsonBody({ id, ...payload }));
+    const response = await api('/image', jsonBody({ id, ...payload, ...(steamAccountId ? { steamAccountId } : {}) }));
     if (context !== chatContext() || id !== state.activeId) return;
     if (isRecord(response)) for (const item of asMessages([response.item])) receiveHistoryMessage(item);
     await loadHistory();
@@ -2525,16 +2530,52 @@ async function sendImage(payload: Record<string, string>) {
   }
 }
 
-function sendFiles(files: FileList | null) {
-  if (!files) return;
-  [...files].filter((file) => file.type.startsWith('image/')).forEach((file) => {
+function canSendImages() {
+  return Boolean(state.me && state.view === 'chat' && steamOnline() && steamAccessAllowed() && state.activeId);
+}
+
+function handleImagePaste(event: ClipboardEvent) {
+  if (!canSendImages() || !event.clipboardData) return;
+  const clipboard = event.clipboardData;
+  const images = Array.from(clipboard.items || [])
+    .filter((item) => item.kind === 'file' && item.type.startsWith('image/'))
+    .map((item) => item.getAsFile())
+    .filter((file): file is File => file !== null);
+  // Some browsers expose pasted files only through files, not items.
+  const files = images.length ? images : Array.from(clipboard.files || []).filter((file) => file.type.startsWith('image/'));
+  if (!files.length) return;
+  event.preventDefault();
+  sendFiles(files);
+}
+
+function sendFiles(files: FileList | File[] | null) {
+  if (!files || !canSendImages()) return;
+  const context = chatContext();
+  const target = state.activeId;
+  const current = () => context === chatContext() && target === state.activeId && canSendImages();
+  for (const file of Array.from(files).filter((file) => file.type.startsWith('image/'))) {
+    // Base64 plus JSON must fit the server's 10 MiB request body limit.
+    if (!file.size || file.size > 7 * 1024 * 1024) {
+      setFeedback(file.size ? '图片不能超过 7 MiB。' : '不能发送空图片。', 'warn');
+      continue;
+    }
     const reader = new FileReader();
+    pendingImageReaders.add(reader);
     reader.onload = () => {
-      if (typeof reader.result === 'string') void sendImage({ img: reader.result });
+      if (!pendingImageReaders.delete(reader)) return;
+      if (current() && typeof reader.result === 'string') void sendImage({ img: reader.result });
     };
-    reader.onerror = () => setFeedback('读取图片失败', 'error');
-    reader.readAsDataURL(file);
-  });
+    reader.onerror = () => {
+      pendingImageReaders.delete(reader);
+      if (current()) setFeedback('读取图片失败', 'error');
+    };
+    reader.onabort = () => pendingImageReaders.delete(reader);
+    try { reader.readAsDataURL(file); }
+    catch (_) {
+      pendingImageReaders.delete(reader);
+      if (current()) setFeedback('读取图片失败', 'error');
+    }
+  }
 }
 
 function renderPicker(container: HTMLElement) {
