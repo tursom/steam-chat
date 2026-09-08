@@ -396,7 +396,7 @@ test('web chat renders Steam emoticon BBCode and complete sticker types', () => 
 
 test('web chat proxies emoticon picker thumbnails', () => {
   const { createElement, renderPicker, setMediaInventory } = loadWebTestApi();
-  setMediaInventory([{ name: 'steamhappy' }], []);
+  setMediaInventory([{ name: ':steamhappy:' }], []);
 
   const picker = createElement('div');
   renderPicker(picker);
@@ -406,6 +406,18 @@ test('web chat proxies emoticon picker thumbnails', () => {
     `/proxy/image?url=${encodeURIComponent('https://community.cloudflare.steamstatic.com/economy/emoticon/steamhappy')}`
   );
 });
+
+for (const name of ['steamhappy', ':steamhappy:']) {
+  test(`picker inserts one colon pair for ${name}`, async () => {
+    const api = loadWebTestApi();
+    const view = api.mountChatView();
+    api.setMediaInventory([{ name }], []);
+    const picker = api.createElement('div');
+    api.renderPicker(picker);
+    await picker.findByClass('picker-grid')!.findByTag('button')!.dispatch('click');
+    assert.equal(view.findById('messageInput')!.value, ':steamhappy:');
+  });
+}
 
 test('web chat renders HAR-style Steam image BBCode with proxying, aspect ratio, and lightbox', async () => {
   const { renderMessage, lightbox, lightboxImage } = loadWebTestApi();

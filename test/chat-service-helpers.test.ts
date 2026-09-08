@@ -87,6 +87,14 @@ test('defaultGetEmoticons waits for login and supports callback-style chat APIs'
   assert.deepEqual(data.stickers, [{ name: 'sticker' }]);
 });
 
+test('defaultGetEmoticons accepts the name-keyed inventory returned by steam-user', async () => {
+  const emoticon = { name: ':steamhappy:', count: 1 };
+  const data = await defaultGetEmoticons({
+    steamUser: { getEmoticonList: async () => ({ emoticons: { ':steamhappy:': emoticon } }) }
+  });
+  assert.deepEqual(data.emoticons, [emoticon]);
+});
+
 test('decodeBase64Image accepts data URLs and readRequestBody enforces byte limits', async () => {
   const encoded = Buffer.from('hello image').toString('base64');
   assert.deepEqual(decodeBase64Image(`data:image/png;base64,${encoded}`), Buffer.from('hello image'));

@@ -1521,11 +1521,12 @@ async function defaultGetEmoticons({ steamUser, waitForLogin, waitForWebSession 
   if (!source) return { emoticons: [], stickers: [] };
   const context = steamUser?.getEmoticonList ? steamUser : steamUser.chat;
   const response = await callMaybeCallback(source, context, []);
+  const entries = (value: unknown): unknown[] => Array.isArray(value) ? value : isRecord(value) ? Object.values(value) : [];
   const emoticons = isRecord(response)
-    ? arrayFromUnknown(response.emoticons || response.emoticon_list)
+    ? entries(response.emoticons || response.emoticon_list)
     : [];
   const stickers = isRecord(response)
-    ? arrayFromUnknown(response.stickers || response.sticker_list)
+    ? entries(response.stickers || response.sticker_list)
     : [];
   return { emoticons, stickers };
 }

@@ -1810,6 +1810,8 @@ async function refreshChatData() {
       state.groups = asListEntries(groups);
       state.emoticons = isRecord(inventory) ? asInventory(inventory.emoticons) : [];
       state.stickers = isRecord(inventory) ? asInventory(inventory.stickers) : [];
+      const picker = document.querySelector<HTMLElement>('#picker');
+      if (picker && !picker.hidden) renderPicker(picker);
     } else {
       state.friends = [];
       state.groups = [];
@@ -2869,6 +2871,7 @@ function renderPicker(container: HTMLElement) {
   const stickers = create('button', '', '贴纸');
   const grid = create('div', 'picker-grid');
   function fill(type: 'emoticons' | 'stickers') {
+    container.dataset.inventoryType = type;
     clear(grid);
     const source = (type === 'emoticons' ? state.emoticons : state.stickers).slice(0, 160);
     if (!source.length) {
@@ -2876,7 +2879,8 @@ function renderPicker(container: HTMLElement) {
       return;
     }
     for (const item of source) {
-      const name = String(item.name || '');
+      const rawName = String(item.name || '');
+      const name = type === 'emoticons' ? rawName.replace(/^:+|:+$/g, '') : rawName;
       if (!name) continue;
       const button = create('button');
       button.type = 'button';
@@ -2901,7 +2905,7 @@ function renderPicker(container: HTMLElement) {
   stickers.addEventListener('click', () => fill('stickers'));
   tabs.append(emoticons, stickers);
   container.append(tabs, grid);
-  fill('emoticons');
+  fill(container.dataset.inventoryType === 'stickers' ? 'stickers' : 'emoticons');
 }
 
 function ensureWebSocket() {
