@@ -556,6 +556,37 @@ test('web chat handles long unclosed supported BBCode without blocking', () => {
   assert.equal(rendered.textContent, `Alice${message}`);
 });
 
+test('recent list and selected header use current peer identity instead of the outgoing sender', async () => {
+  const api = loadWebTestApi();
+  const id = '76561198000000001';
+  const recent = [{ id, name: 'tursom', preview: 'outgoing preview', updatedAt: '2026-01-01T12:42:00Z' }];
+  const friends = [{ id, name: 'Current friend', avatar: 'https://example.com/peer.png', online: true }];
+  api.setChatListState(recent, friends, [], 'recent', '', id);
+  const view = api.mountChatView();
+  const row = view.findByClass('list-item')!;
+  assert.match(row.findByClass('item-title')!.textContent, /Current friend/);
+  assert.doesNotMatch(row.findByClass('item-title')!.textContent, /tursom/);
+  assert.equal(row.findByClass('item-preview')!.textContent, 'outgoing preview');
+  assert.equal(row.findByTag('img')!.src, friends[0].avatar);
+  await row.dispatch('click');
+  assert.equal(api.getChatState().activeName, 'Current friend');
+  assert.match(view.findByClass('thread-identity')!.textContent, /Current friend/);
+  const results = api.createElement('div');
+  api.setChatListState(recent, friends, [], 'recent', 'Current friend', id);
+  api.renderChatList(results);
+  assert.equal(results.findAllByClass('list-item').length, 1);
+  assert.equal(recent[0].name, 'tursom', 'display enrichment must not mutate source records');
+});
+
+test('unavailable live names retain the known peer name', () => {
+  const api = loadWebTestApi();
+  const id = '76561198000000001';
+  api.setChatListState([{ id, name: 'Known friend', preview: 'preview' }], [{ id, name: id }], [], 'recent', '', id);
+  const view = api.mountChatView();
+  assert.match(view.findByClass('item-title')!.textContent, /Known friend/);
+  assert.match(view.findByClass('thread-identity')!.textContent, /Known friend/);
+});
+
 test('web chat filters the selected conversation group by name, SteamID, and preview', () => {
   const { filterChatEntries } = loadWebTestApi();
   const entries = [

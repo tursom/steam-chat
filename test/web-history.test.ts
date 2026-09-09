@@ -69,11 +69,12 @@ function harness(withLayout = false) {
     renderMessage = (item) => { const row = document.createElement('article'); row.dataset.eventId = item.eventId; return row; };
     state.me = {id: 1}; state.activeId = 'peer'; state.steam.accessAllowed = true;
     resizeComposerInput = () => {};
-    globalThis.__test = {sendText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
+    globalThis.__test = {refreshChatData, sendText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
       resetHistory, invalidateChat, state, items: () => historyItems, outgoing: () => Array.from(outgoingMessages.values()),
       switchPeer: (id) => { state.activeId = id; resetHistory(); },
       detached: () => historyDetached, busy: () => historyBusy};`, sandbox);
   const api = sandbox.__test as {
+    refreshChatData: () => Promise<void>;
     sendText: () => Promise<boolean>;
     sendImage: (payload: Record<string, string>) => Promise<void>;
     loadHistory: (mode?: string, date?: string) => Promise<void>;
@@ -84,7 +85,7 @@ function harness(withLayout = false) {
     resetHistory: () => void;
     invalidateChat: () => void;
     switchPeer: (id: string) => void;
-    state: { steam: { steamId: string }; friends: Array<{id: string; name: string}>; activeName: string;
+    state: { view: string; steam: { steamId: string; status: string }; friends: Array<{id: string; name: string}>; activeName: string;
       conversations: Array<{id: string; name?: string; preview?: string; updatedAt?: string}>; feedback: string };
     outgoing: () => Array<{ state: string; item: Item; context: string }>;
     items: () => Item[];
@@ -96,6 +97,29 @@ function harness(withLayout = false) {
     resize: () => { for (const observer of [...observers]) if (observer.active) observer.callback(); flushFrames(); } };
 }
 const item = (eventId: string, id = 'peer'): Item => ({ id, eventId, message: eventId });
+
+for (const stale of [false, true]) {
+  test(`friend identity updates independently of inventory, stale context ${stale}`, async () => {
+    const { api, pending } = harness();
+    api.state.view = 'chat';
+    api.state.steam.status = 'online';
+    const loading = api.refreshChatData();
+    pending[0].resolve({ items: [{ id: 'peer', name: 'sender name' }] });
+    for (let i = 0; i < 30 && pending.length < 4; i++) await Promise.resolve();
+    assert.equal(pending.length, 4);
+    if (stale) {
+      api.invalidateChat();
+      api.state.friends = [{ id: 'other', name: 'New account friend' }];
+    }
+    pending[1].resolve([{ id: 'peer', name: 'Current friend' }]);
+    for (let i = 0; i < 30; i++) await Promise.resolve();
+    assert.equal(api.state.friends[0].name, stale ? 'New account friend' : 'Current friend');
+    pending[2].resolve([]);
+    pending[3].resolve({ emoticons: [], stickers: [] });
+    await loading;
+    assert.equal(api.state.friends[0].name, stale ? 'New account friend' : 'Current friend');
+  });
+}
 
 test('optimistic text appears before the response and reconciles response, WebSocket and history once', async () => {
   const { api, pending, nodes, messages } = harness();

@@ -292,7 +292,7 @@ async function buildConversations(options: {
     const name = !item.echo && item.name && item.name !== 'Unknown' ? item.name : previous?.name;
     conversations.set(item.id, {
       id: item.id,
-      name: name || item.name || item.id,
+      name: name || item.id,
       updatedAt: item.sentAt || item.date,
       updatedAtMs: at,
       preview: previewForMessage(item),

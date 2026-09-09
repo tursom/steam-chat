@@ -1482,10 +1482,18 @@ function filterChatEntries(items: ListEntry[], query: string): ListEntry[] {
     .some((value) => String(value || '').toLocaleLowerCase('zh-CN').includes(normalized)));
 }
 
+function resolvedChatEntry(entry: ListEntry): ListEntry {
+  const persona = state.friends.find(item => item.id === entry.id) || state.groups.find(item => item.id === entry.id);
+  if (!persona) return entry;
+  const name = persona.name && persona.name !== entry.id && persona.name !== 'Unknown' ? persona.name : entry.name || entry.id;
+  return { ...entry, ...persona, id: entry.id, name, avatar: persona.avatar || entry.avatar,
+    preview: entry.preview, updatedAt: entry.updatedAt };
+}
+
 function chatEntriesForActiveTab() {
   if (state.chatListTab === 'friends') return state.friends;
   if (state.chatListTab === 'groups') return state.groups;
-  return state.conversations;
+  return state.conversations.map(resolvedChatEntry);
 }
 
 function updateChatTabs() {
@@ -1517,7 +1525,8 @@ function activeChatEntry(): ListEntry | null {
   const recent = state.conversations.find((item) => item.id === state.activeId);
   const persona = state.friends.find((item) => item.id === state.activeId)
     || state.groups.find((item) => item.id === state.activeId);
-  return recent || persona ? { ...recent, ...persona, id: state.activeId } : null;
+  const entry = recent || persona;
+  return entry ? resolvedChatEntry(entry) : null;
 }
 
 function chatAccountLabel() {
@@ -1627,8 +1636,7 @@ function renderListItem(item: ListEntry) {
   const title = create('span', 'item-title');
   title.append(create('strong', '', name), create('time', '', formatConversationTime(item.updatedAt)));
   body.append(title, create('span', 'item-preview', item.preview || item.gameName || item.clanId || item.clanid || item.id));
-  const persona = state.friends.find((friend) => friend.id === item.id);
-  button.append(renderAvatar(persona || item, name), body);
+  button.append(renderAvatar(item, name), body);
   button.addEventListener('click', () => openConversation(item.id, item.name || item.id));
   return button;
 }
@@ -1807,7 +1815,18 @@ async function refreshChatData() {
     if (context !== chatContext() || request !== listRequest) return;
     if (steamOnline()) {
       const [friends, groups, inventory] = await Promise.all([
-        api('/api/friends'),
+        api('/api/friends').then(friends => {
+          if (context === chatContext() && request === listRequest) {
+            state.friends = asListEntries(friends);
+            if (state.view === 'chat') {
+              updateChatLists();
+              const head = document.querySelector<HTMLElement>('#threadHead');
+              if (head) renderThreadHeader(head);
+              syncFriendDetails();
+            }
+          }
+          return friends;
+        }),
         api('/api/groups'),
         api('/api/emoticons')
       ]);

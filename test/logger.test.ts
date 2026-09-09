@@ -127,6 +127,31 @@ test('appendLog and buildConversations generate previews and newest-first summar
   assert.equal(conversations[1].preview, '[贴纸] happy');
 });
 
+for (const incomingFirst of [false, true]) {
+  test(`conversation name ${incomingFirst ? 'preserves incoming peer name after outgoing messages' : 'falls back to peer ID for outgoing-only messages'}`, async (t: import('node:test').TestContext) => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'steam-chat-log-'));
+    t.after(() => fs.rm(dir, { recursive: true, force: true }));
+    const logPath = path.join(dir, 'chat.jsonl');
+    const peer = '76561198000000002';
+    if (incomingFirst) {
+      await appendLog({ id: peer, name: 'Friend', message: 'hello', echo: false,
+        date: '2026-06-23 10:00:00.000' }, { logPath });
+    }
+    for (const minute of ['01', '02']) {
+      await appendLog({ id: peer, name: 'tursom', message: 'reply', echo: true,
+        date: `2026-06-23 10:${minute}:00.000` }, { logPath });
+      const summaries = await buildConversations({ logPath });
+      assert.equal(summaries.length, 1);
+      assert.equal(summaries[0].id, peer);
+      assert.equal(summaries[0].name, incomingFirst ? 'Friend' : peer);
+      assert.equal(summaries[0].preview, 'reply');
+      assert.equal(summaries[0].lastEcho, true);
+    }
+    const history = await readHistory({ logPath });
+    assert.equal(history.at(-1).name, 'tursom');
+  });
+}
+
 test('readHistory and buildConversations filter by steam account and keep legacy rows admin-only', async () => {
   const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'steam-chat-log-'));
   const logPath = path.join(dir, 'chat.jsonl');

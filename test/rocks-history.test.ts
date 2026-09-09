@@ -102,6 +102,25 @@ test('atomic IDs, event deduplication and recent indexes survive reopen with zst
   } finally { await reopened.close(); }
 });
 
+for (const incomingFirst of [false, true]) {
+  test(`conversation name ${incomingFirst ? 'preserves incoming peer name after outgoing messages' : 'falls back to peer ID for outgoing-only messages'}`, async (t) => {
+    const { store } = await fixture(t);
+    if (incomingFirst) await store.put(item(1));
+    for (const n of [2, 3]) {
+      const outgoing = item(n, { echo: true, name: 'tursom' });
+      await store.put(outgoing);
+      const { items } = await store.conversations({ steamAccountId: account });
+      assert.equal(items.length, 1);
+      assert.equal(items[0].id, peer);
+      assert.equal(items[0].name, incomingFirst ? 'Friend' : peer);
+      assert.equal(items[0].preview, outgoing.message);
+      assert.equal(items[0].lastEcho, true);
+      assert.equal(items[0].messageCount, incomingFirst ? n : n - 1);
+      assert.equal((await store.getByEventId(outgoing.eventId))?.name, 'tursom');
+    }
+  });
+}
+
 test('recent conversation pagination rejects foreign account and generation cursors', async (t) => {
   const { store, directory } = await fixture(t);
   await store.put(item(1));

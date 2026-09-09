@@ -144,7 +144,7 @@ export class RocksHistoryStore {
         if (isLatest) {
           if (previous) await txn.remove(recentKey(account, Number(Buffer.from(previous.lastKey, 'hex').readBigUInt64BE(17)), item.id));
           state = { lastKey: key.toString('hex'), summary: {
-            id: item.id, name: (!item.echo && item.name && item.name !== 'Unknown' ? item.name : previous?.summary.name) || item.name || item.id,
+            id: item.id, name: (!item.echo && item.name && item.name !== 'Unknown' ? item.name : previous?.summary.name) || item.id,
             updatedAt: item.sentAt!, preview: previewForMessage(item), lastType: item.type,
             lastEcho: item.echo, messageCount: (previous?.summary.messageCount || 0) + 1
           } };
