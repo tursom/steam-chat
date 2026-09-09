@@ -67,7 +67,10 @@ async function fetchBuffer(url: string, options: CacheOptions = {}): Promise<Cac
     }
   });
   if (!response.ok) {
-    throw new Error(`Remote request failed with HTTP ${response.status}`);
+    throw Object.assign(new Error(`Remote request failed with HTTP ${response.status}`), {
+      statusCode: response.status === 404 ? 404 : 502,
+      upstreamStatus: response.status
+    });
   }
   const type = response.headers?.get?.('content-type') || '';
   const arrayBuffer = await response.arrayBuffer();
@@ -124,7 +127,7 @@ async function loadOrDownloadRemoteImage(url: string, options: CacheOptions = {}
 }
 
 function stickerUrlForType(type: string): string {
-  return `https://steamcommunity-a.akamaihd.net/economy/sticker/${encodeURIComponent(type)}`;
+  return `https://community.steamstatic.com/economy/sticker/${encodeURIComponent(type)}`;
 }
 
 function safeCacheName(value: string): string {

@@ -86,7 +86,12 @@ test('fetchBuffer rejects failed responses and oversized images with status meta
         async arrayBuffer() { return exactArrayBuffer([]); }
       } as unknown as Response)) as typeof fetch
     }),
-    /Remote request failed with HTTP 404/
+    (error: Error & { statusCode?: number; upstreamStatus?: number }) => {
+      assert.match(error.message, /Remote request failed with HTTP 404/);
+      assert.equal(error.statusCode, 404);
+      assert.equal(error.upstreamStatus, 404);
+      return true;
+    }
   );
 
   await assert.rejects(
@@ -125,6 +130,7 @@ test('loadOrDownloadSticker encodes remote URL and stores a reusable cache file'
     }) as typeof fetch
   });
 
+  assert.equal(stickerUrlForType('Cat Cam talking'), 'https://community.steamstatic.com/economy/sticker/Cat%20Cam%20talking');
   assert.equal(requestedUrl, stickerUrlForType(type));
   assert.equal(calls, 1);
   assert.equal(first.fromCache, false);

@@ -1,6 +1,7 @@
 'use strict';
 
 import { handleDeployWebhook } from './deploy-webhook';
+import { resolveStickerAlias } from './sticker-inventory';
 import { settleMetadata } from '../steam/metadata';
 import { steamEventKey } from '../storage/history-message';
 import type { HistoryStorage } from '../storage/history-storage';
@@ -1255,7 +1256,15 @@ function createChatService(options: ChatServiceOptions = {}) {
         if (url.pathname.startsWith('/proxy/sticker/')) {
           requireSteamAccountAccess(req, false);
           const type = decodeURIComponent(url.pathname.slice('/proxy/sticker/'.length));
-          const sticker = await loadOrDownloadSticker(type, { fetchImpl });
+          let sticker;
+          try {
+            sticker = await loadOrDownloadSticker(type, { fetchImpl });
+          } catch (error) {
+            if (!isRecord(error) || error.upstreamStatus !== 404) throw error;
+            const canonical = await resolveStickerAlias(type, { fetchImpl });
+            if (!canonical || canonical === type) throw error;
+            sticker = await loadOrDownloadSticker(canonical, { fetchImpl });
+          }
           textResponse(res, 200, sticker.buffer, { 'Content-Type': sticker.contentType, 'Cache-Control': 'public, max-age=86400' });
           return;
         }
@@ -1540,19 +1549,8 @@ async function defaultGetEmoticons({ steamUser, steamCommunity, waitForLogin, wa
   if (steamCommunity?.getUserInventoryContents && steamId) {
     // The SDK joins asset descriptions and follows all inventory pages, including non-tradable items.
     const inventory = await callMaybeCallback(steamCommunity.getUserInventoryContents, steamCommunity, [steamId, 753, 6, false]);
-    const owned = new Map<string, { name: string; title: string; imageUrl: string }>();
-    for (const item of entries(inventory)) {
-      if (!isRecord(item) || !Array.isArray(item.tags) || !item.tags.some(tag =>
-        isRecord(tag) && tag.category === 'item_class' && tag.internal_name === 'item_class_11')) continue;
-      // Community market hash names carry the app prefix; localized names are display-only.
-      const hashName = typeof item.market_hash_name === 'string' ? item.market_hash_name : '';
-      const name = hashName.replace(/^\d+-/, '');
-      if (!name || /[\[\]"\\\x00-\x1f]/.test(name)) continue;
-      const imageUrl = typeof item.icon_url === 'string' && item.icon_url
-        ? `https://community.cloudflare.steamstatic.com/economy/image/${item.icon_url}` : '';
-      owned.set(name, { name, title: typeof item.name === 'string' ? item.name : name, imageUrl });
-    }
-    stickers = [...owned.values()];
+    const { resolveStickerInventory } = await import('./sticker-inventory.js');
+    stickers = await resolveStickerInventory(entries(inventory));
   }
   return { emoticons, stickers };
 }

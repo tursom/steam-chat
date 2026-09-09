@@ -108,7 +108,7 @@ test('defaultGetEmoticons loads owned community stickers through the installed i
     } }
   });
   assert.deepEqual(calls, [['76561198000000001', 753, 6, false]]);
-  assert.deepEqual(data.stickers, [{ name: 'show love', title: 'Localized title', imageUrl: 'https://community.cloudflare.steamstatic.com/economy/image/icon/hash' }]);
+  assert.deepEqual(data.stickers, [{ name: 'show love', title: 'Localized title', imageUrl: 'https://community.cloudflare.steamstatic.com/economy/image/icon/hash', aliases: ['570-show love'] }]);
   assert.deepEqual(data.emoticons, [{ name: ':wave:' }]);
 });
 
@@ -129,7 +129,7 @@ test('owned sticker adaptation consumes actual SDK paginated CEconItems, includi
   const data = await defaultGetEmoticons({ steamUser: { steamID: '76561198000000001' }, steamCommunity: community });
   assert.deepEqual(pages, [undefined, '10']);
   assert.deepEqual(data.emoticons, []);
-  assert.deepEqual(data.stickers, [{ name: 'show love', title: 'Localized title', imageUrl: 'https://community.cloudflare.steamstatic.com/economy/image/hash' }]);
+  assert.deepEqual(data.stickers, [{ name: 'show love', title: 'Localized title', imageUrl: 'https://community.cloudflare.steamstatic.com/economy/image/hash', aliases: ['570-show love'] }]);
 });
 
 test('owned inventory errors are reported rather than disguised as an empty inventory', async () => {
