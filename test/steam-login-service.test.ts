@@ -102,9 +102,159 @@ test('SteamLoginService saves refresh tokens and logout deletes the persisted to
     logger: { info() {}, warn() {}, error() {} }
   });
 
+  service.login({ accountName: 'name', password: 'secret' });
   user.emit('refreshToken', 'next-token');
   assert.equal(fs.readFileSync(tokenPath, 'utf8'), 'next-token\n');
   service.logout();
   assert.equal(fs.existsSync(tokenPath), false);
   assert.equal(service.getStatus().status, 'logged_out');
+});
+
+function retryFixture() {
+  const tokenPath = tempTokenPath();
+  fs.writeFileSync(tokenPath, 'saved-token\n');
+  const calls: LogOnOptions[] = [];
+  const user = createUser(calls);
+  const tasks = new Map<number, { fn: () => void; delay: number }>();
+  let sequence = 0;
+  let connecting = false;
+  let cancellations = 0;
+  user.logOn = (options) => {
+    assert.equal(connecting, false, 'Already attempting to log on, cannot log on again');
+    connecting = true;
+    calls.push(options);
+  };
+  user.logOff = () => { connecting = false; cancellations += 1; };
+  const service = createSteamLoginService({
+    steamUser: user, refreshTokenPath: tokenPath,
+    logger: { info() {}, warn() {}, error() {} },
+    timers: {
+      setTimeout(fn: () => void, delay: number) { tasks.set(++sequence, { fn, delay }); return sequence; },
+      clearTimeout(id: number) { tasks.delete(id); }
+    }
+  });
+  function run(delay: number) {
+    const task = [...tasks].find(([, task]) => task.delay === delay);
+    assert.ok(task, `Expected timer at ${delay} ms`);
+    tasks.delete(task[0]);
+    task[1].fn();
+  }
+  return { service, user, calls, tasks, run, tokenPath, cancellations: () => cancellations };
+}
+
+test('repeated start does not enqueue another SDK logOn', () => {
+  const f = retryFixture();
+  const first = f.service.start();
+  assert.equal(f.service.start(), first);
+  assert.equal(f.calls.length, 1);
+  f.service.stop();
+});
+
+test('recoverable errors cancel SDK connection retries before application retry', () => {
+  const f = retryFixture();
+  f.service.start();
+  f.user.emit('error', new Error('socket timeout'));
+  f.user.emit('error', new Error('socket timeout'));
+  f.run(5000);
+  assert.equal(f.calls.length, 2);
+  assert.ok(f.cancellations() >= 1);
+  f.service.stop();
+});
+
+test('silent login times out without deleting credentials or reusing uncertain client', async () => {
+  const f = retryFixture();
+  const login = f.service.start();
+  f.run(120000);
+  await assert.rejects(login, /timed out/);
+  assert.equal(f.service.getStatus().status, 'error');
+  assert.equal(fs.readFileSync(f.tokenPath, 'utf8'), 'saved-token\n');
+  assert.equal(f.tasks.size, 0);
+  assert.throws(() => f.service.start(), /restart/i);
+  f.user.emit('loggedOn');
+  f.user.emit('refreshToken', 'late-token');
+  f.user.emit('webSession', 'late', ['late']);
+  f.user.emit('error', new Error('timeout'));
+  assert.equal(f.service.getStatus().status, 'error');
+  assert.equal(f.service.getLatestWebSession(), null);
+  assert.equal(fs.readFileSync(f.tokenPath, 'utf8'), 'saved-token\n');
+});
+
+test('Guard waiting suspends watchdog and submission rearms it', () => {
+  const f = retryFixture();
+  f.service.start();
+  f.user.emit('steamGuard', null, () => {}, false);
+  assert.equal(f.tasks.size, 0);
+  f.service.submitGuard('ABCDE');
+  f.run(120000);
+  assert.equal(f.service.getStatus().status, 'error');
+});
+
+test('stop ignores late events and settles pending login', async () => {
+  const f = retryFixture();
+  const login = f.service.start();
+  f.service.stop();
+  await assert.rejects(login, /stopped/);
+  f.user.emit('loggedOn');
+  f.user.emit('steamGuard', null, () => {}, false);
+  f.user.emit('disconnected', 0, 'timeout');
+  assert.equal(f.service.getStatus().status, 'logged_out');
+  assert.equal(f.tasks.size, 0);
+});
+
+test('fatal error cancels queued reconnect and successful login clears watchdog', () => {
+  const f = retryFixture();
+  f.service.start();
+  f.user.emit('error', new Error('socket timeout'));
+  f.user.emit('error', new Error('InvalidPassword'));
+  assert.equal(f.service.getStatus().status, 'error');
+  assert.equal(f.tasks.size, 0);
+  f.service.start();
+  f.user.emit('loggedOn');
+  assert.equal(f.service.getStatus().status, 'online');
+  assert.equal(f.tasks.size, 0);
+  f.user.emit('disconnected', 0, 'Logged off');
+  assert.equal(f.service.getStatus().status, 'reconnecting');
+  f.service.stop();
+});
+
+test('logout during pending login rejects waiters and ignores late Guard and token events', async () => {
+  const f = retryFixture();
+  const login = f.service.start();
+  f.service.logout();
+  await assert.rejects(login, /logged out/);
+  f.user.emit('steamGuard', null, () => { throw new Error('stale Guard callback'); }, false);
+  f.user.emit('refreshToken', 'late-token');
+  f.user.emit('loggedOn');
+  assert.equal(f.service.getStatus().status, 'logged_out');
+  assert.equal(fs.existsSync(f.tokenPath), false);
+  assert.equal(f.tasks.size, 0);
+  assert.throws(() => f.service.login({ accountName: 'name', password: 'secret' }), /restart/);
+});
+
+test('cancelled watchdog and reconnect callbacks cannot affect a later login', () => {
+  const f = retryFixture();
+  f.service.start();
+  const oldWatchdog = [...f.tasks.values()][0].fn;
+  f.user.emit('error', new Error('socket timeout'));
+  const oldRetry = [...f.tasks.values()][0].fn;
+  f.service.logout();
+  f.service.login({ accountName: 'name', password: 'secret' });
+  oldWatchdog();
+  oldRetry();
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.service.getStatus().status, 'logging_in');
+  f.service.stop();
+});
+
+test('online logout blocks new login until SDK disconnection and does not schedule reconnect', () => {
+  const f = retryFixture();
+  f.service.start();
+  f.user.emit('loggedOn');
+  f.service.logout();
+  assert.throws(() => f.service.login({ accountName: 'name', password: 'secret' }), /logout is still in progress/);
+  f.user.emit('disconnected', 0, 'Logged off');
+  assert.equal(f.tasks.size, 0);
+  f.service.login({ accountName: 'name', password: 'secret' });
+  assert.equal(f.calls.length, 2);
+  f.service.stop();
 });

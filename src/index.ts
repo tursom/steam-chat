@@ -52,7 +52,7 @@ type SteamCommunityMain = {
   sendImageToUser?: CallbackStyleFunction;
 };
 
-type SteamUserConstructor = new (options: { renewRefreshTokens: boolean }) => SteamUserMain;
+type SteamUserConstructor = new (options: { renewRefreshTokens: boolean; autoRelogin: boolean }) => SteamUserMain;
 type SteamCommunityConstructor = new () => SteamCommunityMain;
 type ChatServiceRuntime = {
   start: () => unknown;
@@ -70,7 +70,8 @@ const SteamCommunity = require('steamcommunity') as SteamCommunityConstructor;
 const SteamUser = require('steam-user') as SteamUserConstructor;
 
 const config = loadConfig();
-const steamUser = new SteamUser({ renewRefreshTokens: true });
+// The application owns reconnects; SDK auto-relogin would race scheduleReconnect.
+const steamUser = new SteamUser({ renewRefreshTokens: true, autoRelogin: false });
 const steamCommunity = new SteamCommunity();
 const users: Record<string, Persona> = {};
 const authStore = createAuthStore({ dbPath: AUTH_DB_PATH });
