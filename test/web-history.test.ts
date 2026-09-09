@@ -75,7 +75,7 @@ function harness(withLayout = false) {
       detached: () => historyDetached, busy: () => historyBusy};`, sandbox);
   const api = sandbox.__test as {
     refreshChatData: () => Promise<void>;
-    sendText: () => Promise<boolean>;
+    sendText: (explicitMessage?: string, previewMessage?: string) => Promise<boolean>;
     sendImage: (payload: Record<string, string>) => Promise<void>;
     loadHistory: (mode?: string, date?: string) => Promise<void>;
     loadConversations: (more?: boolean) => Promise<void>;
@@ -169,6 +169,20 @@ test('success without stable event identity keeps one sent row and no fake histo
   assert.equal(messages.children.length, 1);
   assert.equal(messages.children[0].dataset.sendState, 'sent');
   assert.equal(api.items().length, 0);
+});
+
+test('standalone sticker commands preserve the text draft and adopt the server rendering', async () => {
+  const { api, pending, nodes } = harness();
+  nodes['#messageInput'].value = 'unfinished text';
+  const sending = api.sendText('/sticker Show Love', '[sticker type="Show Love" limit="0"][/sticker]');
+  assert.equal(nodes['#messageInput'].value, 'unfinished text');
+  assert.equal(api.outgoing()[0].state, 'sending');
+  const literal = '\\[sticker type="Show Love" limit="0"]\\[/sticker]';
+  pending[0].resolve({ ok: true, item: { id: 'peer', echo: true, message: literal } });
+  await sending;
+  assert.equal(api.outgoing()[0].item.message, literal);
+  assert.equal(api.outgoing()[0].state, 'sent');
+  assert.equal(nodes['#messageInput'].value, 'unfinished text');
 });
 
 test('identical intentional sends stay distinct and preserve a newer composer draft', async () => {

@@ -153,6 +153,7 @@ type WebTestApi = {
   renderSteamView: () => FakeElement;
   renderMessage: (item: Record<string, unknown>) => FakeElement;
   renderPicker: (container: FakeElement) => void;
+  capturePickerSends: () => Array<{ text: string; preview: string }>;
   createElement: (tag: string) => FakeElement;
   setMediaInventory: (emoticons: Record<string, unknown>[], stickers: Record<string, unknown>[]) => void;
   filterChatEntries: (items: Record<string, unknown>[], query: string) => Record<string, unknown>[];
@@ -241,7 +242,7 @@ function loadWebTestApi(): WebTestApi & {
     setInterval,
     clearInterval
   };
-  const testSource = `${appSource.slice(0, bootstrapIndex)}\n;globalThis.__webTest = { pageSubtitle: () => { state.view = 'chat'; return pageSubtitle(); }, renderSteamView, renderMessage, renderPicker, createElement: (tag) => document.createElement(tag), setMediaInventory: (emoticons, stickers) => { state.emoticons = emoticons; state.stickers = stickers; }, filterChatEntries, openConversation, showChatList, getChatState: () => ({ activeId: state.activeId, activeName: state.activeName, chatPanel: state.chatPanel }), setChatAvailability: (online, accessAllowed, activeId) => { state.steam.status = online ? 'online' : 'logged_out'; state.steam.accessAllowed = accessAllowed; state.activeId = activeId; updateChatAvailability(); }, renderChatList: renderChatListSections, setChatListState: (recent, friends, groups, tab, query, activeId) => { state.conversations = recent; state.friends = friends; state.groups = groups; state.chatListTab = tab; state.chatQuery = query; state.activeId = activeId; }, renderChatView, mountChatView: () => { state.view = 'chat'; const view = renderChatView(); document.querySelector('#app').replaceChildren(view); return view; }, setFriendDetailsOpen, updateSteamStatus, renderFriendDetails };`;
+  const testSource = `${appSource.slice(0, bootstrapIndex)}\n;globalThis.__webTest = { pageSubtitle: () => { state.view = 'chat'; return pageSubtitle(); }, renderSteamView, renderMessage, renderPicker, capturePickerSends: () => { const calls = []; state.me = {id: 1}; state.view = 'chat'; state.activeId = 'peer'; state.steam.status = 'online'; state.steam.accessAllowed = true; sendText = (text, preview) => { calls.push({text, preview}); return Promise.resolve(true); }; return calls; }, createElement: (tag) => document.createElement(tag), setMediaInventory: (emoticons, stickers) => { state.emoticons = emoticons; state.stickers = stickers; }, filterChatEntries, openConversation, showChatList, getChatState: () => ({ activeId: state.activeId, activeName: state.activeName, chatPanel: state.chatPanel }), setChatAvailability: (online, accessAllowed, activeId) => { state.steam.status = online ? 'online' : 'logged_out'; state.steam.accessAllowed = accessAllowed; state.activeId = activeId; updateChatAvailability(); }, renderChatList: renderChatListSections, setChatListState: (recent, friends, groups, tab, query, activeId) => { state.conversations = recent; state.friends = friends; state.groups = groups; state.chatListTab = tab; state.chatQuery = query; state.activeId = activeId; }, renderChatView, mountChatView: () => { state.view = 'chat'; const view = renderChatView(); document.querySelector('#app').replaceChildren(view); return view; }, setFriendDetailsOpen, updateSteamStatus, renderFriendDetails };`;
   vm.runInNewContext(testSource, sandbox);
   assert.ok(sandbox.__webTest);
   return { ...sandbox.__webTest, clipboardWrites, lightbox, lightboxImage, offlineNote, chatControls, dispatchDocument };
@@ -414,13 +415,28 @@ test('emoticon parsing preserves literal surrounding punctuation and ordinary te
 test('sticker picker uses inventory thumbnail but sends the internal type', async () => {
   const api = loadWebTestApi();
   const view = api.mountChatView();
+  const sent = api.capturePickerSends();
+  view.findById('messageInput')!.value = 'unfinished draft';
   api.setMediaInventory([], [{ name: 'show love', title: 'Localized title', imageUrl: 'https://community.cloudflare.steamstatic.com/economy/image/hash' }]);
   const picker = api.createElement('div');
   picker.dataset.inventoryType = 'stickers';
   api.renderPicker(picker);
   assert.equal(picker.findByTag('img')!.src, `/proxy/image?url=${encodeURIComponent('https://community.cloudflare.steamstatic.com/economy/image/hash')}`);
   await picker.findByClass('picker-grid')!.findByTag('button')!.dispatch('click');
-  assert.equal(view.findById('messageInput')!.value, '[sticker type="show love" limit="0"][/sticker]');
+  assert.equal(view.findById('messageInput')!.value, 'unfinished draft');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].text, '/sticker show love');
+  assert.equal(sent[0].preview, '[sticker type="show love" limit="0"][/sticker]');
+});
+
+test('escaped literal markup remains text instead of becoming a fake sticker or emoticon', () => {
+  const { renderMessage } = loadWebTestApi();
+  for (const markup of ['[sticker type="Show Love" limit="0"][/sticker]', '[emoticon]Khappy[/emoticon]']) {
+    const message = markup.replace(/\[/g, '\\[');
+    const rendered = renderMessage({ id: '1', message });
+    assert.equal(rendered.findByClass('message-content')!.textContent, markup);
+    assert.equal(rendered.findAllByTag('img').length, 0);
+  }
 });
 
 test('web chat proxies emoticon picker thumbnails', () => {
@@ -446,14 +462,14 @@ test('picker exposes the complete inventory and rejects unsafe sticker markup', 
 });
 
 for (const name of ['steamhappy', ':steamhappy:', '\u02d0steamhappy\u02d0']) {
-  test(`picker inserts native emoticon markup for ${name}`, async () => {
+  test(`picker inserts official client emoticon syntax for ${name}`, async () => {
     const api = loadWebTestApi();
     const view = api.mountChatView();
     api.setMediaInventory([{ name }], []);
     const picker = api.createElement('div');
     api.renderPicker(picker);
     await picker.findByClass('picker-grid')!.findByTag('button')!.dispatch('click');
-    assert.equal(view.findById('messageInput')!.value, '[emoticon]steamhappy[/emoticon]');
+    assert.equal(view.findById('messageInput')!.value, ':steamhappy:');
   });
 }
 

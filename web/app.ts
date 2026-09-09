@@ -2254,13 +2254,15 @@ function finishOutgoing(entry: OutgoingMessage, status: OutgoingState, response?
   entry.error = error;
   if (isRecord(response)) {
     const account = state.steam.activeAccount?.steamId || state.steam.steamId;
-    const item = asMessages([response.item]).find(item => item.id === entry.item.id && item.echo && item.eventId
+    const item = asMessages([response.item]).find(item => item.id === entry.item.id && item.echo
       && (!item.steamAccountId || item.steamAccountId === account));
     if (item) {
       entry.item = item;
-      entry.eventId = item.eventId;
-      outgoingMessages.delete(entry.localId);
-      receiveHistoryMessage(item);
+      if (item.eventId) {
+        entry.eventId = item.eventId;
+        outgoingMessages.delete(entry.localId);
+        receiveHistoryMessage(item);
+      }
     }
   }
   if (entry.item.id === state.activeId) refreshOutgoing();
@@ -2365,9 +2367,15 @@ function appendMessageText(container: HTMLElement, text: string) {
 
 function findSupportedBbcodeStart(text: string, fromIndex: number): { start: number; tag: SupportedBbcodeTag } | null {
   supportedBbcodePattern.lastIndex = fromIndex;
-  const match = supportedBbcodePattern.exec(text);
-  const tag = match?.[1].toLowerCase() || '';
-  return match && isSupportedBbcodeTag(tag) ? { start: match.index, tag } : null;
+  let match: RegExpExecArray | null;
+  while ((match = supportedBbcodePattern.exec(text))) {
+    let escapes = 0;
+    for (let i = match.index - 1; i >= 0 && text[i] === '\\'; i--) escapes++;
+    if (escapes % 2) continue;
+    const tag = match[1].toLowerCase();
+    if (isSupportedBbcodeTag(tag)) return { start: match.index, tag };
+  }
+  return null;
 }
 
 function isSupportedBbcodeTag(value: string): value is SupportedBbcodeTag {
@@ -2683,6 +2691,7 @@ function steamImageNode(preview: SteamImagePreview) {
 }
 
 function appendInlineMessageText(container: HTMLElement, text: string) {
+  text = text.replace(/\\([\\\[])/g, '$1');
   const pattern = /(?<![A-Za-z0-9_]):([A-Za-z0-9_+\-.]+):(?![A-Za-z0-9_])|\u02d0([A-Za-z0-9_+\-.]+)\u02d0|(https?:\/\/[^\s<>"'\[\]]+)/gi;
   let lastIndex = 0;
   for (const match of text.matchAll(pattern)) {
@@ -2726,14 +2735,14 @@ function activeIdOrWarn() {
   return '';
 }
 
-async function sendText(): Promise<boolean> {
+async function sendText(explicitMessage?: string, previewMessage?: string): Promise<boolean> {
   const id = activeIdOrWarn();
   const input = document.querySelector<HTMLTextAreaElement>('#messageInput');
-  const draft = input?.value || '';
+  const draft = explicitMessage ?? input?.value ?? '';
   const msg = draft.trim();
   if (!id || !msg) return false;
-  const outgoing = beginOutgoing(id, msg);
-  if (input) { input.value = ''; resizeComposerInput(input); }
+  const outgoing = beginOutgoing(id, previewMessage ?? msg.replace(/\[/g, '\\['));
+  if (explicitMessage === undefined && input) { input.value = ''; resizeComposerInput(input); }
   try {
     const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId;
     const response = await api('/message', jsonBody({ id, msg, ...(steamAccountId ? { steamAccountId } : {}) }));
@@ -3005,7 +3014,14 @@ function renderPicker(container: HTMLElement) {
       button.addEventListener('click', () => {
         const input = document.querySelector<HTMLTextAreaElement>('#messageInput');
         if (!input) return;
-        input.value += type === 'emoticons' ? `[emoticon]${name}[/emoticon]` : `[sticker type="${name}" limit="0"][/sticker]`;
+        // Steam accepts a sticker command here; BBCode is the server's rendered reply.
+        if (type === 'stickers') {
+          if (!canSendImages()) return;
+          void sendText(`/sticker ${name}`, `[sticker type="${name}" limit="0"][/sticker]`);
+        } else {
+          input.value += `:${name}:`;
+          resizeComposerInput(input);
+        }
         input.focus();
       });
       grid.append(button);

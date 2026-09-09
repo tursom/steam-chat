@@ -1050,26 +1050,23 @@ function createChatService(options: ChatServiceOptions = {}) {
       const sender = steamUser.chat?.sendFriendMessage || steamUser.sendFriendMessage;
       const context = steamUser.chat?.sendFriendMessage ? steamUser.chat : steamUser;
       if (!sender) throw new Error('Steam chat sender is unavailable');
-      const args: unknown[] = [id, message];
-      // The SDK's default command-parsing mode escapes literal BBCode brackets.
-      if (steamUser.chat?.sendFriendMessage && /\[(?:sticker\b[^\]]*\]|emoticon\])/i.test(message)) {
-        args.push({ containsBbCode: false });
-      }
-      return callMaybeCallback(sender, context, args);
+      return callMaybeCallback(sender, context, [id, message]);
     });
-    remember(recentSentText, `${id}:${message}`);
+    const canonicalMessage = isRecord(result) && typeof result.modified_message === 'string'
+      ? result.modified_message : message;
+    remember(recentSentText, `${id}:${canonicalMessage}`);
     const record: HistoryRecordInput = {
       type: 'message',
       echo: true,
       steamAccountId,
       id,
       name: await selfName,
-      message
+      message: canonicalMessage
     };
     if (isRecord(result)) {
       if (typeof result.ordinal === 'string' || typeof result.ordinal === 'number') record.ordinal = result.ordinal;
       if (result.server_timestamp instanceof Date) record.sentAt = result.server_timestamp.toISOString();
-      record.steamEventKey = steamEventKey(steamAccountId, String(id), true, message, result.server_timestamp, result.ordinal);
+      record.steamEventKey = steamEventKey(steamAccountId, String(id), true, canonicalMessage, result.server_timestamp, result.ordinal);
     }
     return persistSent(record);
   }
