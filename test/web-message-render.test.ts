@@ -429,6 +429,15 @@ test('sticker picker uses inventory thumbnail but sends the internal type', asyn
   assert.equal(sent[0].preview, '[sticker type="show love" limit="0"][/sticker]');
 });
 
+test('historical unparsed sticker commands are not labelled as confirmed sends', () => {
+  const { renderMessage } = loadWebTestApi();
+  const rendered = renderMessage({ id: 'peer', eventId: 'old-command', echo: true, message: '/sticker CatchHeart' });
+  assert.equal(rendered.dataset.sendState, 'unknown');
+  assert.match(rendered.textContent, /贴纸结果未确认/);
+  assert.doesNotMatch(rendered.textContent, /已发送/);
+  assert.equal(rendered.findByClass('message-content')!.textContent, '/sticker CatchHeart');
+});
+
 test('escaped literal markup remains text instead of becoming a fake sticker or emoticon', () => {
   const { renderMessage } = loadWebTestApi();
   for (const markup of ['[sticker type="Show Love" limit="0"][/sticker]', '[emoticon]Khappy[/emoticon]']) {

@@ -16,11 +16,10 @@ type Definition = { name: string; title: string; aliases: string[] };
 type Catalog = Map<string, Definition | null>;
 type CacheEntry = { expires: number; promise: Promise<Catalog> };
 const caches = new WeakMap<typeof fetch, Map<string, CacheEntry>>();
-const MAX_APPS = 32;
+const MAX_FILTERED_APPS = 32;
 const MAX_PAGES = 4;
 const MAX_CACHE_ENTRIES = 64;
 const TIMEOUT_MS = 4000;
-const DECORATED = /\(Sticker\)-\d+$/;
 const safeName = (name: string): boolean => Boolean(name.trim()) && name.length <= 512 && !/[\[\]"\\\x00-\x1f\x7f]/.test(name);
 
 function addDefinition(catalog: Catalog, value: unknown, appids: Set<number>): void {
@@ -30,11 +29,17 @@ function addDefinition(catalog: Catalog, value: unknown, appids: Set<number>): v
       !Number.isSafeInteger(value.community_item_type) || Number(value.community_item_type) <= 0 ||
       !isRecord(value.community_item_data)) return;
   const data = value.community_item_data;
-  if (typeof data.item_name !== 'string' || !safeName(data.item_name)) return;
-  const name = data.item_name;
-  const decorated = `${name} (Sticker)-${value.community_item_type}`;
-  const aliases = [`${value.appid}-${name}`, `${value.appid}-${decorated}`, decorated];
-  const definition = { name, title: typeof data.item_title === 'string' && data.item_title ? data.item_title : name, aliases };
+  if (typeof value.internal_description !== 'string' || !safeName(value.internal_description)) return;
+  const name = value.internal_description;
+  const title = typeof data.item_title === 'string' && data.item_title ? data.item_title
+    : typeof data.item_name === 'string' && data.item_name ? data.item_name : name;
+  const labels = [...new Set([name, data.item_name, data.item_title])]
+    .filter((label): label is string => typeof label === 'string' && safeName(label));
+  const aliases = [...new Set(labels.flatMap(label => {
+    const decorated = `${label} (Sticker)-${value.community_item_type}`;
+    return [label, `${appid}-${label}`, decorated, `${appid}-${decorated}`];
+  }))];
+  const definition = { name, title, aliases };
   for (const alias of aliases) {
     const previous = catalog.get(alias);
     // Conflicting authoritative names must not silently pick the last definition.
@@ -101,7 +106,7 @@ function getCatalog(appids: number[], options: StickerInventoryOptions): Promise
     entry.expires = Date.now() + 10 * 60_000;
     return catalog;
   }, () => {
-    // Catalog outages should not hide safe, already-canonical inventory names.
+    // Fail closed until authoritative protocol names can be loaded again.
     entry.expires = Date.now() + 30_000;
     return new Map();
   });
@@ -111,7 +116,7 @@ function getCatalog(appids: number[], options: StickerInventoryOptions): Promise
 
 /** Historical messages may lack the app prefix, so their aliases use the public catalog. */
 export async function resolveStickerAlias(type: string, options: StickerInventoryOptions = {}): Promise<string | undefined> {
-  if (!safeName(type) || !DECORATED.test(type)) return undefined;
+  if (!safeName(type)) return undefined;
   const catalog = await getCatalog([], options);
   return catalog.get(type)?.name;
 }
@@ -128,20 +133,23 @@ export async function resolveStickerInventory(inventory: unknown[], options: Sti
     if (!safeName(name) || (match && (!Number.isSafeInteger(appid) || appid <= 0 || appid > 0xffffffff))) return [];
     return [{ item, name, appid, hash: item.market_hash_name }];
   });
-  // Only decorated inventory requires a catalog lookup. Normal bare types stay network-independent.
-  const appids = [...new Set(parsed.filter(item => DECORATED.test(item.name) && item.appid).map(item => item.appid))]
-    .sort((a, b) => a - b).slice(0, MAX_APPS);
-  const catalog = appids.length ? await getCatalog(appids, options) : new Map<string, Definition | null>();
+  if (!parsed.length) return [];
+  const appids = [...new Set(parsed.filter(item => item.appid).map(item => item.appid))]
+    .sort((a, b) => a - b);
+  // Large inventories and unprefixed aliases use the bounded public catalog, not a truncated app list.
+  const catalog = await getCatalog(appids.length > MAX_FILTERED_APPS || parsed.some(item => !item.appid)
+    ? [] : appids, options);
   const owned = new Map<string, InventorySticker>();
   for (const { item, name: bareName, hash } of parsed) {
     const definition = catalog.get(hash);
-    if (!definition && (DECORATED.test(bareName) || catalog.has(hash))) continue;
-    const name = definition?.name ?? bareName;
-    const aliases = [...new Set([hash, bareName, ...(definition?.aliases ?? [])])].filter(alias => alias !== name);
+    if (!definition) continue;
+    const name = definition.name;
+    const aliases = [...new Set([hash, bareName, ...definition.aliases])]
+      .filter(alias => alias !== name && catalog.get(alias)?.name === name);
     const previous = owned.get(name);
     owned.set(name, {
       name,
-      title: definition?.title ?? (typeof item.name === 'string' && item.name ? item.name : name),
+      title: definition.title,
       imageUrl: typeof item.icon_url === 'string' && item.icon_url
         ? `https://community.cloudflare.steamstatic.com/economy/image/${item.icon_url}` : '',
       aliases: [...new Set([...(previous?.aliases ?? []), ...aliases])]

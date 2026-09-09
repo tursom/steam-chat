@@ -95,9 +95,19 @@ test('defaultGetEmoticons accepts the name-keyed inventory returned by steam-use
   assert.deepEqual(data.emoticons, [emoticon]);
 });
 
-test('defaultGetEmoticons loads owned community stickers through the installed inventory SDK', async () => {
+// Public reward definition 153568; adapter tests must not depend on live catalog availability.
+function mockStickerCatalog(t: import('node:test').TestContext): void {
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ response: {
+    definitions: [{ appid: 1203420, defid: 153568, community_item_class: 11, community_item_type: 28,
+      internal_description: 'show love', community_item_data: { item_name: 'Show Love', item_title: 'Show Love' } }],
+    count: 1, total_count: 1
+  } }));
+}
+
+test('defaultGetEmoticons loads owned community stickers through the installed inventory SDK', async (t: import('node:test').TestContext) => {
+  mockStickerCatalog(t);
   const calls: unknown[][] = [];
-  const sticker = { appid: 753, market_hash_name: '570-show love', name: 'Localized title',
+  const sticker = { appid: 753, market_hash_name: '1203420-Show Love', name: 'Localized title',
     icon_url: 'icon/hash', tags: [{ category: 'item_class', internal_name: 'item_class_11' }] };
   const data = await defaultGetEmoticons({
     steamUser: { steamID: '76561198000000001', getEmoticonList: async () => ({ emoticons: { ':wave:': { name: ':wave:' } } }) },
@@ -108,11 +118,16 @@ test('defaultGetEmoticons loads owned community stickers through the installed i
     } }
   });
   assert.deepEqual(calls, [['76561198000000001', 753, 6, false]]);
-  assert.deepEqual(data.stickers, [{ name: 'show love', title: 'Localized title', imageUrl: 'https://community.cloudflare.steamstatic.com/economy/image/icon/hash', aliases: ['570-show love'] }]);
+  assert.equal(data.stickers.length, 1);
+  assert.equal(data.stickers[0].name, 'show love');
+  assert.equal(data.stickers[0].title, 'Show Love');
+  assert.equal(data.stickers[0].imageUrl, 'https://community.cloudflare.steamstatic.com/economy/image/icon/hash');
+  assert.ok(data.stickers[0].aliases.includes('1203420-Show Love'));
   assert.deepEqual(data.emoticons, [{ name: ':wave:' }]);
 });
 
-test('owned sticker adaptation consumes actual SDK paginated CEconItems, including non-tradable items', async () => {
+test('owned sticker adaptation consumes actual SDK paginated CEconItems, including non-tradable items', async (t: import('node:test').TestContext) => {
+  mockStickerCatalog(t);
   const SteamCommunity = require('steamcommunity');
   const pages: unknown[] = [];
   const community = new SteamCommunity();
@@ -122,14 +137,18 @@ test('owned sticker adaptation consumes actual SDK paginated CEconItems, includi
     queueMicrotask(() => callback(null, {}, {
       success: 1, total_inventory_count: 2, more_items: !second, last_assetid: '10',
       assets: [{ assetid: second ? '20' : '10', appid: 753, classid: '1', instanceid: '0', amount: '1' }],
-      descriptions: [{ classid: '1', instanceid: '0', tradable: 0, market_hash_name: '570-show love',
+      descriptions: [{ classid: '1', instanceid: '0', tradable: 0, market_hash_name: '1203420-Show Love',
         name: 'Localized title', icon_url: 'hash', tags: [{ category: 'item_class', internal_name: 'item_class_11', localized_tag_name: 'Sticker' }] }]
     }));
   };
   const data = await defaultGetEmoticons({ steamUser: { steamID: '76561198000000001' }, steamCommunity: community });
   assert.deepEqual(pages, [undefined, '10']);
   assert.deepEqual(data.emoticons, []);
-  assert.deepEqual(data.stickers, [{ name: 'show love', title: 'Localized title', imageUrl: 'https://community.cloudflare.steamstatic.com/economy/image/hash', aliases: ['570-show love'] }]);
+  assert.equal(data.stickers.length, 1);
+  assert.equal(data.stickers[0].name, 'show love');
+  assert.equal(data.stickers[0].title, 'Show Love');
+  assert.equal(data.stickers[0].imageUrl, 'https://community.cloudflare.steamstatic.com/economy/image/hash');
+  assert.ok(data.stickers[0].aliases.includes('1203420-Show Love'));
 });
 
 test('owned inventory errors are reported rather than disguised as an empty inventory', async () => {

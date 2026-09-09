@@ -2317,8 +2317,9 @@ function renderMessage(item: MessageItem) {
   const meta = create('div', 'meta');
   meta.append(create('span', '', item.name || (item.echo ? '我' : item.id)), create('span', '', formatTime(item.sentAt || item.date)));
   if (item.eventId && item.echo) {
-    row.dataset.sendState = 'sent';
-    meta.append(create('span', 'message-send-state', '已发送'));
+    const unparsedSticker = /^\/sticker(?:\s|$)/i.test((item.message || '').trim());
+    row.dataset.sendState = unparsedSticker ? 'unknown' : 'sent';
+    meta.append(create('span', 'message-send-state', unparsedSticker ? '贴纸结果未确认' : '已发送'));
   }
   const content = create('div', 'message-content');
   const message = item.message || '';

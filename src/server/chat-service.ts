@@ -1054,6 +1054,9 @@ function createChatService(options: ChatServiceOptions = {}) {
     });
     const canonicalMessage = isRecord(result) && typeof result.modified_message === 'string'
       ? result.modified_message : message;
+    if (/^\/sticker(?:\s|$)/i.test(message.trim()) && !/^\[sticker\b[^\]]*\]\s*\[\/sticker\]$/i.test(canonicalMessage.trim())) {
+      throw Object.assign(new Error('Steam 未确认贴纸解析，请先检查官方客户端。'), { statusCode: 502, uncertain: true });
+    }
     remember(recentSentText, `${id}:${canonicalMessage}`);
     const record: HistoryRecordInput = {
       type: 'message',

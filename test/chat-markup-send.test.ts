@@ -54,6 +54,27 @@ for (const { input, wire, canonical } of cases) {
   });
 }
 
+for (const reply of [undefined, { modified_message: '' }, { modified_message: '/sticker CatchHeart' }]) {
+  test(`unparsed sticker response is uncertain, not archived or automatically resent: ${JSON.stringify(reply)}`, async t => {
+    let sends = 0;
+    let appends = 0;
+    const user = Object.assign(new EventEmitter(), {
+      sendFriendMessage(_id: string, _message: string, callback: (error: null, reply: unknown) => void) {
+        sends++; callback(null, reply);
+      }
+    });
+    const service = createChatService({ steamUser: user, logger, historyStorage: {
+      canSend: () => true, append() { appends++; },
+      onMessage: () => () => {}, onStatus: () => () => {}, onDurable: () => () => {}
+    } });
+    t.after(() => service.stop());
+    await assert.rejects(service.sendTextMessage(peer, '/sticker CatchHeart', account),
+      (error: { statusCode?: number; uncertain?: boolean }) => error.statusCode === 502 && error.uncertain === true);
+    assert.equal(sends, 1);
+    assert.equal(appends, 0);
+  });
+}
+
 for (const result of [undefined, { ordinal: 7 }, { modified_message: '[sticker type="happy" limit="0"][/sticker]' }, { modified_message: '' }]) {
   test(`canonical event identity and legacy reply fallback: ${JSON.stringify(result)}`, async t => {
     const records: HistoryRecordInput[] = [];
@@ -62,7 +83,7 @@ for (const result of [undefined, { ordinal: 7 }, { modified_message: '[sticker t
     const user = Object.assign(new EventEmitter(), {
       sendFriendMessage(id: string, message: string, callback: (error: null, reply: unknown) => void) {
         assert.equal(id, peer);
-        assert.equal(message, '/sticker happy');
+        assert.equal(message, 'legacy text');
         callback(null, reply);
       }
     });
@@ -72,14 +93,14 @@ for (const result of [undefined, { ordinal: 7 }, { modified_message: '[sticker t
       onMessage: () => () => {}, onStatus: () => () => {}, onDurable: () => () => {}
     } });
     t.after(() => service.stop());
-    const item = await service.sendTextMessage(peer, '/sticker happy', account);
-    const canonical = result && 'modified_message' in result ? result.modified_message : '/sticker happy';
+    const item = await service.sendTextMessage(peer, 'legacy text', account);
+    const canonical = result && 'modified_message' in result ? result.modified_message : 'legacy text';
     assert.equal(item.message, canonical);
     assert.equal(records.length, 1);
     assert.equal(records[0].message, canonical);
     assert.equal(records[0].steamEventKey, reply ? steamEventKey(account, peer, true, canonical, timestamp, 7) : undefined);
-    if (reply && canonical !== '/sticker happy') {
-      assert.notEqual(records[0].steamEventKey, steamEventKey(account, peer, true, '/sticker happy', timestamp, 7));
+    if (reply && canonical !== 'legacy text') {
+      assert.notEqual(records[0].steamEventKey, steamEventKey(account, peer, true, 'legacy text', timestamp, 7));
     }
   });
 }
