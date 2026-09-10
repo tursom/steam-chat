@@ -10,6 +10,7 @@ const DEFAULT_REFRESH_TOKEN_PATH = path.resolve(__dirname, '..', '..', 'refresh.
 const INITIAL_RETRY_DELAY_MS = 5000;
 const MAX_RETRY_DELAY_MS = 5 * 60 * 1000;
 const LOGIN_TIMEOUT_MS = 2 * 60 * 1000;
+const STEAM_RESULT_NAMES: Record<number, string> = require('steam-user/enums/EResult');
 
 type Deferred<T> = {
   promise: Promise<T>;
@@ -121,6 +122,9 @@ function createDeferred<T = unknown>(): Deferred<T> {
 
 function codeOf(error: unknown): string {
   if (!error) return '';
+  if (isRecord(error) && typeof error.eresult === 'number') {
+    return (STEAM_RESULT_NAMES[error.eresult] || errorMessage(error)).toLowerCase();
+  }
   return errorCode(error).toLowerCase();
 }
 
@@ -516,7 +520,7 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
     lastError = errorMessage(reason);
     const delay = retryDelayMs;
     retryDelayMs = Math.min(retryDelayMs * 2, MAX_RETRY_DELAY_MS);
-    log('warn', `Steam reconnect scheduled in ${delay} ms`, { reason: errorMessage(reason) });
+    log('warn', `Steam reconnect scheduled in ${delay} ms (${codeOf(reason) || 'unknown'})`, { reason: errorMessage(reason) });
     const generation = retryGeneration;
     retryTimer = timers.setTimeout(() => {
       if (generation !== retryGeneration) return;
@@ -552,7 +556,7 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
       return;
     }
     status = 'error';
-    log('error', 'Steam login failed', { error: lastError });
+    log('error', `Steam login failed (${codeOf(error) || 'unknown'})`, { error: lastError });
   }
 
   function refreshWebSession(): Promise<WebSession> {

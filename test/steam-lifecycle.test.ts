@@ -56,6 +56,15 @@ test('login error classification separates recoverable and unrecoverable errors'
   assert.equal(isRecoverableLoginError(new Error('ECONNRESET socket closed')), true);
   assert.equal(isRecoverableLoginError(new Error('InvalidPassword')), false);
   assert.equal(isUnrecoverableLoginError(new Error('SteamGuard required')), true);
+  const results = require('steam-user/enums/EResult');
+  for (const name of ['NoConnection', 'Timeout', 'ServiceUnavailable', 'TryAnotherCM']) {
+    assert.equal(isRecoverableLoginError(Object.assign(new Error('Steam error'), { eresult: results[name] })), true, name);
+  }
+  for (const name of ['InvalidPassword', 'AccountDisabled', 'AccessDenied']) {
+    const error = Object.assign(new Error('connection failed'), { eresult: results[name] });
+    assert.equal(isRecoverableLoginError(error), false, name);
+    assert.equal(isUnrecoverableLoginError(error), true, name);
+  }
 });
 
 test('createSteamLifecycle logs on, resolves web session, saves refresh token, and avoids duplicate retry timers', async () => {

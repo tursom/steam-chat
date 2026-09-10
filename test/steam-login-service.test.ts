@@ -161,6 +161,27 @@ test('recoverable errors cancel SDK connection retries before application retry'
   f.service.stop();
 });
 
+test('numeric Steam NoConnection after login schedules a retry', async () => {
+  const f = retryFixture();
+  const login = f.service.start();
+  f.user.emit('loggedOn');
+  await login;
+  f.user.emit('error', Object.assign(new Error('NoConnection'), { eresult: 3 }));
+  assert.equal(f.service.getStatus().status, 'reconnecting');
+  f.run(5000);
+  assert.equal(f.calls.length, 2);
+  f.service.stop();
+});
+
+test('numeric credential errors do not schedule retries', () => {
+  const f = retryFixture();
+  f.service.start();
+  f.user.emit('error', Object.assign(new Error('InvalidPassword'), { eresult: 5 }));
+  assert.equal(f.service.getStatus().status, 'error');
+  assert.equal(f.tasks.size, 0);
+  f.service.stop();
+});
+
 test('silent login times out without deleting credentials or reusing uncertain client', async () => {
   const f = retryFixture();
   const login = f.service.start();
