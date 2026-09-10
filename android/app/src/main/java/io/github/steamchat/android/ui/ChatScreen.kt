@@ -28,6 +28,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -59,13 +60,27 @@ internal fun ChatScreen(state: AppState, repository: ChatRepository, loader: UiI
     val name = state.selectedName.ifBlank { friend?.name ?: selectedPeer }
     val avatar = friend?.avatar?.ifBlank { conversation?.avatar.orEmpty() } ?: conversation?.avatar.orEmpty()
     val messages = state.messages.filter { it.peerId == selectedPeer }
-    val scroll = rememberLazyListState()
+    val scroll = key(state.server, state.activeAccountId, selectedPeer) {
+        rememberLazyListState(initialFirstVisibleItemIndex = messages.size)
+    }
+    var positioned by remember(state.server, state.activeAccountId, selectedPeer) { mutableStateOf(false) }
+    var previousCount by remember(state.server, state.activeAccountId, selectedPeer) { mutableIntStateOf(0) }
+    var previousLastKey by remember(state.server, state.activeAccountId, selectedPeer) { mutableStateOf<String?>(null) }
     val canSend = state.loggedIn && state.accessAllowed && state.connected && state.steamOnline
-    LaunchedEffect(selectedPeer, messages.lastOrNull()?.key, messages.size) {
-        if (messages.isNotEmpty()) {
-            val nearBottom = scroll.layoutInfo.visibleItemsInfo.lastOrNull()?.index?.let { it >= messages.size - 3 } ?: true
-            if (nearBottom || messages.last().echo) scroll.animateScrollToItem(messages.lastIndex)
+    LaunchedEffect(state.server, state.activeAccountId, selectedPeer, messages.lastOrNull()?.key, messages.size) {
+        if (messages.isEmpty()) {
+            positioned = false; previousCount = 0; previousLastKey = null
+            return@LaunchedEffect
         }
+        val nearBottom = scroll.layoutInfo.visibleItemsInfo.lastOrNull()?.index?.let { it >= previousCount - 2 } ?: true
+        val localSend = messages.last().let { it.key != previousLastKey && it.echo && it.key.startsWith("local:") }
+        val initial = !positioned
+        positioned = true
+        previousCount = messages.size
+        previousLastKey = messages.last().key
+        // The end anchor also exposes the bottom of a message taller than the viewport.
+        if (initial) scroll.scrollToItem(messages.size)
+        else if (nearBottom || localSend) scroll.animateScrollToItem(messages.size)
     }
     Column(Modifier.fillMaxSize()) {
         Row(Modifier.fillMaxWidth().heightIn(min = 66.dp).padding(horizontal = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -83,11 +98,12 @@ internal fun ChatScreen(state: AppState, repository: ChatRepository, loader: UiI
             !state.connected -> "${state.connectionText} · 暂不能发送消息"
             else -> "Steam 未在线 · 暂不能发送消息"
         }, Modifier.fillMaxWidth().background(Color(0xFFFAF5E9)).padding(10.dp), color = Color(0xFF9B793E), style = MaterialTheme.typography.bodySmall)
-        LazyColumn(Modifier.weight(1f).fillMaxWidth(), state = scroll, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
+        LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("chat-messages"), state = scroll, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
             if (messages.isEmpty()) item { EmptyState(if (state.loading) "正在加载消息…" else "暂无消息") }
             items(messages, key = { it.key }) { message ->
                 MessageRow(message, avatar, loader, { lightbox = it }, { retry = message.key })
             }
+            item(key = "chat-end") { Spacer(Modifier.fillMaxWidth().height(1.dp).testTag("chat-end")) }
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
         Column(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 8.dp)) {
@@ -114,7 +130,8 @@ internal fun ChatScreen(state: AppState, repository: ChatRepository, loader: UiI
                 }
             }
         }
-        if (showInventory) InventoryPanel(state, loader, { draft += it }, { showInventory = false })
+        if (showInventory) InventoryPanel(state, loader, { draft += it },
+            { repository.sendSticker(it); showInventory = false }, canSend, { showInventory = false })
     }
     lightbox?.let { ImageLightbox(it, loader) { lightbox = null } }
     retry?.let { key -> AlertDialog(onDismissRequest = { retry = null }, title = { Text("确认重新发送？") },
@@ -175,7 +192,8 @@ private fun MessageContent(part: MessagePart, loader: UiImageLoader, viewImage: 
 }
 
 @Composable
-private fun InventoryPanel(state: AppState, loader: UiImageLoader, insert: (String) -> Unit, close: () -> Unit) {
+internal fun InventoryPanel(state: AppState, loader: UiImageLoader, insert: (String) -> Unit,
+                            sendSticker: (String) -> Unit, canSendSticker: Boolean, close: () -> Unit) {
     var tab by rememberSaveable { mutableIntStateOf(0) }
     Column(Modifier.fillMaxWidth().height(226.dp).background(MaterialTheme.colorScheme.surfaceVariant)) {
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -186,19 +204,21 @@ private fun InventoryPanel(state: AppState, loader: UiImageLoader, insert: (Stri
             when (tab) {
                 0 -> state.emoticons.mapNotNull(::inventoryName).distinct()
                 1 -> listOf("😀", "😊", "😂", "🥰", "😎", "🤔", "😮", "😭", "👍", "👏", "❤️", "🎉", "🔥", "✨", "🎮", "☕")
-                else -> state.stickers.map { it.trim() }.filter { it.isNotEmpty() && it.length <= 256 && it.none(Char::isISOControl) }.distinct()
+                else -> state.stickers.mapNotNull(io.github.steamchat.android.data.Protocol::stickerName).distinct()
             }
         }
         if (inventory.isEmpty()) EmptyState(if (state.loading) "正在加载库存…" else "暂无可用库存")
         LazyVerticalGrid(GridCells.Adaptive(64.dp), contentPadding = PaddingValues(8.dp)) {
             items(inventory, key = { it }) { item ->
-                Column(Modifier.height(76.dp).clip(RoundedCornerShape(6.dp)).clickable {
-                    insert(when (tab) { 0 -> ":$item:"; 1 -> item; else -> stickerMarkup(item) })
+                val title = if (tab == 2) state.stickerInventory.firstOrNull { it.name == item }?.title ?: item else item
+                Column(Modifier.height(76.dp).clip(RoundedCornerShape(6.dp)).clickable(enabled = tab != 2 || canSendSticker) {
+                    if (tab == 2) sendSticker(item)
+                    else insert(if (tab == 0) ":$item:" else item)
                 }.padding(4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
                     if (tab == 1) Text(item, style = MaterialTheme.typography.headlineSmall, modifier = Modifier.height(48.dp))
                     else {
-                        MediaImage(if (tab == 0) emoticonSource(item) else stickerSource(item), loader, item, Modifier.size(44.dp))
-                        Text(item, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall)
+                        MediaImage(if (tab == 0) emoticonSource(item) else stickerSource(item), loader, title, Modifier.size(44.dp))
+                        Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis, style = MaterialTheme.typography.labelSmall)
                     }
                 }
             }

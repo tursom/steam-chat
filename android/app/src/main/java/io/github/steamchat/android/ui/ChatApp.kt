@@ -60,7 +60,7 @@ fun ChatApp(repository: ChatRepository, notificationsAllowed: Boolean, requestNo
             openNotificationSettings: () -> Unit) {
     val state by repository.state.collectAsStateWithLifecycle()
     SteamChatTheme {
-        val loader = remember(repository, state.loggedIn, state.server, state.activeAccountId, state.accessAllowed) { UiImageLoader(repository) }
+        val loader = remember(repository, state.loggedIn, state.server, state.activeAccountId, state.accessAllowed, state.stickerInventory) { UiImageLoader(repository) }
         DisposableEffect(loader) { onDispose { loader.clear() } }
         var tab by rememberSaveable { mutableIntStateOf(0) }
         val snackbar = remember { SnackbarHostState() }

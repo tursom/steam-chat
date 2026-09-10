@@ -35,7 +35,7 @@ fun inventoryName(value: String): String? = value.trim().trim(':').takeIf {
 }
 private fun encoded(value: String) = URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 fun emoticonSource(name: String) = "https://community.cloudflare.steamstatic.com/economy/emoticon/${encoded(name)}"
-fun stickerSource(name: String) = "/proxy/sticker/${encoded(name)}"
+fun stickerSource(name: String) = io.github.steamchat.android.data.Protocol.stickerPath(name)
 fun stickerMarkup(name: String) = "[sticker type=\"${name.replace("\\", "\\\\").replace("\"", "\\\"")}\" limit=\"0\"][/sticker]"
 
 object SteamMessageParser {

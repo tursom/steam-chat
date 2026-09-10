@@ -52,6 +52,7 @@ class ForegroundSyncLatencyTest {
     private var syncFail = false
     private var syncDenied = false
     private var steam = "steam1"
+    private var mediaBody = """{"emoticons":[],"stickers":[]}"""
     private var onFriends: () -> Unit = {}
     private val requests = CopyOnWriteArrayList<String>()
     private val releases = mutableListOf<CountDownLatch>()
@@ -103,7 +104,7 @@ class ForegroundSyncLatencyTest {
                         .put("nextCursor", "cursor-$syncCalls").put("hasMore", false).toString()
                 }
                 "/api/friends" -> { code = if (friendsFail) 503 else friendsCode; onFriends(); """[{"id":"peer1","name":"Metadata friend"}]""" }
-                "/api/emoticons" -> """{"emoticons":[],"stickers":[]}"""
+                "/api/emoticons" -> mediaBody
                 "/api/config" -> """{"wsPath":"/ws"}"""
                 "/ws" -> { code = 503; "{}" }
                 "/api/auth/logout" -> "{}"
@@ -125,6 +126,18 @@ class ForegroundSyncLatencyTest {
         field<ChatCache>("cache").close()
         field<OkHttpClient>("client").dispatcher.cancelAll()
         field<OkHttpClient>("client").connectionPool.evictAll()
+    }
+
+    @Test fun stickerInventoryRetainsPreviewAndAliasMetadata() {
+        val imageUrl = "https://community.cloudflare.steamstatic.com/economy/image/catalog-image"
+        mediaBody = JSONObject().put("emoticons", JSONArray()).put("stickers", JSONArray().put(JSONObject()
+            .put("name", "canonical-sticker").put("title", "Friendly title").put("imageUrl", imageUrl)
+            .put("aliases", JSONArray().put("legacy-sticker")))).toString()
+        startWorker()
+        awaitMetadata()
+        assertEquals(listOf("canonical-sticker"), repository.state.value.stickers)
+        assertTrue("Dropping preview URLs prevents fallback for unavailable sticker endpoints", repository.state.value.toString().contains(imageUrl))
+        assertTrue(repository.state.value.toString().contains("legacy-sticker"))
     }
 
     @Test fun foregroundHintPublishesMessageWithoutMandatoryOneSecondSleep() {
@@ -318,6 +331,7 @@ class ForegroundSyncLatencyTest {
         assertTrue(retry in 1..2000)
         scheduler.advanceTimeBy(retry)
         scheduler.runCurrent()
+        awaitMetadata() // Reconnect config now runs independently of the serialized sync worker.
         assertEquals(2, requests.count { it == "/api/config" })
         awaitMetadata()
     }

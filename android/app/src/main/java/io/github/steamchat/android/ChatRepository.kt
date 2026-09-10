@@ -33,7 +33,7 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
-class ChatRepository(private val context: Context) {
+class ChatRepository(private val context: Context, private val socketFactory: WebSocket.Factory? = null) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val gate = Mutex()
     private val vault = SessionVault(context)
@@ -53,12 +53,22 @@ class ChatRepository(private val context: Context) {
     private var userId = ""
     private var accountSteamId = ""
     @Volatile private var cacheScope = ""
-    private var socket: WebSocket? = null
-    private var wsPath = "/ws"
+    private val connectionLock = Any()
+    @Volatile private var socket: WebSocket? = null
+    private var socketVersion = 0L
+    private var socketDeadline = Long.MAX_VALUE
+    private var socketWorker: Job? = null
+    private var socketConnect: Job? = null
+    private val connectionHints = Channel<Unit>(Channel.CONFLATED)
+    private var defaultNetwork: Network? = null
+    private var lastRecovery = Long.MIN_VALUE
+    @Volatile private var recoveryVersion = 0L
+    @Volatile private var activeRead: Call? = null
+    private class RecoveryInterrupted : IOException()
     private var reconnectAt = 0L
     private var attempts = 0
     @Volatile private var httpRetryAt = 0L
-    private var syncAt = 0L
+    @Volatile private var syncAt = 0L
     private var now: () -> Long = SystemClock::elapsedRealtime
     private class MetadataRefresh(var job: Job? = null, var nextAt: Long = 0)
     private val friendsRefresh = MetadataRefresh()
@@ -67,7 +77,7 @@ class ChatRepository(private val context: Context) {
     private var worker: Job? = null
     private val hints = Channel<Unit>(Channel.CONFLATED)
     private val outgoing = linkedMapOf<String, Outgoing>()
-    private data class Outgoing(val message: Message, val scope: String, val uri: Uri? = null, val confirmedEventId: String = "")
+    private data class Outgoing(val message: Message, val scope: String, val uri: Uri? = null, val confirmedEventId: String = "", val wireText: String = message.text)
     private class HttpFailure(val status: Int) : IOException("HTTP $status")
 
     init {
@@ -87,13 +97,21 @@ class ChatRepository(private val context: Context) {
         runCatching {
             (context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).registerDefaultNetworkCallback(object : ConnectivityManager.NetworkCallback() {
                 override fun onAvailable(network: Network) {
-                    scope.launch { gate.withLock {
-                        if (httpRetryAt > now() + 1000) httpRetryAt = now() + 1000
-                        if (reconnectAt > now() + 1000) reconnectAt = now() + 1000
-                        hints.trySend(Unit)
-                    } }
+                    synchronized(connectionLock) {
+                        if (defaultNetwork == network) return
+                        defaultNetwork = network
+                        recoverConnection()
+                    }
                 }
-                override fun onLost(network: Network) { hints.trySend(Unit) }
+                override fun onLost(network: Network) {
+                    synchronized(connectionLock) {
+                        if (defaultNetwork != network) return
+                        defaultNetwork = null
+                        invalidateSocket()
+                        mutable.update { if (it.accessAllowed) it.copy(connected = false, connectionText = "网络已断开，等待恢复") else it }
+                        connectionHints.trySend(Unit)
+                    }
+                }
             })
         }
     }
@@ -118,15 +136,29 @@ class ChatRepository(private val context: Context) {
         val builder = Request.Builder().url(url)
         if (cookie.isNotEmpty()) builder.header("Cookie", cookie)
         if (body != null) builder.post(body.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
-        client.newCall(builder.build()).execute().use { response ->
-            if (version != generation) throw CancellationException()
-            if (!response.isSuccessful) throw HttpFailure(response.code)
-            response.headers.values("Set-Cookie").mapNotNull { Cookie.parse(url, it) }.firstOrNull { it.name == "steam_chat_session" }?.let {
-                cookie = "${it.name}=${it.value}"; expires = minOf(it.expiresAt, System.currentTimeMillis() + 7 * 86400_000L)
-                vault.save(JSONObject().put("server", root.toString()).put("cookie", cookie).put("expires", expires))
-            }
-            return response.body?.byteStream()?.use { String(bounded(it, 4 * 1024 * 1024), Charsets.UTF_8) } ?: "{}"
+        val call = client.newCall(builder.build())
+        val readVersion = synchronized(connectionLock) {
+            if (body == null) activeRead = call
+            recoveryVersion
         }
+        try {
+            call.execute().use { response ->
+                if (version != generation) throw CancellationException()
+                if (body == null && readVersion != recoveryVersion) throw RecoveryInterrupted()
+                if (!response.isSuccessful) throw HttpFailure(response.code)
+                response.headers.values("Set-Cookie").mapNotNull { Cookie.parse(url, it) }.firstOrNull { it.name == "steam_chat_session" }?.let {
+                    cookie = "${it.name}=${it.value}"; expires = minOf(it.expiresAt, System.currentTimeMillis() + 7 * 86400_000L)
+                    vault.save(JSONObject().put("server", root.toString()).put("cookie", cookie).put("expires", expires))
+                }
+                val result = response.body?.byteStream()?.use { String(bounded(it, 4 * 1024 * 1024), Charsets.UTF_8) } ?: "{}"
+                if (version != generation) throw CancellationException()
+                if (body == null && readVersion != recoveryVersion) throw RecoveryInterrupted()
+                return result
+            }
+        } catch (e: IOException) {
+            if (body == null && readVersion != recoveryVersion) throw RecoveryInterrupted()
+            throw e
+        } finally { if (activeRead === call) activeRead = null }
     }
     private fun json(path: String, body: JSONObject? = null) = JSONObject(request(path, body))
 
@@ -172,7 +204,10 @@ class ChatRepository(private val context: Context) {
         httpRetryAt = 0; syncAt = 0; reconnectAt = 0; attempts = 0
         cookie = ""; expires = 0; vault.clear()
         worker?.cancel(); worker = null
-        socket?.cancel(); socket = null
+        synchronized(connectionLock) {
+            invalidateSocket()
+            socketWorker?.cancel(); socketWorker = null
+        }
         client.dispatcher.cancelAll()
         mediaCache.clear()
         cache.clearAll()
@@ -183,7 +218,9 @@ class ChatRepository(private val context: Context) {
     }
     private fun allowed() = !sessionEnding && (state.value.loggedIn || cookie.isNotEmpty()) && (foreground || state.value.backgroundEnabled)
     private fun startWorker() {
-        if (!allowed() || worker?.isActive == true) return
+        if (!allowed()) return
+        startSocketWorker()
+        if (worker?.isActive == true) return
         worker = scope.launch {
             var syncRequested = true
             while (isActive && allowed()) {
@@ -197,15 +234,13 @@ class ChatRepository(private val context: Context) {
                                 syncAt = now() + 30_000
                                 syncRequested = false
                             }
-                            if (state.value.accessAllowed && socket == null && now() >= maxOf(reconnectAt, httpRetryAt)) connectSocket()
+                            connectionHints.trySend(Unit)
                         }
                     } catch (e: CancellationException) { throw e } catch (e: Exception) {
                         handleFailure(e)
                     }
-                    val nextSync = if (httpRetryAt > 0) httpRetryAt else if (syncRequested) now() else syncAt
-                    val nextReconnect = if (state.value.accessAllowed && socket == null) reconnectAt else Long.MAX_VALUE
-                    // A failed HTTP config request also respects the sync retry deadline.
-                    val next = minOf(nextSync, maxOf(nextReconnect, httpRetryAt))
+                    connectionHints.trySend(Unit)
+                    val next = if (httpRetryAt > 0) httpRetryAt else if (syncRequested) now() else syncAt
                     (next - now()).coerceAtLeast(1)
                 }
                 syncRequested = withTimeoutOrNull(wait) { hints.receive(); true } ?: false
@@ -304,8 +339,8 @@ class ChatRepository(private val context: Context) {
         launchRefresh(mediaRefresh, "/api/emoticons", 30 * 60_000) { body ->
             val media = JSONObject(body)
             val emoticons = mediaNames(media.optJSONArray("emoticons"))
-            val stickers = mediaNames(media.optJSONArray("stickers"))
-            mutable.update { if (current()) it.copy(emoticons = emoticons, stickers = stickers) else it }
+            val stickers = Protocol.stickerInventory(media.optJSONArray("stickers"))
+            mutable.update { if (current()) it.copy(emoticons = emoticons, stickers = stickers.map { sticker -> sticker.name }, stickerInventory = stickers) else it }
         }
     }
     // Metadata never rotates credentials; only serialized authoritative requests may do that.
@@ -332,51 +367,160 @@ class ChatRepository(private val context: Context) {
     }
     private fun hideAccount(reason: String = "无 Steam 账户访问权限") {
         cancelMetadata()
-        socket?.cancel(); socket = null
+        synchronized(connectionLock) { invalidateSocket(); reconnectAt = 0; attempts = 0 }
         cacheScope = ""; accountSteamId = ""; outgoing.clear()
         mediaCache.close()
-        mutable.update { it.copy(activeAccountId = "", accessAllowed = false, steamOnline = false, connected = false, connectionText = reason, conversations = emptyList(), friends = emptyList(), messages = emptyList(), emoticons = emptyList(), stickers = emptyList(), selectedPeer = "", selectedName = "") }
+        mutable.update { it.copy(activeAccountId = "", accessAllowed = false, steamOnline = false, connected = false, connectionText = reason, conversations = emptyList(), friends = emptyList(), messages = emptyList(), emoticons = emptyList(), stickers = emptyList(), stickerInventory = emptyList(), selectedPeer = "", selectedName = "") }
         ChatNotifications.clearMessages(context)
     }
-    private fun connectSocket() {
-        wsPath = json("/api/config").getString("wsPath")
-        val url = Protocol.endpoint(base!!, wsPath)
-        val version = generation
-        val account = cacheScope
-        socket = client.newWebSocket(Request.Builder().url(url).header("Cookie", cookie).build(), object : WebSocketListener() {
-            override fun onOpen(webSocket: WebSocket, response: Response) {
-                launchAction {
-                    if (version != generation || account != cacheScope || !allowed() || socket !== webSocket) { webSocket.cancel(); return@launchAction }
-                    attempts = 0
-                    mutable.update { it.copy(connected = true, connectionText = connectionText(true, it.steamOnline)) }
-                    hints.trySend(Unit)
+    // Never take gate while holding connectionLock: gate may be occupied by a blocking HTTP call.
+    private fun invalidateSocket() {
+        socketVersion++
+        socketConnect?.cancel(); socketConnect = null
+        val obsolete = socket
+        socket = null
+        socketDeadline = Long.MAX_VALUE
+        obsolete?.cancel()
+    }
+    private fun recoverConnection() = synchronized(connectionLock) {
+        if (!allowed()) return@synchronized
+        invalidateSocket()
+        // Coalesce flapping network/lifecycle signals into at most one attempt per second.
+        val timestamp = now()
+        val deadline = if (lastRecovery == Long.MIN_VALUE) timestamp else maxOf(timestamp, lastRecovery + 1_000)
+        if (deadline == timestamp) lastRecovery = timestamp
+        attempts = 0
+        reconnectAt = deadline
+        recoveryVersion++
+        activeRead?.cancel() // GET only; never replay or cancel a message POST to reconnect.
+        httpRetryAt = deadline
+        syncAt = deadline
+        mutable.update { if (it.accessAllowed) it.copy(connected = false, connectionText = "正在恢复连接…") else it }
+        hints.trySend(Unit)
+        startSocketWorker()
+        connectionHints.trySend(Unit)
+    }
+    private fun startSocketWorker() = synchronized(connectionLock) {
+        if (!allowed() || socketWorker?.isActive == true) return@synchronized
+        socketWorker = scope.launch {
+            while (isActive && allowed()) {
+                val wait = synchronized(connectionLock) {
+                    if (state.value.accessAllowed) {
+                        if (socket != null && now() >= socketDeadline) {
+                            invalidateSocket()
+                            scheduleSocketRetry()
+                        }
+                        if (socket == null && socketConnect?.isActive != true && now() >= reconnectAt) {
+                            socketConnect = scope.launch { connectSocket() }
+                        }
+                    }
+                    val next = when {
+                        !state.value.accessAllowed -> Long.MAX_VALUE
+                        socket != null -> socketDeadline
+                        socketConnect?.isActive == true -> Long.MAX_VALUE
+                        else -> reconnectAt
+                    }
+                    (next - now()).coerceAtLeast(1)
+                }
+                withTimeoutOrNull(wait) { connectionHints.receive() }
+            }
+        }
+    }
+    private fun scheduleSocketRetry() {
+        attempts = (attempts + 1).coerceAtMost(6)
+        reconnectAt = now() + Random.nextLong(1000, (1000L shl attempts).coerceAtMost(60_000))
+        mutable.update { if (it.accessAllowed) it.copy(connected = false, connectionText = "连接已断开，正在重试（HTTP 同步仍会尝试）") else it }
+        connectionHints.trySend(Unit)
+    }
+    private suspend fun connectSocket() {
+        val root: HttpUrl
+        val version: Long
+        val account: String
+        val token: Long
+        val capturedCookie: String
+        synchronized(connectionLock) {
+            root = base ?: return
+            version = generation
+            account = cacheScope
+            token = socketVersion
+            capturedCookie = cookie
+        }
+        fun current() = version == generation && account == cacheScope && token == socketVersion &&
+            allowed() && state.value.accessAllowed
+        try {
+            if (expires <= System.currentTimeMillis()) throw HttpFailure(401)
+            // Config has its own cancellable deadline/backoff; optional metadata and sync cannot block it.
+            val config = withTimeout(15_000) { metadataRequest(root, capturedCookie, "/api/config") }
+            val url = Protocol.endpoint(root, JSONObject(config).getString("wsPath"))
+            synchronized(connectionLock) {
+                if (!current()) return
+                if (cookie != capturedCookie) { scheduleSocketRetry(); return }
+                mutable.update { it.copy(connected = false, connectionText = "正在连接服务器…") }
+                socketDeadline = now() + 20_000
+                socket = (socketFactory ?: client).newWebSocket(Request.Builder().url(url).header("Cookie", capturedCookie).build(), object : WebSocketListener() {
+                    override fun onOpen(webSocket: WebSocket, response: Response) = synchronized(connectionLock) {
+                        if (!current() || socket !== webSocket) { webSocket.cancel(); return@synchronized }
+                        // OkHttp's 30s ping + next-ping timeout detects an idle half-open socket.
+                        socketDeadline = Long.MAX_VALUE
+                        attempts = 0
+                        mutable.update { it.copy(connected = true, connectionText = connectionText(true, it.steamOnline)) }
+                        hints.trySend(Unit)
+                        connectionHints.trySend(Unit)
+                        Unit
+                    }
+                    override fun onMessage(webSocket: WebSocket, text: String) = synchronized(connectionLock) {
+                        if (!current() || socket !== webSocket) return@synchronized
+                        val type = runCatching { JSONObject(text).optString("type") }.getOrNull()
+                        if (type in listOf("sync_available", "message", "ready", "steam_status", "status")) hints.trySend(Unit)
+                        Unit
+                    }
+                    override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
+                        webSocket.close(code, null)
+                        failed(webSocket, null)
+                    }
+                    override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = failed(webSocket, null)
+                    override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = failed(webSocket, response?.code)
+                    private fun failed(webSocket: WebSocket, status: Int?) = synchronized(connectionLock) {
+                        if (!current() || socket !== webSocket) return@synchronized
+                        invalidateSocket()
+                        scheduleSocketRetry()
+                        if (status == 401 || status == 403) rejectSocketAuthorization(status, version, account, capturedCookie)
+                    }
+                })
+            }
+        } catch (e: CancellationException) {
+            if (e !is TimeoutCancellationException) throw e
+            synchronized(connectionLock) { if (current()) scheduleSocketRetry() }
+        } catch (e: Exception) {
+            synchronized(connectionLock) {
+                if (current()) {
+                    scheduleSocketRetry()
+                    if (e is HttpFailure && e.status in listOf(401, 403)) rejectSocketAuthorization(e.status, version, account, capturedCookie)
                 }
             }
-            override fun onMessage(webSocket: WebSocket, text: String) {
-                if (version != generation || account != cacheScope) return
-                val type = runCatching { JSONObject(text).optString("type") }.getOrNull()
-                if (type in listOf("sync_available", "message", "ready", "steam_status", "status")) hints.trySend(Unit)
+        } finally {
+            synchronized(connectionLock) {
+                if (token == socketVersion) socketConnect = null
+                connectionHints.trySend(Unit)
             }
-            override fun onClosing(webSocket: WebSocket, code: Int, reason: String) { webSocket.close(code, null) }
-            override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = failed(webSocket, null)
-            override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = failed(webSocket, response?.code)
-            private fun failed(webSocket: WebSocket, status: Int?) {
-                launchAction {
-                    if (version != generation || socket !== webSocket) return@launchAction
-                    socket = null
-                    if (status == 401) { endSession("登录已过期，请重新登录"); return@launchAction }
-                    if (status == 403) { hideAccount(); return@launchAction }
-                    attempts = (attempts + 1).coerceAtMost(6)
-                    reconnectAt = now() + Random.nextLong(1000, (1000L shl attempts).coerceAtMost(60_000))
-                    hints.trySend(Unit)
-                    mutable.update { it.copy(connected = false, connectionText = "连接已断开，等待重连") }
+        }
+    }
+    private fun rejectSocketAuthorization(status: Int, version: Long, account: String, capturedCookie: String) {
+        // Stop retries immediately, then let authoritative account cleanup serialize with HTTP.
+        reconnectAt = Long.MAX_VALUE
+        val token = socketVersion
+        launchAction {
+            synchronized(connectionLock) {
+                if (version == generation && account == cacheScope && token == socketVersion) {
+                    if (cookie == capturedCookie) handleFailure(HttpFailure(status))
+                    else { reconnectAt = now(); connectionHints.trySend(Unit) }
                 }
             }
-        })
+        }
     }
     private fun connectionText(connected: Boolean, steam: Boolean) = when { !connected -> "未连接（HTTP 同步）"; !steam -> "服务器已连接，Steam 离线"; else -> "已连接" }
     private fun handleFailure(error: Throwable) {
-        if (error is CancellationException) return
+        if (error is CancellationException || error is RecoveryInterrupted) return
         when ((error as? HttpFailure)?.status) {
             401 -> endSession("登录已过期，请重新登录")
             403 -> {
@@ -416,13 +560,17 @@ class ChatRepository(private val context: Context) {
     }
     fun sendText(text: String) { if (text.isNotBlank()) queueSend(text, null) }
     fun sendImage(uri: Uri) = queueSend("[图片]", uri)
-    private fun queueSend(text: String, uri: Uri?) {
+    fun sendSticker(raw: String) {
+        val name = Protocol.stickerName(raw) ?: return
+        queueSend("[sticker type=\"$name\" limit=\"0\"][/sticker]", null, "/sticker $name")
+    }
+    private fun queueSend(text: String, uri: Uri?, wireText: String = text) {
         val peer = state.value.selectedPeer
         val account = cacheScope
         launchAction {
             if (!state.value.accessAllowed || peer.isEmpty() || account != cacheScope) return@launchAction
             val message = Message("local:${UUID.randomUUID()}", peer, state.value.username, text, true, Instant.now().toString(), pending = true, imageUrl = uri?.toString())
-            val item = Outgoing(message, cacheScope, uri)
+            val item = Outgoing(message, cacheScope, uri, wireText = wireText)
             outgoing[message.key] = item; publishCache(); transmit(item)
         }
     }
@@ -446,12 +594,13 @@ class ChatRepository(private val context: Context) {
                 val bytes = context.contentResolver.openInputStream(item.uri)?.use { bounded(it, 6 * 1024 * 1024) } ?: error("Cannot read image")
                 require(bytes.isNotEmpty())
                 body.put("img", Base64.encodeToString(bytes, Base64.NO_WRAP)); "/image"
-            } else { body.put("msg", item.message.text); "/message" }
+            } else { body.put("msg", item.wireText); "/message" }
             val response = json(path, body)
             check(response.optBoolean("ok"))
             val committed = response.optJSONObject("item")
             outgoing[item.message.key] = item.copy(
-                message = item.message.copy(pending = false, failed = false, error = ""),
+                message = item.message.copy(text = committed?.opt("message") as? String ?: item.message.text,
+                    pending = false, failed = false, error = ""),
                 confirmedEventId = committed?.optString("eventId").orEmpty()
             )
             hints.trySend(Unit)
@@ -482,12 +631,27 @@ class ChatRepository(private val context: Context) {
             val stickerPath = Protocol.endpoint(root, "/proxy/sticker/").encodedPath
             require(url.encodedPath == imagePath || url.encodedPath.startsWith(stickerPath))
             if (expires <= System.currentTimeMillis()) throw HttpFailure(401)
+            val stickerRoot = Protocol.endpoint(root, "/proxy/sticker/")
+            val sticker = if (url.encodedPath.startsWith(stickerRoot.encodedPath) && url.pathSegments.size == stickerRoot.pathSegments.size)
+                Protocol.stickerForName(url.pathSegments.last(), state.value.stickerInventory) else null
+            val candidates = if (sticker == null) listOf(url) else buildList {
+                // Prefer the canonical animated sticker; inventory artwork is a fallback for missing endpoints.
+                add(Protocol.endpoint(root, Protocol.stickerPath(sticker.name)))
+                if (sticker.imageUrl.isNotEmpty()) add(Protocol.endpoint(root, "/proxy/image").newBuilder().addQueryParameter("url", sticker.imageUrl).build())
+                add(url)
+            }.distinct()
             val mediaClient = mediaCache.client(account, client, ::authorized) ?: return@withContext null
-            mediaClient.newCall(Request.Builder().url(url).header("Cookie", cookie).build()).execute().use {
-                if (!it.isSuccessful) throw HttpFailure(it.code)
-                val bytes = it.body?.byteStream()?.use { stream -> bounded(stream, 10 * 1024 * 1024) }
-                if (authorized()) bytes else null
+            for ((index, candidate) in candidates.withIndex()) {
+                if (!authorized()) return@withContext null
+                val bytes = mediaClient.newCall(Request.Builder().url(candidate).header("Cookie", cookie).build()).execute().use {
+                    if (!it.isSuccessful) {
+                        if (it.code in listOf(401, 403, 429) || index == candidates.lastIndex) throw HttpFailure(it.code)
+                        null
+                    } else it.body?.byteStream()?.use { stream -> bounded(stream, 10 * 1024 * 1024) }
+                }
+                if (bytes != null) return@withContext if (authorized()) bytes else null
             }
+            null
         } catch (e: CancellationException) { throw e } catch (e: Exception) {
             if (version == generation && account == cacheScope && e is HttpFailure && e.status in listOf(401, 403)) launchAction { handleFailure(e) }
             null
@@ -505,11 +669,20 @@ class ChatRepository(private val context: Context) {
         settings.edit().putBoolean("notifications", enabled).apply(); mutable.update { it.copy(notificationsEnabled = enabled) }
         if (!enabled) ChatNotifications.clearMessages(context)
     }
-    fun onForegroundChanged(value: Boolean) { foreground = value; reconcile() }
+    fun onForegroundChanged(value: Boolean) {
+        val returning = value && !foreground
+        foreground = value
+        if (returning) recoverConnection()
+        reconcile()
+    }
     fun clearError() { mutable.update { it.copy(error = "") } }
     private fun reconcile() = launchAction {
         if (allowed()) { startWorker(); hints.trySend(Unit) } else {
-            worker?.cancel(); worker = null; socket?.cancel(); socket = null
+            worker?.cancel(); worker = null
+            synchronized(connectionLock) {
+                invalidateSocket()
+                socketWorker?.cancel(); socketWorker = null
+            }
             mutable.update { it.copy(connected = false, connectionText = "后台连接已暂停") }
         }
         if (foreground && cacheScope.isNotEmpty() && state.value.selectedPeer.isNotEmpty()) { cache.read(cacheScope, state.value.selectedPeer); publishCache() }

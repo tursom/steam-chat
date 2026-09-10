@@ -208,6 +208,47 @@ class PersistentMediaCacheTest {
         assertEquals(0, server.requestCount)
     }
 
+    private fun inventory(repo: ChatRepository) {
+        val state = field<MutableStateFlow<AppState>>(repo, "mutable")
+        state.value = state.value.copy(stickerInventory = listOf(Sticker("canonical sticker", "Friendly title",
+            "https://media.example.test/inventory.png", listOf("legacy sticker"))))
+    }
+
+    @Test fun stickerAliasesUseCanonicalAnimatedEndpoint() {
+        server.enqueue(response())
+        val repo = repository()
+        inventory(repo)
+        assertArrayEquals(image, runBlocking { repo.imageBytes("/proxy/sticker/legacy%20sticker") })
+        assertEquals("/proxy/sticker/canonical%20sticker", server.takeRequest().path)
+        assertEquals(1, server.requestCount)
+    }
+
+    @Test fun missingStickerUsesInventoryArtworkThroughAuthenticatedProxyAndDiskCache() {
+        server.enqueue(MockResponse().setResponseCode(404)); server.enqueue(response())
+        val first = repository()
+        inventory(first)
+        assertArrayEquals(image, runBlocking { first.imageBytes("/proxy/sticker/canonical%20sticker") })
+        server.takeRequest()
+        val fallback = server.takeRequest()
+        assertEquals("/proxy/image", fallback.requestUrl!!.encodedPath)
+        assertEquals("https://media.example.test/inventory.png", fallback.requestUrl!!.queryParameter("url"))
+        assertEquals("steam_chat_session=synthetic", fallback.getHeader("Cookie"))
+        closeRepository(first)
+        server.enqueue(MockResponse().setResponseCode(404))
+        val reopened = repository()
+        inventory(reopened)
+        assertArrayEquals(image, runBlocking { reopened.imageBytes("/proxy/sticker/canonical%20sticker") })
+        assertEquals("Fallback bytes should survive restart without another image download", 3, server.requestCount)
+    }
+
+    @Test fun deniedStickerRequestMustNotTryAlternateArtwork() {
+        server.enqueue(MockResponse().setResponseCode(403))
+        val repo = repository()
+        inventory(repo)
+        assertNull(runBlocking { repo.imageBytes("/proxy/sticker/canonical%20sticker") })
+        assertEquals(1, server.requestCount)
+    }
+
     @Test fun cachedImagesStillRequireCurrentPermissionAndUnexpiredSession() {
         server.enqueue(response())
         val repo = repository()
