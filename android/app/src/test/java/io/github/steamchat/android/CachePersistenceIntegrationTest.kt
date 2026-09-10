@@ -67,6 +67,7 @@ class CachePersistenceIntegrationTest {
             fail("Malformed sync item must fail the transaction")
         } catch (_: Exception) { }
         assertEquals("before", cache.checkpoint(scope).first)
+        assertFalse(cache.containsEvent(scope, "valid"))
         assertTrue(cache.messages(scope, "peer1").isEmpty())
     }
 
@@ -101,6 +102,37 @@ class CachePersistenceIntegrationTest {
         assertTrue(cache.messages(scope, "peer1").isEmpty())
         assertTrue(cache.messages("other", "peer1").isEmpty())
         assertEquals("", cache.checkpoint(scope).first)
+    }
+
+    @Test fun versionOneUpgradePreservesMessagesCheckpointAndEventIdentity() {
+        cache.ingest(scope, JSONArray().put(item("existing")), "saved", false, "")
+        // Reconstruct the shipped v1 schema, which has no alias table.
+        cache.writableDatabase.execSQL("DROP TABLE event_aliases")
+        cache.writableDatabase.version = 1
+        cache.close()
+        cache = ChatCache(RuntimeEnvironment.getApplication())
+        assertTrue(cache.containsEvent(scope, "existing"))
+        assertEquals("saved", cache.checkpoint(scope).first)
+        assertEquals(1, cache.messages(scope, "peer1").size)
+    }
+
+    @Test fun semanticAliasesSurviveReopenAndStayScoped() {
+        val original = item("original")
+        cache.ingest(scope, JSONArray().put(original), "first", false, "")
+        val alias = JSONObject(original.toString()).put("eventId", "alias").put("syncId", "alias-sync")
+        cache.ingest(scope, JSONArray().put(alias), "second", false, "")
+        cache.close()
+        cache = ChatCache(RuntimeEnvironment.getApplication())
+        assertTrue(cache.containsEvent(scope, "original"))
+        assertTrue(cache.containsEvent(scope, "alias"))
+        assertFalse(cache.containsEvent("other", "alias"))
+        // A replay with the alias event ID must not insert another row even if its payload differs.
+        cache.ingest(scope, JSONArray().put(JSONObject(alias.toString()).put("syncId", "replay").put("message", "changed")), "third", false, "")
+        assertEquals(1, cache.messages(scope, "peer1").size)
+        cache.reset(scope)
+        assertTrue(cache.containsEvent(scope, "alias"))
+        cache.clearAll()
+        assertFalse(cache.containsEvent(scope, "alias"))
     }
 
     @Test fun cursorSurvivesReopeningAndResetDoesNotDuplicateRows() {

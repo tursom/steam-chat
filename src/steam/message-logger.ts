@@ -1,7 +1,7 @@
 'use strict';
 
 import { settleMetadata } from './metadata';
-import { steamEventKey } from '../storage/history-message';
+import { imageEchoIdentity, steamEventKey } from '../storage/history-message';
 import type { HistoryStorage } from '../storage/history-storage';
 import type { LoggerLike, Persona, HistoryRecordInput } from '../types';
 import type { SteamFriendMessageEvent, SteamFriendMessageEventUser } from './friend-message-events';
@@ -75,6 +75,9 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
     const at = record.sentAt || record.date;
     record.steamEventKey = steamEventKey(record.steamAccountId, String(record.id), Boolean(record.echo), record.message || '',
       at ? new Date(at.replace(' ', 'T')) : undefined, record.ordinal);
+    if (storage?.appendSteamImage && record.steamEventKey && imageEchoIdentity({ ...record, imageSendSource: 'echo' })) {
+      return storage.appendSteamImage(record, { notify: !historical });
+    }
     return storage ? storage.append(record, { notify: !historical }) : appendLog(record, { logPath });
   }
   const echoKeys = new Map<string, boolean>();
@@ -115,6 +118,7 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
         name: echo ? selfName : (friendInfo.player_name || friendInfo.personaName || id),
         message: typeof message.message === 'string' ? message.message : '',
         ordinal: message.ordinal ?? null,
+        sentAt: message.server_timestamp instanceof Date ? message.server_timestamp.toISOString() : undefined,
         date: message.server_timestamp instanceof Date ? formatDate(message.server_timestamp) : undefined
       }, true);
     }
@@ -137,6 +141,7 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
         name: echo ? await selfNamePromise : (message.accountid ? String(message.accountid) : 'Unknown'),
         message: message.message || '',
         ordinal: message.ordinal ?? null,
+        sentAt: message.timestamp ? new Date(message.timestamp * 1000).toISOString() : undefined,
         date: message.timestamp ? formatDate(new Date(message.timestamp * 1000)) : undefined
       }, true);
     }
@@ -174,6 +179,7 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
         name: info.player_name || info.personaName || id,
         message: event.message,
         ordinal: event.ordinal ?? null,
+        sentAt: event.serverTimestamp?.toISOString(),
         date: event.serverTimestamp ? formatDate(event.serverTimestamp) : undefined
       });
     } catch (error) {
@@ -196,6 +202,7 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
         name: await selfNamePromise,
         message: event.message,
         ordinal: event.ordinal ?? null,
+        sentAt: event.serverTimestamp?.toISOString(),
         date: event.serverTimestamp ? formatDate(event.serverTimestamp) : undefined
       });
     } catch (error) {

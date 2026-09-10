@@ -77,7 +77,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     private var worker: Job? = null
     private val hints = Channel<Unit>(Channel.CONFLATED)
     private val outgoing = linkedMapOf<String, Outgoing>()
-    private data class Outgoing(val message: Message, val scope: String, val uri: Uri? = null, val confirmedEventId: String = "", val wireText: String = message.text)
+    private data class Outgoing(val message: Message, val scope: String, val uri: Uri? = null, val confirmedItem: JSONObject? = null, val wireText: String = message.text)
     private class HttpFailure(val status: Int) : IOException("HTTP $status")
 
     init {
@@ -552,7 +552,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     fun leaveConversation() { mutable.update { it.copy(selectedPeer = "", selectedName = "", messages = emptyList()) } }
     private fun publishCache() {
         if (cacheScope.isEmpty() || !state.value.accessAllowed) return
-        outgoing.entries.removeAll { (_, item) -> item.scope == cacheScope && item.confirmedEventId.isNotEmpty() && cache.containsEvent(cacheScope, item.confirmedEventId) }
+        outgoing.entries.removeAll { (_, item) -> item.scope == cacheScope && item.confirmedItem?.let { cache.containsConfirmed(cacheScope, it) } == true }
         mutable.update { current ->
             val conversations = cache.conversations(cacheScope).map { c -> current.friends.find { it.id == c.id }?.let { c.copy(name = it.name, avatar = it.avatar) } ?: c }
             current.copy(conversations = conversations, messages = if (current.selectedPeer.isEmpty()) emptyList() else cache.messages(cacheScope, current.selectedPeer) + outgoing.values.filter { it.scope == cacheScope && it.message.peerId == current.selectedPeer }.map { it.message })
@@ -601,7 +601,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
             outgoing[item.message.key] = item.copy(
                 message = item.message.copy(text = committed?.opt("message") as? String ?: item.message.text,
                     pending = false, failed = false, error = ""),
-                confirmedEventId = committed?.optString("eventId").orEmpty()
+                confirmedItem = committed
             )
             hints.trySend(Unit)
         } catch (e: CancellationException) { throw e } catch (e: Exception) {

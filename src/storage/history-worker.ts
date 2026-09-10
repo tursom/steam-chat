@@ -1,12 +1,14 @@
 import * as fs from 'node:fs/promises';
 import * as path from 'node:path';
 import { randomBytes } from 'node:crypto';
+import { SteamImageAliases } from './history-steam-alias';
 import { serializeStoredMessage, type StoredMessage } from './history-message';
 
 // This module is loaded only by the forked writer, never by the HTTP process.
 let database: any;
 let file: fs.FileHandle | undefined;
 let logFilename: string | undefined;
+let aliases: SteamImageAliases;
 let serial = Promise.resolve();
 
 async function openLog(filename: string) {
@@ -30,6 +32,7 @@ async function openLog(filename: string) {
 
 async function run(method: string, value: any): Promise<any> {
   if (method === 'init') {
+    aliases = new SteamImageAliases(`${value.path}.steam-image-aliases-v1`);
     if (value.kind === 'jsonl') { logFilename = value.path; await openLog(value.path); }
     else {
       const { RocksHistoryStore } = require('./rocks-history');
@@ -38,8 +41,11 @@ async function run(method: string, value: any): Promise<any> {
     }
     return true;
   }
+  if (method === 'imageAlias') return aliases.get(value);
   if (method === 'append') {
     const item: StoredMessage = value;
+    // The alias must survive even if the primary write succeeds but its ACK is lost.
+    if (value.steamImageEventKey) await aliases.put(value.steamImageEventKey, item);
     if (logFilename) {
       try {
         if (!file) await openLog(logFilename);

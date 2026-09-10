@@ -1,7 +1,7 @@
 import { fork, type ChildProcess } from 'node:child_process';
 import * as path from 'node:path';
 import type { ConversationSummary, HistoryItem, HistoryRecordInput, LoggerLike } from '../types';
-import { imageEchoIdentity, normalizeStoredMessage, type StoredMessage } from './history-message';
+import { canonicalMessage, imageEchoIdentity, normalizeStoredMessage, type StoredMessage } from './history-message';
 
 export type SyncQuery = { steamAccountId: string; cursor?: string; limit?: number };
 export type SyncPage = { items: Array<HistoryItem & { syncId: string }>; nextCursor: string; hasMore: boolean; steamAccountId: string };
@@ -13,6 +13,7 @@ export type LaneStatus = { state: string; queued: number; queuedBytes?: number; 
 export type StorageStatus = { jsonl: LaneStatus; rocksdb: LaneStatus };
 export interface HistoryStorage {
   append(input: HistoryRecordInput, options?: { notify?: boolean }): HistoryItem;
+  appendSteamImage?(input: HistoryRecordInput, options?: { notify?: boolean }): Promise<HistoryItem>;
   sync(options: SyncQuery): Promise<SyncPage>;
   onDurable(listener: (item: HistoryItem) => void): () => void;
   history(options: HistoryQuery): Promise<HistoryPage>;
@@ -152,6 +153,17 @@ class WriterLane {
     return this.rpc(method, value);
   }
 
+  async imageAlias(key: string): Promise<StoredMessage | undefined> {
+    // A query RPC alone could overtake jobs still waiting in the parent queue.
+    await this.startup;
+    const deadline = performance.now() + (this.options.timeoutMs || 15000);
+    while (this.queue.length || this.processing) {
+      if (!this.ready || this.stopping || performance.now() >= deadline) throw unavailable('Steam image alias barrier unavailable');
+      await new Promise(resolve => setTimeout(resolve, 5));
+    }
+    return this.query('imageAlias', key);
+  }
+
   async close() {
     if (this.restarting) clearTimeout(this.restarting);
     const deadline = Date.now() + (this.options.shutdownMs || 5000);
@@ -184,6 +196,10 @@ export function createHistoryStorage(options: Options = {}): HistoryStorage {
   const recent = new Map<string, { item: StoredMessage; expires: number; bytes: number; notified: boolean; image?: ReturnType<typeof imageEchoIdentity> }>();
   let recentBytes = 0;
   let closed = false;
+  let closing = false;
+  let steamImageTail: Promise<unknown> = Promise.resolve();
+  let steamImagePending = 0;
+  let steamImageBytes = 0;
   let jsonl: WriterLane;
   let rocksdb: WriterLane;
   const changed = () => {
@@ -192,6 +208,37 @@ export function createHistoryStorage(options: Options = {}): HistoryStorage {
     for (const listener of listeners) { try { listener(status); } catch (error) { options.logger?.warn?.('History status listener failed'); } }
   };
   const storage: HistoryStorage = {
+    appendSteamImage(input, dispatch = {}) {
+      if (closed || closing) return Promise.reject(unavailable('History storage closed'));
+      const bytes = Buffer.byteLength(JSON.stringify(input));
+      if (steamImagePending >= (options.queueLimit || 1000) || steamImageBytes + bytes > (options.queueBytes || 16 * 1024 * 1024)) {
+        return Promise.reject(unavailable('Steam image identity queue full'));
+      }
+      input = { ...input }; dispatch = { ...dispatch };
+      steamImagePending++; steamImageBytes += bytes;
+      // Serialize resolve + admission, including simultaneous live/history callbacks.
+      const task = steamImageTail.then(async () => {
+        if (closed) throw unavailable('History storage closed');
+        const key = input.steamEventKey;
+        if (typeof key !== 'string' || !/^[a-f0-9]{64}$/.test(key)
+          || !imageEchoIdentity({ ...input, imageSendSource: 'echo' })) return storage.append(input, dispatch);
+        const results = await Promise.allSettled([rocksdb.imageAlias(key), jsonl.imageAlias(key)]);
+        const found = results.flatMap(result => result.status === 'fulfilled' && result.value ? [result.value] : []);
+        if (found.some(item => canonicalMessage(item) !== canonicalMessage(found[0]))) throw unavailable('Conflicting durable Steam image aliases');
+        const item = found[0];
+        if (item) {
+          if (item.steamAccountId !== input.steamAccountId || item.id !== String(input.id) || !item.echo) {
+            throw unavailable('Steam image alias escaped conversation');
+          }
+          return storage.append({ ...item, steamEventKey: key }, dispatch);
+        }
+        // An unavailable copy may contain the only mapping. Do not invent a new ID.
+        if (results.some(result => result.status === 'rejected')) throw unavailable('Steam image identity lookup unavailable');
+        return storage.append(input, dispatch);
+      }).finally(() => { steamImagePending--; steamImageBytes -= bytes; });
+      steamImageTail = task.catch(() => {});
+      return task;
+    },
     append(input, dispatch = {}) {
       if (closed) throw unavailable('History storage closed');
       const key = typeof input.steamEventKey === 'string' && /^[a-f0-9]{64}$/.test(input.steamEventKey) ? input.steamEventKey : undefined;
@@ -223,8 +270,11 @@ export function createHistoryStorage(options: Options = {}): HistoryStorage {
       }
       // No await and no shared queue: a failing lane never cancels the other enqueue.
       const persistence = { jsonl: 'pending', rocksdb: 'pending' };
+      const steamImageEventKey = key && (imageEchoIdentity({ ...input, imageSendSource: 'echo' })
+        || input.type === 'image' && input.eventId && input.echo) ? key : undefined;
+      const persisted = steamImageEventKey ? { ...item, steamImageEventKey } : item;
       for (const [name, lane] of [['jsonl', jsonl], ['rocksdb', rocksdb]] as const) {
-        try { if (!lane.enqueue(item)) persistence[name] = 'failed'; }
+        try { if (!lane.enqueue(persisted)) persistence[name] = 'failed'; }
         catch (error) { persistence[name] = 'failed'; options.logger?.error?.('History enqueue failed', { error: String(error) }); }
       }
       const result: HistoryItem = { ...item, persistence };
@@ -239,10 +289,22 @@ export function createHistoryStorage(options: Options = {}): HistoryStorage {
     history: (query) => rocksdb.query('history', query),
     conversations: (query) => rocksdb.query('conversations', query),
     status: () => ({ jsonl: jsonl.status(), rocksdb: rocksdb.status() }),
-    canSend: () => !closed && (jsonl.status().writable || rocksdb.status().writable),
+    canSend: () => !closed && !closing && (jsonl.status().writable || rocksdb.status().writable),
     onMessage(listener) { messages.add(listener); return () => messages.delete(listener); },
     onStatus(listener) { listeners.add(listener); return () => listeners.delete(listener); },
-    async close() { closed = true; await Promise.all([jsonl.close(), rocksdb.close()]); listeners.clear(); messages.clear(); durableListeners.clear(); recent.clear(); recentBytes = 0; }
+    async close() {
+      closing = true;
+      let timer: NodeJS.Timeout | undefined;
+      try {
+        await Promise.race([steamImageTail, new Promise<void>(resolve => {
+          timer = setTimeout(resolve, options.shutdownMs || 5000);
+        })]);
+      } finally { if (timer) clearTimeout(timer); }
+      if (steamImagePending) options.logger?.warn?.('Shutdown with pending Steam image identity lookups', { pending: steamImagePending });
+      closed = true;
+      await Promise.all([jsonl.close(), rocksdb.close()]);
+      listeners.clear(); messages.clear(); durableListeners.clear(); recent.clear(); recentBytes = 0;
+    }
   };
   jsonl = new WriterLane('jsonl', options.logPath || process.env.STEAM_CHAT_LOG_PATH || path.join(data, 'logs', 'chat.jsonl'), options, changed);
   rocksdb = new WriterLane('rocksdb', options.dbPath || process.env.STEAM_CHAT_DB_PATH || path.join(data, 'chat.rocksdb'), options, changed, (item) => {
