@@ -20,6 +20,7 @@
   "license": "GPL-3.0",
   "dependencies": {
     "@harperfast/rocksdb-js": "^2.8.0",
+    "image-size": "1.2.1",
     "steam-user": "^5.0.8",
     "steamcommunity": "^3.48.2",
     "winston": "^3.12.0",

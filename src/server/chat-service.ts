@@ -1,5 +1,6 @@
 'use strict';
 
+import { ImageEmoteStore } from '../storage/image-emotes';
 import { handleDeployWebhook } from './deploy-webhook';
 import { resolveStickerAlias } from './sticker-inventory';
 import { settleMetadata } from '../steam/metadata';
@@ -55,7 +56,7 @@ const {
   loadOrDownloadSticker,
   stickerUrlForType
 } = require('../storage/media-cache');
-const { WEB_DIR } = require('../paths');
+const { WEB_DIR, DATA_DIR } = require('../paths');
 const { createAuthChecker, getClientIp } = require('./auth');
 const { isLocalOrLanIp, normalizeIp } = require('./network');
 
@@ -102,6 +103,7 @@ type GetEmoticonsOptions = {
 };
 
 type ChatServiceOptions = {
+  imageEmoteDir?: string;
   deploymentWebhookUrl?: string;
   historyStorage?: HistoryStorage;
   config?: unknown;
@@ -199,6 +201,7 @@ type WsPayload = UnknownRecord & {
 type ImageBody = UnknownRecord & {
   img?: string;
   url?: string;
+  emoteId?: string;
 };
 
 type SteamAccessContext = {
@@ -451,6 +454,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     : options.chatConfig ?? options.config ?? true;
   const config = normalizeChatConfig(rawConfig);
   const historyStorage = options.historyStorage;
+  const imageEmotes = new ImageEmoteStore(options.imageEmoteDir || path.join(DATA_DIR, 'image-emotes'));
   const pending = new Set<Promise<unknown>>();
   let stopping = false;
   function track<T>(task: Promise<T>): Promise<T> {
@@ -1084,7 +1088,9 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
     let imageBuffer: Buffer;
     let message = body.url || '';
-    if (body.img) {
+    if (body.emoteId !== undefined) {
+      imageBuffer = (await imageEmotes.read(body.emoteId)).buffer;
+    } else if (body.img) {
       imageBuffer = decodeBase64Image(body.img);
     } else if (body.url) {
       const downloaded = await loadOrDownloadRemoteImage(body.url, { fetchImpl });
@@ -1172,6 +1178,31 @@ function createChatService(options: ChatServiceOptions = {}) {
       if (await handleSteamApi(req, res, url)) return;
       if (await handleUsersApi(req, res, url)) return;
       if (await handleAuditApi(req, res, url)) return;
+
+      if (url.pathname === '/api/image-emotes' || url.pathname.startsWith('/api/image-emotes/file/')) {
+        if (!sessionManager) throw Object.assign(new Error('Session authentication required'), { statusCode: 401 });
+        if (req.method === 'GET') {
+          requirePermission(req, 'chat.use');
+          if (url.pathname === '/api/image-emotes') {
+            jsonResponse(res, 200, await imageEmotes.list());
+          } else {
+            const image = await imageEmotes.read(url.pathname.slice('/api/image-emotes/file/'.length));
+            textResponse(res, 200, image.buffer, { 'Content-Type': image.item.contentType,
+              'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' });
+          }
+          return;
+        }
+        if (req.method === 'POST' && url.pathname === '/api/image-emotes') {
+          requireAdminSession(req);
+          const body = await readJsonBody(req);
+          requireAdminSession(req);
+          const result = await imageEmotes.mutate(body);
+          jsonResponse(res, 200, result);
+          return;
+        }
+        jsonResponse(res, 405, { error: 'Method not allowed' });
+        return;
+      }
 
       requireLegacyOrSession(req);
 

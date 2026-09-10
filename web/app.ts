@@ -1,5 +1,5 @@
 type Role = 'admin' | 'user';
-type View = 'steam' | 'chat' | 'users' | 'steamAccounts' | 'audit' | 'account';
+type View = 'steam' | 'chat' | 'users' | 'steamAccounts' | 'audit' | 'account' | 'imageEmotes';
 type Tone = 'muted' | 'ok' | 'warn' | 'error';
 type ChatListTab = 'recent' | 'friends' | 'groups';
 type ChatPanel = 'list' | 'thread';
@@ -132,6 +132,18 @@ type SteamImagePreview = {
   width: number;
   height: number;
 };
+
+type ImageEmoteGroup = { id: string; name: string };
+type CustomImageEmote = { id: string; groupId: string; name: string; bytes: number; width: number; height: number };
+type ImageEmoteCatalog = { version: number; groups: ImageEmoteGroup[]; images: CustomImageEmote[] };
+let imageEmoteCatalog: ImageEmoteCatalog = { version: 0, groups: [], images: [] };
+let imageEmoteRequest = 0;
+let imageEmoteLoading = false;
+let imageEmoteBusy = false;
+let imageEmoteError = '';
+let imageEmoteGroup = '';
+let customImageEmoteGroup = '';
+const emoteFileUrl = (id: string) => `/api/image-emotes/file/${encodeURIComponent(id)}`;
 
 type InventoryItem = Record<string, unknown> & {
   name?: string;
@@ -294,6 +306,10 @@ function invalidateChat() {
   conversationsBefore = '';
   conversationsBusy = false;
   recentConversationUpdates.clear();
+  imageEmoteRequest++;
+  imageEmoteCatalog = { version: 0, groups: [], images: [] };
+  imageEmoteLoading = false;
+  imageEmoteError = '';
   imageTransfers.clear();
   outgoingMessages.clear();
   clearImageDrafts();
@@ -344,7 +360,7 @@ function clampLimit(value: unknown): number {
 
 function normalizeView(value: unknown): View {
   const view = String(value || '');
-  return view === 'steam' || view === 'chat' || view === 'users' || view === 'steamAccounts' || view === 'audit' || view === 'account' ? view : 'chat';
+  return view === 'steam' || view === 'chat' || view === 'users' || view === 'steamAccounts' || view === 'audit' || view === 'account' || view === 'imageEmotes' ? view : 'chat';
 }
 
 function asListEntries(value: unknown): ListEntry[] {
@@ -605,7 +621,7 @@ function renderLogin() {
 }
 
 function navButton(view: View, label: string) {
-  const icons: Record<View, ChatIconName> = { steam: 'gamepad-2', chat: 'messages-square', users: 'users', steamAccounts: 'shield', audit: 'scroll-text', account: 'settings-2' };
+  const icons: Record<View, ChatIconName> = { steam: 'gamepad-2', chat: 'messages-square', users: 'users', steamAccounts: 'shield', audit: 'scroll-text', account: 'settings-2', imageEmotes: 'image' };
   const button = chatIconButton(icons[view], label, state.view === view ? 'is-active' : '');
   button.append(create('span', 'nav-label', label));
   button.addEventListener('click', () => {
@@ -628,7 +644,7 @@ function renderShell() {
     renderLogin();
     return;
   }
-  if (state.me.role !== 'admin' && ['users', 'steamAccounts', 'audit'].includes(state.view)) state.view = 'steam';
+  if (state.me.role !== 'admin' && ['users', 'steamAccounts', 'audit', 'imageEmotes'].includes(state.view)) state.view = 'steam';
   clear(root);
   const shell = create('div', `admin-shell${state.view === 'chat' ? ' is-chat' : ''}`);
   const sidebar = create('aside', 'admin-sidebar');
@@ -640,6 +656,7 @@ function renderShell() {
   if (hasPermission('user.manage')) nav.append(navButton('users', '用户管理'));
   if (hasPermission('steam.account.manage')) nav.append(navButton('steamAccounts', 'Steam 账户'));
   if (hasPermission('audit.view')) nav.append(navButton('audit', '审计日志'));
+  if (state.me.role === 'admin') nav.append(navButton('imageEmotes', '图片表情'));
   nav.append(navButton('account', '账号'));
   sidebar.append(brand, nav);
   if (state.view === 'chat') {
@@ -684,7 +701,8 @@ function renderShell() {
   main.append(top, content, feedback);
   shell.append(sidebar, main);
   root.append(shell);
-  if (state.view === 'chat') void refreshChatData();
+  if (state.view === 'chat') { void refreshChatData(); void loadImageEmotes(); }
+  if (state.view === 'imageEmotes') void loadImageEmotes();
   if (state.view === 'users' && hasPermission('user.manage')) {
     void loadSteamAccounts();
     void loadUsers();
@@ -700,6 +718,7 @@ function pageTitle() {
   if (state.view === 'users') return '用户管理';
   if (state.view === 'steamAccounts') return 'Steam 账户';
   if (state.view === 'audit') return '审计日志';
+  if (state.view === 'imageEmotes') return '图片表情';
   if (state.view === 'account') return '账号';
   return 'Steam 连接';
 }
@@ -712,6 +731,7 @@ function pageSubtitle() {
   if (state.view === 'users') return '后台用户、会话、角色、资料和 Steam 授权';
   if (state.view === 'steamAccounts') return 'Steam 账户资料、连接状态和授权计数';
   if (state.view === 'audit') return '关键管理动作和敏感字段脱敏记录';
+  if (state.view === 'imageEmotes') return '管理共享图片表情、分组和素材';
   if (state.view === 'account') return '修改当前后台账号密码';
   return state.me?.role === 'admin' ? '管理员在这里完成 Steam 登录和 Guard 验证' : '等待管理员连接 Steam';
 }
@@ -721,6 +741,7 @@ function renderCurrentView() {
   if (state.view === 'users' && hasPermission('user.manage')) return renderUsersView();
   if (state.view === 'steamAccounts' && hasPermission('steam.account.manage')) return renderSteamAccountsView();
   if (state.view === 'audit' && hasPermission('audit.view')) return renderAuditView();
+  if (state.view === 'imageEmotes' && state.me?.role === 'admin') return renderImageEmotesView();
   if (state.view === 'account') return renderAccountView();
   return renderSteamView();
 }
@@ -1656,7 +1677,7 @@ function renderComposer() {
   const pickerControls = bindFloatingPanel(pickerButton, picker);
   pickerButton.addEventListener('click', () => {
     attachmentControls.close();
-    if (picker.hidden) renderPicker(picker);
+    if (picker.hidden) { renderPicker(picker); void loadImageEmotes(); }
     pickerControls.toggle();
   });
 
@@ -2288,7 +2309,7 @@ function renderHistory(items: MessageItem[]) {
     for (const item of items) messages.append((item.eventId && existing.get(item.eventId)) || renderMessage(item));
   }
   for (const entry of outgoing) {
-    const localImage = entry.item.type === 'image' && /^data:image\//i.test(entry.item.message || '');
+    const localImage = entry.item.type === 'image' && (/^data:image\//i.test(entry.item.message || '') || (entry.item.message || '').startsWith('/api/image-emotes/file/'));
     const row = renderMessage(localImage ? { ...entry.item, message: '[图片]' } : entry.item);
     row.dataset.outgoingId = String(entry.localId);
     row.dataset.sendState = entry.state;
@@ -2907,9 +2928,10 @@ async function sendImage(payload: Record<string, string>, existing?: ImageTransf
   const id = activeIdOrWarn();
   if (!id) return;
   const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId;
-  const transfer = existing || createImageTransfer(payload.url ? '图片 URL' : '图片', payload.img ? 'uploading' : 'processing');
+  const emote = payload.emoteId ? imageEmoteCatalog.images.find(item => item.id === payload.emoteId) : undefined;
+  const transfer = existing || createImageTransfer(emote?.name || (payload.url ? '图片 URL' : '图片'), payload.img ? 'uploading' : 'processing');
   updateImageTransfer(transfer, payload.img ? 'uploading' : 'processing', payload.img ? 0 : null);
-  const outgoing = beginOutgoing(id, payload.img || payload.url || '', 'image');
+  const outgoing = beginOutgoing(id, payload.emoteId ? emoteFileUrl(payload.emoteId) : payload.img || payload.url || '', 'image');
   let response: unknown;
   try {
     response = await api('/image', jsonBody({ id, ...payload, ...(steamAccountId ? { steamAccountId } : {}) }), (percent) => {
@@ -2984,14 +3006,199 @@ function sendFiles(files: FileList | File[] | null) {
   }
 }
 
+async function loadImageEmotes() {
+  if (!state.me || !hasPermission('chat.use') || imageEmoteBusy) return;
+  const context = chatContext();
+  const request = ++imageEmoteRequest;
+  imageEmoteLoading = true;
+  imageEmoteError = '';
+  try {
+    const data = await api('/api/image-emotes');
+    if (request !== imageEmoteRequest || context !== chatContext()) return;
+    if (!isRecord(data) || !Array.isArray(data.groups) || !Array.isArray(data.images) || typeof data.version !== 'number') throw new Error('素材库响应无效');
+    if (data.version >= imageEmoteCatalog.version) imageEmoteCatalog = data as ImageEmoteCatalog;
+  } catch (error) {
+    if (request === imageEmoteRequest && context === chatContext()) imageEmoteError = errorMessage(error);
+  } finally {
+    if (request === imageEmoteRequest && context === chatContext()) {
+      imageEmoteLoading = false;
+      refreshImageEmoteViews();
+    }
+  }
+}
+
+function refreshImageEmoteViews() {
+  const manager = document.querySelector<HTMLElement>('#imageEmoteManager');
+  if (manager) renderImageEmoteManager(manager);
+  const picker = document.querySelector<HTMLElement>('#picker');
+  if (picker && !picker.hidden && picker.dataset.inventoryType === 'custom') renderPicker(picker);
+}
+
+async function mutateImageEmotes(changes: Record<string, unknown>) {
+  const data = await api('/api/image-emotes', jsonBody({ ...changes, version: imageEmoteCatalog.version }));
+  if (!isRecord(data) || !Array.isArray(data.groups) || !Array.isArray(data.images) || typeof data.version !== 'number') throw new Error('素材库响应无效');
+  return data as ImageEmoteCatalog;
+}
+
+async function editImageEmotes(changes: Record<string, unknown>) {
+  if (imageEmoteBusy) return;
+  const context = chatContext();
+  imageEmoteBusy = true;
+  imageEmoteLoading = false;
+  imageEmoteRequest++;
+  document.querySelector<HTMLElement>('#imageEmoteManager')?.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLSelectElement>('input,button,select').forEach(node => node.disabled = true);
+  try {
+    const catalog = await mutateImageEmotes(changes);
+    if (context !== chatContext()) return;
+    if (catalog.version >= imageEmoteCatalog.version) imageEmoteCatalog = catalog;
+    imageEmoteError = '';
+    setFeedback('素材库已更新', 'ok');
+  } catch (error) {
+    if (context === chatContext()) { imageEmoteError = errorMessage(error); setFeedback(imageEmoteError, 'error'); }
+  } finally { imageEmoteBusy = false; if (context === chatContext()) refreshImageEmoteViews(); }
+}
+
+function imageGroupSelect(value: string, includeAll = false) {
+  const select = create('select');
+  select.setAttribute('aria-label', '图片分组');
+  if (includeAll) { const option = create('option', '', '全部分组'); option.value = ''; select.append(option); }
+  for (const group of imageEmoteCatalog.groups) {
+    const option = create('option', '', group.name); option.value = group.id; select.append(option);
+  }
+  select.value = value;
+  return select;
+}
+
+function renderImageEmotesView() {
+  const container = create('div', 'image-emote-manager');
+  container.id = 'imageEmoteManager';
+  renderImageEmoteManager(container);
+  return container;
+}
+
+function renderImageEmoteManager(container: HTMLElement) {
+  clear(container);
+  const tools = panel('图片表情分组');
+  const groupForm = create('form', 'image-emote-tools');
+  const newName = create('input'); newName.placeholder = '新分组名称'; newName.maxLength = 80; newName.required = true;
+  newName.setAttribute('aria-label', '新分组名称');
+  const add = create('button', 'primary-btn', '新建分组'); add.type = 'submit';
+  const refresh = create('button', 'ghost-btn', '刷新'); refresh.type = 'button';
+  refresh.addEventListener('click', () => { if (!imageEmoteBusy) void loadImageEmotes(); });
+  groupForm.append(newName, add, refresh);
+  groupForm.addEventListener('submit', event => { event.preventDefault(); void editImageEmotes({ action: 'createGroup', name: newName.value }); });
+  tools.append(groupForm);
+  if (imageEmoteError) tools.append(create('p', 'warn-text', imageEmoteError));
+  if (imageEmoteLoading) tools.append(create('p', 'muted', '加载素材库…'));
+  container.append(tools);
+  if (!imageEmoteCatalog.groups.length) {
+    container.append(create('p', 'empty', '先创建分组，再上传图片表情。管理员维护的素材可供聊天用户使用。'));
+    return;
+  }
+  if (!imageEmoteCatalog.groups.some(group => group.id === imageEmoteGroup)) imageEmoteGroup = imageEmoteCatalog.groups[0].id;
+  const activeGroup = imageEmoteCatalog.groups.find(group => group.id === imageEmoteGroup)!;
+  const section = panel('分组内容');
+  const controls = create('form', 'image-emote-tools');
+  const groups = imageGroupSelect(imageEmoteGroup);
+  groups.addEventListener('change', () => { imageEmoteGroup = groups.value; renderImageEmoteManager(container); });
+  const rename = create('input'); rename.value = activeGroup.name; rename.maxLength = 80; rename.required = true;
+  rename.setAttribute('aria-label', '分组名称');
+  const saveGroup = create('button', 'ghost-btn', '保存分组名称'); saveGroup.type = 'submit';
+  const deleteGroup = create('button', 'danger-btn', '删除空分组'); deleteGroup.type = 'button';
+  deleteGroup.disabled = imageEmoteCatalog.images.some(item => item.groupId === imageEmoteGroup);
+  deleteGroup.addEventListener('click', () => { if (window.confirm(`删除分组“${activeGroup.name}”？`)) void editImageEmotes({ action: 'deleteGroup', id: activeGroup.id }); });
+  controls.append(groups, rename, saveGroup, deleteGroup);
+  controls.addEventListener('submit', event => { event.preventDefault(); void editImageEmotes({ action: 'renameGroup', id: activeGroup.id, name: rename.value }); });
+  const upload = create('input'); upload.type = 'file'; upload.multiple = true; upload.accept = 'image/png,image/jpeg,image/gif,image/webp';
+  upload.setAttribute('aria-label', '上传图片表情');
+  upload.addEventListener('change', () => { void uploadImageEmotes(Array.from(upload.files || []), activeGroup.id); });
+  section.append(controls, create('p', 'muted', '支持 PNG、JPEG、GIF、WebP，每张最多 7 MiB。相同图片共用原文件，动画保留。'), upload);
+  const grid = create('div', 'image-emote-grid');
+  for (const item of imageEmoteCatalog.images.filter(item => item.groupId === imageEmoteGroup)) {
+    const form = create('form', 'image-emote-card');
+    const preview = create('button', 'image-emote-preview'); preview.type = 'button'; preview.title = '查看图片';
+    const img = create('img'); img.src = emoteFileUrl(item.id); img.alt = item.name; img.loading = 'lazy'; preview.append(img);
+    preview.addEventListener('click', () => openLightbox(emoteFileUrl(item.id)));
+    const title = create('input'); title.value = item.name; title.required = true; title.maxLength = 80; title.setAttribute('aria-label', '图片名称');
+    const destination = imageGroupSelect(item.groupId);
+    const save = create('button', 'ghost-btn', '保存名称 / 分组'); save.type = 'submit';
+    const remove = create('button', 'danger-btn', '删除图片'); remove.type = 'button';
+    remove.addEventListener('click', () => { if (window.confirm(`从素材库删除“${item.name}”？已发送消息不受影响。`)) void editImageEmotes({ action: 'deleteImage', id: item.id }); });
+    form.append(preview, title, destination, create('small', 'muted', `${item.width} × ${item.height} · ${Math.ceil(item.bytes / 1024)} KiB`), save, remove);
+    form.addEventListener('submit', event => { event.preventDefault(); void editImageEmotes({ action: 'updateImage', id: item.id, groupId: destination.value, name: title.value }); });
+    grid.append(form);
+  }
+  if (!grid.childElementCount) grid.append(create('p', 'empty', '此分组暂无图片，请选择文件上传。'));
+  section.append(grid);
+  container.append(section);
+  if (imageEmoteBusy) container.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLSelectElement>('input,button,select').forEach(node => node.disabled = true);
+}
+
+async function uploadImageEmotes(files: File[], groupId: string) {
+  if (imageEmoteBusy || !files.length) return;
+  const context = chatContext();
+  imageEmoteBusy = true; imageEmoteLoading = false; imageEmoteRequest++;
+  refreshImageEmoteViews();
+  let count = 0;
+  try {
+    for (const file of files) {
+      if (context !== chatContext() || state.view !== 'imageEmotes') break;
+      if (!file.size || file.size > 7 * 1024 * 1024) throw new Error(`${file.name}：图片必须小于 7 MiB 且不能为空`);
+      const data = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => typeof reader.result === 'string' ? resolve(reader.result) : reject(new Error('无法读取图片'));
+        reader.onerror = () => reject(new Error('无法读取图片')); reader.onabort = () => reject(new Error('图片读取已取消'));
+        reader.readAsDataURL(file);
+      });
+      if (context !== chatContext() || state.view !== 'imageEmotes') break;
+      setFeedback(`正在保存 ${count + 1}/${files.length}：${file.name}`, 'muted');
+      const catalog = await mutateImageEmotes({ action: 'addImage', groupId, name: file.name.slice(0, 80), data });
+      if (context !== chatContext()) return;
+      if (catalog.version >= imageEmoteCatalog.version) imageEmoteCatalog = catalog;
+      count++;
+    }
+    if (context === chatContext()) { imageEmoteError = ''; setFeedback(`已保存 ${count} 张图片表情`, 'ok'); }
+  } catch (error) {
+    if (context === chatContext()) { imageEmoteError = `已保存 ${count} 张；${errorMessage(error)}`; setFeedback(imageEmoteError, 'error'); }
+  } finally { imageEmoteBusy = false; if (context === chatContext()) refreshImageEmoteViews(); }
+}
+
+function renderCustomImagePicker(container: HTMLElement) {
+  const tools = create('div', 'custom-emote-tools');
+  const chosenGroup = imageEmoteCatalog.groups.some(group => group.id === customImageEmoteGroup) ? customImageEmoteGroup : '';
+  const group = imageGroupSelect(chosenGroup, true);
+  const search = create('input'); search.type = 'search'; search.placeholder = '搜索图片表情'; search.setAttribute('aria-label', '搜索图片表情');
+  const grid = create('div', 'picker-grid');
+  const fill = () => {
+    clear(grid);
+    const query = search.value.trim().toLocaleLowerCase();
+    for (const item of imageEmoteCatalog.images.filter(item => (!group.value || item.groupId === group.value) && item.name.toLocaleLowerCase().includes(query))) {
+      const button = create('button'); button.type = 'button'; button.title = `发送 ${item.name}`;
+      const image = create('img'); image.src = emoteFileUrl(item.id); image.alt = item.name; image.loading = 'lazy';
+      button.append(image, create('span', '', item.name));
+      button.addEventListener('click', () => { if (canSendImages()) void sendImage({ emoteId: item.id }); });
+      grid.append(button);
+    }
+    if (!grid.childElementCount) grid.append(create('p', 'empty small', imageEmoteLoading ? '加载中…' : imageEmoteError || '暂无匹配的图片表情'));
+  };
+  group.addEventListener('change', () => { customImageEmoteGroup = group.value; fill(); });
+  search.addEventListener('input', fill);
+  tools.append(group, search); container.append(tools, grid); fill();
+}
+
 function renderPicker(container: HTMLElement) {
   clear(container);
   const tabs = create('div', 'picker-tabs');
   const emoticons = create('button', '', '表情');
   const stickers = create('button', '', '贴纸');
+  const custom = create('button', '', '自定义'); custom.type = 'button';
   const grid = create('div', 'picker-grid');
-  function fill(type: 'emoticons' | 'stickers') {
+  const customPanel = create('div', 'custom-emote-picker');
+  function fill(type: 'emoticons' | 'stickers' | 'custom') {
     container.dataset.inventoryType = type;
+    grid.hidden = type === 'custom'; customPanel.hidden = type !== 'custom';
+    for (const [button, selected] of [[emoticons, type === 'emoticons'], [stickers, type === 'stickers'], [custom, type === 'custom']] as const) button.setAttribute('aria-pressed', String(selected));
+    if (type === 'custom') { clear(customPanel); renderCustomImagePicker(customPanel); return; }
     clear(grid);
     const source = type === 'emoticons' ? state.emoticons : state.stickers;
     if (!source.length) {
@@ -3032,9 +3239,10 @@ function renderPicker(container: HTMLElement) {
   stickers.type = 'button';
   emoticons.addEventListener('click', () => fill('emoticons'));
   stickers.addEventListener('click', () => fill('stickers'));
-  tabs.append(emoticons, stickers);
-  container.append(tabs, grid);
-  fill(container.dataset.inventoryType === 'stickers' ? 'stickers' : 'emoticons');
+  custom.addEventListener('click', () => fill('custom'));
+  tabs.append(emoticons, stickers, custom);
+  container.append(tabs, grid, customPanel);
+  fill(container.dataset.inventoryType === 'custom' ? 'custom' : container.dataset.inventoryType === 'stickers' ? 'stickers' : 'emoticons');
 }
 
 function ensureWebSocket() {

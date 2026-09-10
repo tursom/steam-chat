@@ -1625,6 +1625,82 @@ dl.friend-facts {
   color: var(--danger);
 }
 
+.image-emote-manager {
+  display: grid;
+  gap: 20px;
+  min-width: 0;
+}
+
+.image-emote-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 12px;
+}
+
+.image-emote-tools input,
+.image-emote-tools select {
+  flex: 1 1 160px;
+  min-width: 0;
+}
+
+.image-emote-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(min(180px, 100%), 1fr));
+  gap: 14px;
+  margin-top: 16px;
+}
+
+.image-emote-card {
+  display: grid;
+  gap: 8px;
+  padding: 12px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  min-width: 0;
+}
+
+.image-emote-card input,
+.image-emote-card select {
+  width: 100%;
+  min-width: 0;
+}
+
+.image-emote-preview {
+  display: grid;
+  place-items: center;
+  height: 140px;
+  padding: 4px;
+  background: var(--soft);
+  border: 0;
+  border-radius: 6px;
+}
+
+.image-emote-preview img {
+  max-width: 100%;
+  max-height: 132px;
+  object-fit: contain;
+}
+
+.custom-emote-tools {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 8px;
+  margin: 8px 0;
+}
+
+.custom-emote-tools input,
+.custom-emote-tools select {
+  min-width: 0;
+  width: 100%;
+}
+
+.picker-tabs button[aria-pressed="true"] {
+  color: var(--brand);
+  background: var(--brand-soft);
+}
+
 .image-transfers {
   display: grid;
   gap: 8px;
