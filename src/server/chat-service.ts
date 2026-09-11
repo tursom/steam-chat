@@ -399,8 +399,10 @@ function isTransientSteamError(error: unknown): boolean {
 }
 
 function isSessionExpiredError(error: unknown): boolean {
-  const text = errorCode(error).toLowerCase();
-  return ['session', 'not logged in', 'notloggedin', 'access denied', 'forbidden', 'eresult 15'].some((needle) => text.includes(needle));
+  if (isRecord(error) && Number(error.eresult) === 21) return true; // Steam EResult.NotLoggedOn
+  const text = `${errorCode(error)} ${errorMessage(error)}`.toLowerCase();
+  if (/not\s*logged\s*(?:in|on)\b|session (?:expired|invalid)|(?:expired|invalid) session/.test(text)) return true;
+  return ['access denied', 'forbidden', 'eresult 15'].some((needle) => text.includes(needle));
 }
 
 async function callMaybeCallback(fn: CallbackStyleFunction, context: unknown, args: unknown[]): Promise<unknown> {
@@ -949,6 +951,16 @@ function createChatService(options: ChatServiceOptions = {}) {
     return true;
   }
 
+  let webSessionRefresh: Promise<unknown> | undefined;
+  async function refreshSharedWebSession() {
+    if (!webSessionRefresh) {
+      const pending = Promise.resolve().then(() => refreshWebSession());
+      webSessionRefresh = pending;
+      void pending.finally(() => { if (webSessionRefresh === pending) webSessionRefresh = undefined; }).catch(() => {});
+    }
+    return webSessionRefresh;
+  }
+
   async function withSteamRetry<T>(operation: () => Promise<T> | T, needsWebSession = false): Promise<T> {
     requireSteamOnline();
     await resolveWaiter(waitForLogin);
@@ -959,10 +971,12 @@ function createChatService(options: ChatServiceOptions = {}) {
       return await operation();
     } catch (error) {
       if (isSessionExpiredError(error)) {
-        await refreshWebSession();
+        logger.warn?.('Steam web session rejected; refreshing before one retry');
+        await refreshSharedWebSession();
         return operation();
       }
-      if (isTransientSteamError(error)) {
+      // A timeout during image commit can mean Steam already sent it.
+      if (!needsWebSession && isTransientSteamError(error)) {
         return operation();
       }
       throw error;
