@@ -31,6 +31,9 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.testTag
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -95,6 +98,7 @@ fun ChatApp(repository: ChatRepository, notificationsAllowed: Boolean, requestNo
                 }) { padding ->
                 Box(Modifier.padding(padding).fillMaxSize()) {
                     when {
+                        state.restoration != SessionRestoration.NONE -> RestorationScreen(state, repository)
                         !state.loggedIn -> LoginScreen(state, repository)
                         state.selectedPeer.isNotBlank() -> {
                             val draftKey = "$sessionScope:${state.selectedPeer}"
@@ -131,12 +135,29 @@ internal fun Avatar(name: String, source: String, loader: UiImageLoader, online:
 }
 
 @Composable
+internal fun RestorationScreen(state: AppState, repository: ChatRepository) {
+    Column(Modifier.fillMaxSize().padding(24.dp), verticalArrangement = Arrangement.spacedBy(18.dp), horizontalAlignment = Alignment.CenterHorizontally) {
+        Text("Steam Chat", style = MaterialTheme.typography.headlineMedium)
+        Text(state.server)
+        if (state.restoration == SessionRestoration.LOADING) {
+            CircularProgressIndicator()
+            Text("正在验证已保存的会话…")
+        } else {
+            Text("暂时无法验证已保存的会话，请检查网络后重试。验证完成前不显示聊天记录。")
+            Button(onClick = { repository.refresh() }) { Text("重试") }
+        }
+        TextButton(onClick = { repository.logout() }) { Text("退出会话并重新登录") }
+        TextButton(onClick = { repository.changeServer() }) { Text("更换服务器") }
+    }
+}
+
+@Composable
 private fun LoginScreen(state: AppState, repository: ChatRepository) {
     var server by rememberSaveable(state.server) { mutableStateOf(state.server) }
     var username by rememberSaveable { mutableStateOf(state.username) }
     // Password must not enter saved instance state.
     var password by remember { mutableStateOf("") }
-    var configured by rememberSaveable { mutableStateOf(false) }
+    var configured by rememberSaveable(state.server) { mutableStateOf(state.server.isNotBlank()) }
     var validation by remember { mutableStateOf("") }
     BackHandler(configured) { configured = false; password = "" }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).padding(24.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
@@ -152,7 +173,7 @@ private fun LoginScreen(state: AppState, repository: ChatRepository) {
                 singleLine = true, keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Uri), leadingIcon = { Icon(Icons.Default.Lock, null) })
             if (validation.isNotEmpty()) Text(validation, color = MaterialTheme.colorScheme.error)
             Button(onClick = {
-                if (validServer(server)) { server = server.trim().trimEnd('/'); configured = true }
+                if (validServer(server)) { repository.configureServer(server); configured = true }
                 else validation = "请输入不含账户密码、查询参数或片段的 HTTPS 地址"
             }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("继续") }
             Text("HTTPS 安全连接", color = Muted, style = MaterialTheme.typography.bodySmall)
@@ -168,7 +189,41 @@ private fun LoginScreen(state: AppState, repository: ChatRepository) {
 }
 
 @Composable
-private fun ContactScreen(state: AppState, repository: ChatRepository, loader: UiImageLoader, friends: Boolean,
+internal fun SyncStatusIndicator(state: AppState, settings: () -> Unit) {
+    var details by remember { mutableStateOf(false) }
+    val warning = Color(0xFF9B793E)
+    val (icon, tint, description) = when {
+        !state.accessAllowed -> Triple(Icons.Default.Lock, warning, "同步状态：无访问权限")
+        state.restSyncStatus == RestSyncStatus.SYNCING -> Triple(Icons.Default.Sync, Green, "同步状态：正在同步")
+        state.restSyncStatus == RestSyncStatus.FAILED -> Triple(Icons.Default.SyncProblem, warning, "同步状态：同步失败")
+        !state.steamOnline -> Triple(Icons.Default.CloudOff, warning, "同步状态：Steam 离线")
+        state.restSyncStatus == RestSyncStatus.READY && state.connected -> Triple(Icons.Default.CloudDone, Green, "同步状态：已同步，实时连接正常")
+        state.restSyncStatus == RestSyncStatus.READY -> Triple(Icons.Default.CloudQueue, Green, "同步状态：已同步，使用 REST 接收消息")
+        else -> Triple(Icons.Default.Sync, Muted, "同步状态：等待同步")
+    }
+    TooltipBox(positionProvider = TooltipDefaults.rememberPlainTooltipPositionProvider(),
+        tooltip = { PlainTooltip { Text(description) } }, state = rememberTooltipState()) {
+        IconButton(onClick = { details = true }, modifier = Modifier.size(48.dp).testTag("sync-status")
+            .semantics { contentDescription = description }) {
+            if (state.accessAllowed && state.restSyncStatus == RestSyncStatus.SYNCING)
+                CircularProgressIndicator(Modifier.size(18.dp), color = tint, strokeWidth = 2.dp)
+            else Icon(icon, null, tint = tint, modifier = Modifier.size(20.dp))
+        }
+    }
+    if (details) AlertDialog(onDismissRequest = { details = false }, title = { Text("同步状态") }, text = {
+        Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            if (state.username.isNotBlank()) Text(state.username)
+            Text(state.restSyncText)
+            Text(state.connectionText)
+            Text(if (state.steamOnline) "Steam 在线" else "Steam 离线")
+            if (!state.accessAllowed) Text("此账号尚无聊天访问权限")
+        }
+    }, confirmButton = { TextButton(onClick = { details = false }) { Text("关闭") } },
+        dismissButton = { TextButton(onClick = { details = false; settings() }) { Text("打开设置") } })
+}
+
+@Composable
+internal fun ContactScreen(state: AppState, repository: ChatRepository, loader: UiImageLoader, friends: Boolean,
                           newChat: () -> Unit, settings: () -> Unit) {
     var query by rememberSaveable(friends) { mutableStateOf("") }
     var unread by rememberSaveable { mutableStateOf(false) }
@@ -176,7 +231,9 @@ private fun ContactScreen(state: AppState, repository: ChatRepository, loader: U
         Column(Modifier.padding(horizontal = 20.dp)) {
             Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
                 Icon(Icons.Default.SportsEsports, null, tint = Green); Spacer(Modifier.width(8.dp))
-                Text("Steam Chat", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f))
+                Text("Steam Chat", style = MaterialTheme.typography.titleSmall)
+                SyncStatusIndicator(state, settings)
+                Spacer(Modifier.weight(1f))
                 ToolButton(Icons.Default.Refresh, "刷新", !state.loading) { repository.refresh() }
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
@@ -185,11 +242,6 @@ private fun ContactScreen(state: AppState, repository: ChatRepository, loader: U
             }
             OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(top = 8.dp), placeholder = { Text("搜索好友") }, singleLine = true,
                 leadingIcon = { Icon(Icons.Default.Search, null) }, trailingIcon = { if (query.isNotEmpty()) ToolButton(Icons.Default.Close, "清除搜索") { query = "" } })
-            Row(Modifier.fillMaxWidth().heightIn(min = 48.dp).clickable(onClick = settings), verticalAlignment = Alignment.CenterVertically) {
-                Icon(if (state.connected) Icons.Default.CloudDone else Icons.Default.CloudOff, null, tint = if (state.connected) Green else Color(0xFF9B793E), modifier = Modifier.size(16.dp))
-                Spacer(Modifier.width(8.dp)); Text("${state.username} · ${state.connectionText}", style = MaterialTheme.typography.bodySmall, modifier = Modifier.weight(1f))
-                Icon(Icons.Default.ChevronRight, null)
-            }
             if (!state.accessAllowed) Text("此账号尚无聊天访问权限", color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(vertical = 8.dp))
             if (!friends) TabRow(selectedTabIndex = if (unread) 1 else 0) {
                 Tab(!unread, { unread = false }, text = { Text("全部消息") })
@@ -259,7 +311,7 @@ internal fun SettingsScreen(state: AppState, repository: ChatRepository, loader:
         }
         SectionLabel("连接与设备")
         SettingAction("后端地址", state.server) { logout = true }
-        SettingAction("连接状态", "${state.connectionText} · Steam ${if (state.steamOnline) "在线" else "离线"} · ${if (state.accessAllowed) "有访问权限" else "无访问权限"}") { repository.refresh() }
+        SettingAction("连接状态", "${state.restSyncText} · ${state.connectionText} · Steam ${if (state.steamOnline) "在线" else "离线"} · ${if (state.accessAllowed) "有访问权限" else "无访问权限"}") { repository.refresh() }
         SettingAction("后台运行设置", "电池优化与后台活动") { battery = true }
         SettingAction("系统通知设置", "通知类别、锁屏显示与提示音", openNotificationSettings)
         Text("${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}", style = MaterialTheme.typography.bodySmall, color = Muted, modifier = Modifier.padding(22.dp))

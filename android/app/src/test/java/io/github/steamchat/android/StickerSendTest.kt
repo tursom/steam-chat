@@ -45,7 +45,7 @@ class StickerSendTest {
         set("client", OkHttpClient.Builder().addInterceptor { chain ->
             val path = chain.request().url.encodedPath
             val body = when (path) {
-                "/api/steam/status" -> """{"accessAllowed":true,"activeAccount":{"steamId":"steam"}}"""
+                "/api/steam/status" -> """{"accessAllowed":true,"status":"online","activeAccount":{"steamId":"steam"}}"""
                 "/message" -> {
                     val buffer = okio.Buffer()
                     chain.request().body!!.writeTo(buffer)

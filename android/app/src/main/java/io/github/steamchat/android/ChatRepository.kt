@@ -33,16 +33,17 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
-class ChatRepository(private val context: Context, private val socketFactory: WebSocket.Factory? = null) {
+class ChatRepository(private val context: Context, private val socketFactory: WebSocket.Factory? = null,
+                     private val sessionLoader: (() -> JSONObject?)? = null, httpClient: OkHttpClient? = null) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val gate = Mutex()
     private val vault = SessionVault(context)
     private val cache = ChatCache(context)
     private val mediaCache = MediaDiskCache(java.io.File(context.cacheDir, "media-v1"))
     private val settings = context.getSharedPreferences("chat-settings", Context.MODE_PRIVATE)
-    private val mutable = MutableStateFlow(AppState(backgroundEnabled = settings.getBoolean("background", true), notificationPreview = settings.getBoolean("preview", false), notificationsEnabled = settings.getBoolean("notifications", true)))
+    private val mutable = MutableStateFlow(AppState(restoration = SessionRestoration.LOADING, server = settings.getString("server", "").orEmpty(), backgroundEnabled = settings.getBoolean("background", true), notificationPreview = settings.getBoolean("preview", false), notificationsEnabled = settings.getBoolean("notifications", true)))
     val state: StateFlow<AppState> = mutable.asStateFlow()
-    private val client = OkHttpClient.Builder().followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false)
+    private val client = httpClient ?: OkHttpClient.Builder().followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false)
         .connectTimeout(15, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).callTimeout(45, TimeUnit.SECONDS).pingInterval(30, TimeUnit.SECONDS).build()
     @Volatile private var base: HttpUrl? = null
     @Volatile private var cookie = ""
@@ -83,14 +84,24 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     init {
         scope.launch {
             gate.withLock {
-                val saved = vault.load() ?: return@withLock
-                runCatching {
-                    base = Protocol.base(saved.getString("server")); cookie = saved.getString("cookie"); expires = saved.getLong("expires")
+                if (sessionEnding) return@withLock
+                try {
+                    val saved = if (sessionLoader == null) vault.load() else sessionLoader.invoke()
+                    if (sessionEnding) return@withLock
+                    if (saved == null) {
+                        mutable.update { it.copy(restoration = SessionRestoration.NONE) }
+                        return@withLock
+                    }
+                    base = Protocol.base(saved.getString("server"))
+                    configureServer(base.toString())
+                    cookie = saved.getString("cookie"); expires = saved.getLong("expires")
                     if (expires <= System.currentTimeMillis()) { endSession("登录已过期，请重新登录"); return@withLock }
-                    mutable.update { it.copy(server = base.toString()) }
                     validateSession()
-                    startWorker()
-                }.onFailure { handleFailure(it) }
+                } catch (e: CancellationException) { throw e } catch (e: Exception) {
+                    handleFailure(e)
+                } finally {
+                    mutable.update { if (it.restoration == SessionRestoration.LOADING) it.copy(restoration = SessionRestoration.RETRY) else it }
+                }
                 startWorker()
             }
         }
@@ -162,11 +173,18 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     }
     private fun json(path: String, body: JSONObject? = null) = JSONObject(request(path, body))
 
+    fun configureServer(server: String) {
+        val validated = Protocol.base(server).toString()
+        settings.edit().putString("server", validated).apply()
+        mutable.update { it.copy(server = validated) }
+    }
+
     fun login(server: String, username: String, password: String) = launchAction {
         val validated = Protocol.base(server)
         endSession("")
         sessionEnding = false
         base = validated
+        configureServer(validated.toString())
         mutable.update { it.copy(server = validated.toString(), loading = true, error = "") }
         try {
             json("/api/auth/login", JSONObject().put("username", username).put("password", password))
@@ -176,11 +194,24 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         } finally { mutable.update { it.copy(loading = false) } }
     }
     private fun validateSession() {
-        val me = json("/api/auth/me")
-        val user = me.optJSONObject("user") ?: throw HttpFailure(401)
-        if (user.optBoolean("forcePasswordChange")) { endSession("请在网页版修改密码后重新登录"); return }
-        userId = user.getLong("id").toString()
-        mutable.update { it.copy(loggedIn = true, username = user.optString("username")) }
+        mutable.update { it.copy(restoration = SessionRestoration.LOADING) }
+        try {
+            val me = json("/api/auth/me")
+            val user = me.optJSONObject("user") ?: throw HttpFailure(401)
+            if (user.optBoolean("forcePasswordChange")) { endSession("请在网页版修改密码后重新登录"); return }
+            userId = user.getLong("id").toString()
+            mutable.update { it.copy(loggedIn = true, username = user.optString("username"), restoration = SessionRestoration.NONE, error = "") }
+        } catch (e: HttpFailure) {
+            if (e.status == 403) endSession("会话访问被拒绝，请重新登录或在网页版检查账户")
+            else throw e
+        } finally {
+            mutable.update { if (it.restoration == SessionRestoration.LOADING) it.copy(restoration = SessionRestoration.RETRY) else it }
+        }
+    }
+    fun changeServer() {
+        logout()
+        settings.edit().remove("server").apply()
+        mutable.update { it.copy(server = "") }
     }
     fun logout() {
         val oldBase = base
@@ -231,7 +262,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
                                 if (!state.value.loggedIn) validateSession()
                                 if (state.value.loggedIn) catchUp()
                                 httpRetryAt = 0
-                                syncAt = now() + 30_000
+                                syncAt = now() + if (foreground && !state.value.connected) 3_000 else 30_000
                                 syncRequested = false
                             }
                             connectionHints.trySend(Unit)
@@ -249,6 +280,16 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         updateService()
     }
     private fun catchUp() {
+        mutable.update { it.copy(restSyncText = "REST 正在同步…", restSyncStatus = RestSyncStatus.SYNCING) }
+        try {
+            syncMessages()
+            mutable.update { it.copy(restSyncText = if (it.accessAllowed) "REST 同步完成" else "REST 无账户访问权限", restSyncStatus = RestSyncStatus.READY) }
+        } catch (e: Exception) {
+            mutable.update { it.copy(restSyncText = "REST 同步未完成，等待重试", restSyncStatus = RestSyncStatus.FAILED) }
+            throw e
+        }
+    }
+    private fun syncMessages() {
         val status = json("/api/steam/status")
         val account = status.optJSONObject("activeAccount")
         val permitted = status.optBoolean("accessAllowed") && account != null
@@ -429,7 +470,11 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     private fun scheduleSocketRetry() {
         attempts = (attempts + 1).coerceAtMost(6)
         reconnectAt = now() + Random.nextLong(1000, (1000L shl attempts).coerceAtMost(60_000))
-        mutable.update { if (it.accessAllowed) it.copy(connected = false, connectionText = "连接已断开，正在重试（HTTP 同步仍会尝试）") else it }
+        mutable.update { if (it.accessAllowed) it.copy(connected = false, connectionText = "实时通道断开，正在重试") else it }
+        if (foreground) {
+            syncAt = minOf(syncAt, now())
+            hints.trySend(Unit)
+        }
         connectionHints.trySend(Unit)
     }
     private suspend fun connectSocket() {
@@ -455,7 +500,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
             synchronized(connectionLock) {
                 if (!current()) return
                 if (cookie != capturedCookie) { scheduleSocketRetry(); return }
-                mutable.update { it.copy(connected = false, connectionText = "正在连接服务器…") }
+                mutable.update { it.copy(connected = false, connectionText = "正在连接实时通道…") }
                 socketDeadline = now() + 20_000
                 socket = (socketFactory ?: client).newWebSocket(Request.Builder().url(url).header("Cookie", capturedCookie).build(), object : WebSocketListener() {
                     override fun onOpen(webSocket: WebSocket, response: Response) = synchronized(connectionLock) {
@@ -518,7 +563,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
             }
         }
     }
-    private fun connectionText(connected: Boolean, steam: Boolean) = when { !connected -> "未连接（HTTP 同步）"; !steam -> "服务器已连接，Steam 离线"; else -> "已连接" }
+    private fun connectionText(connected: Boolean, steam: Boolean) = when { !connected -> "实时通道未连接"; !steam -> "实时通道已连接，Steam 离线"; else -> "实时通道已连接" }
     private fun handleFailure(error: Throwable) {
         if (error is CancellationException || error is RecoveryInterrupted) return
         when ((error as? HttpFailure)?.status) {
@@ -568,7 +613,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         val peer = state.value.selectedPeer
         val account = cacheScope
         launchAction {
-            if (!state.value.accessAllowed || peer.isEmpty() || account != cacheScope) return@launchAction
+            if (!state.value.canSend || peer.isEmpty() || account != cacheScope) return@launchAction
             val message = Message("local:${UUID.randomUUID()}", peer, state.value.username, text, true, Instant.now().toString(), pending = true, imageUrl = uri?.toString())
             val item = Outgoing(message, cacheScope, uri, wireText = wireText)
             outgoing[message.key] = item; publishCache(); transmit(item)
@@ -576,7 +621,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     }
     fun retryMessage(key: String) = launchAction {
         val item = outgoing[key] ?: return@launchAction
-        if (!item.message.failed || item.scope != cacheScope) return@launchAction
+        if (!state.value.canSend || !item.message.failed || item.scope != cacheScope) return@launchAction
         transmit(item.copy(message = item.message.copy(pending = true, failed = false, error = "")))
     }
     private fun transmit(item: Outgoing) {
@@ -587,6 +632,10 @@ class ChatRepository(private val context: Context, private val socketFactory: We
                 hideAccount()
                 mutable.update { it.copy(error = "Steam 帐号已变化，请刷新后重新发送") }
                 return
+            }
+            if (status.optString("status") != "online") {
+                mutable.update { it.copy(steamOnline = false) }
+                error("Steam 未在线")
             }
             val body = JSONObject().put("id", item.message.peerId).put("steamAccountId", accountSteamId)
             val path = if (item.uri != null) {

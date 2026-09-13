@@ -66,7 +66,7 @@ internal fun ChatScreen(state: AppState, repository: ChatRepository, loader: UiI
     var positioned by remember(state.server, state.activeAccountId, selectedPeer) { mutableStateOf(false) }
     var previousCount by remember(state.server, state.activeAccountId, selectedPeer) { mutableIntStateOf(0) }
     var previousLastKey by remember(state.server, state.activeAccountId, selectedPeer) { mutableStateOf<String?>(null) }
-    val canSend = state.loggedIn && state.accessAllowed && state.connected && state.steamOnline
+    val canSend = state.canSend
     LaunchedEffect(state.server, state.activeAccountId, selectedPeer, messages.lastOrNull()?.key, messages.size) {
         if (messages.isEmpty()) {
             positioned = false; previousCount = 0; previousLastKey = null
@@ -88,14 +88,13 @@ internal fun ChatScreen(state: AppState, repository: ChatRepository, loader: UiI
             Avatar(name, avatar, loader, friend?.online == true, 36)
             Column(Modifier.weight(1f)) {
                 Text(name, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                Text(if (!state.connected) state.connectionText else friend?.gameName?.takeIf { it.isNotBlank() }?.let { "正在玩 $it" } ?: if (friend?.online == true) "在线" else "离线", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                Text(if (!state.connected) "${state.restSyncText} · ${state.connectionText}" else friend?.gameName?.takeIf { it.isNotBlank() }?.let { "正在玩 $it" } ?: if (friend?.online == true) "在线" else "离线", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 2, overflow = TextOverflow.Ellipsis)
             }
             ToolButton(Icons.Default.PersonOutline, "好友资料") { profile = true }
         }
         HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
         if (!canSend) Text(when {
             !state.accessAllowed -> "此账号尚无聊天访问权限"
-            !state.connected -> "${state.connectionText} · 暂不能发送消息"
             else -> "Steam 未在线 · 暂不能发送消息"
         }, Modifier.fillMaxWidth().background(Color(0xFFFAF5E9)).padding(10.dp), color = Color(0xFF9B793E), style = MaterialTheme.typography.bodySmall)
         LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("chat-messages"), state = scroll, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {

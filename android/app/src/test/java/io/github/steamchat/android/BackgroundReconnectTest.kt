@@ -67,7 +67,7 @@ class BackgroundReconnectTest {
         set("cacheScope", account)
         set("accountSteamId", "steam1")
         field<ChatCache>("cache").ingest(account, JSONArray(), "initial", false, "")
-        field<MutableStateFlow<AppState>>("mutable").value = AppState(loggedIn = true, accessAllowed = true,
+        field<MutableStateFlow<AppState>>("mutable").value = AppState(loggedIn = true, accessAllowed = true, steamOnline = true,
             backgroundEnabled = false, activeAccountId = "steam1")
         networkCallback = shadowOf(context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager).networkCallbacks.single()
         set("client", OkHttpClient.Builder().addInterceptor { chain ->

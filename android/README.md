@@ -28,6 +28,26 @@
 
 通知被用户或系统关闭时，前台服务仍可能运行，但普通新消息通知无法显示。通知类别的声音、锁屏显示和重要程度最终受系统设置控制。SDK 版本不能模拟荣耀厂商后台管理策略。
 
+## 启动恢复与 REST 可用性
+
+服务器地址在首次配置后独立保存；重新启动、退出登录或会话过期均直接回到该服务器的会话验证/账号登录流程。只有首次配置或主动修改地址时显示服务器配置页。保存的 Cookie 仍只存放在 Keystore 加密的 SessionVault 中。
+
+冷启动先显示“正在验证已保存的会话”，通过 `/api/auth/me` 验证后，再通过 `/api/steam/status` 核对当前 Steam 账户和权限。验证完成前不展示私人缓存；网络失败会显示重试、退出会话和更换服务器操作，HTTP 单次请求最长 45 秒，自动重试间隔 30 秒。401、认证接口的 403 或强制改密会清除会话与缓存，并保留服务器地址以便重新登录。
+
+消息补拉使用已有 `/api/messages/sync`，不等待 WebSocket 握手。界面分别显示 REST 同步状态和实时通道连接状态；实时通道不可用时仍每 30 秒尝试 REST 同步，也可手动刷新。登录有效、有账户访问权限且 Steam 在线时，文字、贴纸和图片发送均可用，通过已有 `/message`、`/image` 提交。发送前再核对 Steam 账户与在线状态；不自动重发结果不确定的 POST。
+
+自动化测试使用本机 HTTPS MockWebServer 和仅供测试的 localhost 证书，模拟延迟验证、服务不可用、401/403、账户变更和 WebSocket 503；不访问真实 Steam。测试证书仅位于 `src/test/resources`，不会打包进 APK。本次无需新增或部署服务端接口。
+
+## 0.1.9 紧凑同步状态
+
+消息与好友页移除搜索框下方的整行同步文字，改在顶部 Steam Chat 标题右侧显示单个状态图标。同步中显示进度环；实时连接正常、REST 降级可用、同步失败和 Steam 离线使用不同图标与无障碍说明。点击图标查看详细状态或进入设置，右侧刷新按钮保持独立。
+
+## 0.1.8 启动恢复与 REST 降级
+
+保存服务器配置后，启动期间显示会话恢复状态，不再先显示服务器选择页。退出或会话过期仍保留服务器地址；恢复失败可重试或主动更换服务器。验证会话和账户权限前不展示私人缓存。
+
+WebSocket 不可用时，现有 REST 接口继续负责消息加载与发送，文字、图片和贴纸不再等待实时通道连接。前台断线立即唤醒 REST 补拉，并在 REST 正常时约每 3 秒检查新消息；WebSocket 恢复后或进入后台恢复 30 秒校验间隔。HTTP 失败仍保留退避，发送请求不自动重试。界面分别显示同步和实时通道状态。
+
 ## 0.1.7 发送结果去重
 
 本地缓存保留语义去重后被合并记录的消息 ID 别名，避免发送确认无法对应同步消息而留下两份显示。发送确认也可通过完整、精确的消息身份对应缓存；不按图片相同或相近时间猜测合并。缓存升级保留现有消息和游标。
@@ -108,6 +128,21 @@ export STEAM_CHAT_ANDROID_BUILD_DIR=/tmp/steam-chat-android-build
 ```
 
 外部输出为 `$STEAM_CHAT_ANDROID_BUILD_DIR/app/outputs/apk/debug/app-debug.apk`。Robolectric 还会下载 Android 测试运行时，默认写入 `~/.m2`；已准备好这些 JAR 的机器可设置 `STEAM_CHAT_ROBOLECTRIC_JARS` 指向离线 JAR 目录，避免重复下载到根盘。
+
+本次启动/REST 改动的离线验证环境可按以下命令复现（在仓库的 `android` 目录执行）：
+
+```sh
+export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
+export ANDROID_HOME=/tmp/steam-chat-android-sdk
+export GRADLE_USER_HOME=/tmp/steam-chat-gradle
+export STEAM_CHAT_ROBOLECTRIC_JARS=/tmp/steam-chat-robolectric-jars
+export STEAM_CHAT_ANDROID_BUILD_DIR=/tmp/steam-chat-android-rest-build
+/root/.gradle/wrapper/dists/gradle-8.13-bin/5xuhj0ry160q40clulazy9h7d/gradle-8.13/bin/gradle \
+  --offline --project-cache-dir /tmp/steam-chat-android-rest-project-cache \
+  :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
+```
+
+APK 位于 `/tmp/steam-chat-android-rest-build/app/outputs/apk/debug/app-debug.apk`；连接测试设备后可自行执行 `adb install -r <APK路径>`。本次验证未安装到设备、未部署服务端、未提升版本号。
 
 ## 数据与安全
 

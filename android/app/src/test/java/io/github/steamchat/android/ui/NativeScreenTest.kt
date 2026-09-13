@@ -5,6 +5,10 @@ import android.graphics.Bitmap
 import android.graphics.Canvas
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.runtime.mutableStateOf
+import io.github.steamchat.android.RestSyncStatus
+import io.github.steamchat.android.Conversation
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
@@ -73,6 +77,32 @@ class NativeScreenTest {
             org.junit.Assert.assertEquals("messages", notice.notification.channelId)
         }
         screenshot("android-notification-settings")
+    }
+
+    @Test fun syncStatusUsesOneHeaderIconAndDetailsStayCollapsed() {
+        val repository = ChatRepository(RuntimeEnvironment.getApplication())
+        val loader = UiImageLoader(repository)
+        val state = mutableStateOf(AppState(loggedIn = true, accessAllowed = true, connected = true,
+            steamOnline = true, username = "orbit", restSyncStatus = RestSyncStatus.READY,
+            restSyncText = "REST 同步完成", connectionText = "实时通道已连接",
+            conversations = listOf(Conversation("peer", "好友", preview = "最近一条消息"))))
+        compose.setContent { SteamChatTheme { ContactScreen(state.value, repository, loader, false, {}, {}) } }
+        compose.onNodeWithText("REST 同步完成").assertDoesNotExist()
+        compose.onNodeWithContentDescription("刷新").assertIsDisplayed()
+        val title = compose.onNodeWithText("Steam Chat").fetchSemanticsNode().boundsInRoot
+        val icon = compose.onNodeWithTag("sync-status").fetchSemanticsNode().boundsInRoot
+        org.junit.Assert.assertTrue(icon.left >= title.right)
+        org.junit.Assert.assertEquals(title.center.y, icon.center.y, 1f)
+        screenshot("android-header-sync")
+        compose.onNodeWithTag("sync-status").performClick()
+        compose.onNodeWithText("REST 同步完成").assertIsDisplayed()
+        compose.onNodeWithText("实时通道已连接").assertIsDisplayed()
+        compose.onNodeWithText("关闭").performClick()
+        compose.runOnIdle { state.value = state.value.copy(connected = false) }
+        compose.onNodeWithContentDescription("同步状态：已同步，使用 REST 接收消息").assertIsDisplayed()
+        compose.onNodeWithText("REST 同步完成").assertDoesNotExist()
+        compose.runOnIdle { state.value = state.value.copy(restSyncStatus = RestSyncStatus.FAILED) }
+        compose.onNodeWithContentDescription("同步状态：同步失败").assertIsDisplayed()
     }
 
     private fun screenshot(name: String) {

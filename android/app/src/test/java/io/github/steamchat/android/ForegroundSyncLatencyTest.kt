@@ -55,6 +55,7 @@ class ForegroundSyncLatencyTest {
     private var mediaBody = """{"emoticons":[],"stickers":[]}"""
     private var onFriends: () -> Unit = {}
     private val requests = CopyOnWriteArrayList<String>()
+    private val configRequested = CountDownLatch(1)
     private val releases = mutableListOf<CountDownLatch>()
 
     @Before fun setup() {
@@ -78,7 +79,7 @@ class ForegroundSyncLatencyTest {
         setField("accountSteamId", "steam1")
         field<ChatCache>("cache").ingest(accountScope, JSONArray(), "initial", false, "peer1")
         field<MutableStateFlow<AppState>>("mutable").value = AppState(
-            loggedIn = true, accessAllowed = true, backgroundEnabled = false,
+            loggedIn = true, accessAllowed = true, backgroundEnabled = false, connected = true,
             selectedPeer = "peer1", activeAccountId = "steam1"
         )
         // Keep connectSocket out of this HTTP sync repro; hints use its actual channel.
@@ -105,7 +106,7 @@ class ForegroundSyncLatencyTest {
                 }
                 "/api/friends" -> { code = if (friendsFail) 503 else friendsCode; onFriends(); """[{"id":"peer1","name":"Metadata friend"}]""" }
                 "/api/emoticons" -> mediaBody
-                "/api/config" -> """{"wsPath":"/ws"}"""
+                "/api/config" -> { configRequested.countDown(); """{"wsPath":"/ws"}""" }
                 "/ws" -> { code = 503; "{}" }
                 "/api/auth/logout" -> "{}"
                 else -> error("Unexpected request: $path")
@@ -138,6 +139,34 @@ class ForegroundSyncLatencyTest {
         assertEquals(listOf("canonical-sticker"), repository.state.value.stickers)
         assertTrue("Dropping preview URLs prevents fallback for unavailable sticker endpoints", repository.state.value.toString().contains(imageUrl))
         assertTrue(repository.state.value.toString().contains("legacy-sticker"))
+    }
+
+    @Test fun foregroundRestFallbackPollsQuicklyWithoutWebSocketHints() {
+        val mutable = field<MutableStateFlow<AppState>>("mutable")
+        mutable.value = mutable.value.copy(connected = false)
+        startWorker()
+        pendingMessage = true
+        scheduler.advanceTimeBy(2999)
+        scheduler.runCurrent()
+        assertEquals(1, syncCalls)
+        scheduler.advanceTimeBy(1)
+        scheduler.runCurrent()
+        assertEquals("Disconnected foreground must not wait 30 seconds for REST catchup", 2, syncCalls)
+        assertEquals(listOf("new"), repository.state.value.messages.map { it.key })
+        mutable.value = mutable.value.copy(connected = true)
+        hint(); scheduler.runCurrent()
+        val before = syncCalls
+        scheduler.advanceTimeBy(29999)
+        scheduler.runCurrent()
+        assertEquals("Healthy realtime channel returns to low-frequency catchup", before, syncCalls)
+    }
+
+    @Test fun websocketFailureImmediatelyWakesRestCatchup() {
+        startWorker()
+        pendingMessage = true
+        ChatRepository::class.java.getDeclaredMethod("scheduleSocketRetry").apply { isAccessible = true }.invoke(repository)
+        scheduler.runCurrent()
+        assertEquals(listOf("new"), repository.state.value.messages.map { it.key })
     }
 
     @Test fun foregroundHintPublishesMessageWithoutMandatoryOneSecondSleep() {
@@ -224,7 +253,7 @@ class ForegroundSyncLatencyTest {
         setField("socket", null)
         hint(); scheduler.runCurrent()
         assertEquals(listOf("new"), repository.state.value.messages.map { it.key })
-        assertTrue(requests.contains("/api/config"))
+        assertTrue("WS configuration must proceed while metadata is blocked", configRequested.await(5, TimeUnit.SECONDS))
         release.countDown()
         awaitMetadata()
     }

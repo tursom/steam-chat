@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.steamchat.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 8
-        versionName = "0.1.7"
+        versionCode = 10
+        versionName = "0.1.9"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildTypes {

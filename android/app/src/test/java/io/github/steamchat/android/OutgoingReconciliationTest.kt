@@ -50,11 +50,11 @@ class OutgoingReconciliationTest {
         set("expires", Long.MAX_VALUE)
         set("cacheScope", account)
         set("accountSteamId", "steam")
-        field<MutableStateFlow<AppState>>("mutable").value = AppState(loggedIn = true, accessAllowed = true,
+        field<MutableStateFlow<AppState>>("mutable").value = AppState(loggedIn = true, accessAllowed = true, steamOnline = true,
             selectedPeer = "peer", username = "Me")
         set("client", OkHttpClient.Builder().addInterceptor { chain ->
             val body = when (chain.request().url.encodedPath) {
-                "/api/steam/status" -> """{"accessAllowed":true,"activeAccount":{"steamId":"steam"}}"""
+                "/api/steam/status" -> """{"accessAllowed":true,"status":"online","activeAccount":{"steamId":"steam"}}"""
                 "/image" -> JSONObject().put("ok", true).put("item", ack).toString()
                 else -> error("Unexpected request")
             }
