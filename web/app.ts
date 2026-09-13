@@ -300,6 +300,8 @@ function resetHistory() {
 }
 
 function invalidateChat() {
+  closeDesktopNotifications();
+  desktopNotificationEvents.clear();
   chatEpoch += 1;
   listRequest += 1;
   healthRequest += 1;
@@ -1403,7 +1405,7 @@ function renderChatView() {
     });
     tabList.append(button);
   }
-  listHead.append(account, titleRow, search, tabList);
+  listHead.append(account, titleRow, desktopNotificationControl(), search, tabList);
 
   const listBody = create('div', 'conversation-list');
   listBody.id = 'chatListSections';
@@ -2152,11 +2154,86 @@ function updateRecentConversation(item: MessageItem) {
   updateChatLists();
 }
 
+const desktopNotificationEvents = new Set<string>();
+const desktopNotifications = new Set<Notification>();
+
+function closeDesktopNotifications() {
+  for (const notification of desktopNotifications) notification.close();
+  desktopNotifications.clear();
+}
+
+function desktopNotificationControl() {
+  const button = create('button', 'ghost-btn desktop-notifications');
+  button.type = 'button';
+  const supported = typeof Notification !== 'undefined' && globalThis.isSecureContext;
+  const update = () => {
+    const enabled = localStorage.getItem('steam-chat.desktop-notifications') === 'true';
+    button.textContent = !supported ? '浏览器不支持桌面通知'
+      : Notification.permission === 'denied' ? '通知已被浏览器屏蔽'
+      : enabled && Notification.permission === 'granted' ? '桌面通知：已开启' : '开启桌面通知';
+    button.disabled = !supported || Notification.permission === 'denied';
+    button.title = Notification.permission === 'denied' ? '请在浏览器的网站设置中允许通知' : '网页保持打开时通知新消息';
+  };
+  // Some browsers do not expose Notification at all.
+  if (!supported) { button.textContent = '浏览器不支持桌面通知'; button.disabled = true; return button; }
+  update();
+  button.addEventListener('click', async () => {
+    button.disabled = true;
+    try {
+      if (localStorage.getItem('steam-chat.desktop-notifications') === 'true' && Notification.permission === 'granted') {
+        localStorage.setItem('steam-chat.desktop-notifications', 'false');
+        closeDesktopNotifications();
+      } else {
+        const permission = await Notification.requestPermission();
+        localStorage.setItem('steam-chat.desktop-notifications', String(permission === 'granted'));
+      }
+    } catch { setFeedback('无法启用桌面通知，请检查浏览器通知设置', 'warn'); }
+    update();
+  });
+  return button;
+}
+
+function notifyIncomingMessage(item: MessageItem) {
+  if (!state.me || !steamAccessAllowed() || item.echo || !item.id) return;
+  const account = state.steam.activeAccount?.steamId || state.steam.steamId;
+  if (item.steamAccountId && item.steamAccountId !== account) return;
+  // Only stable event IDs are deduplicated; identical intentional messages stay distinct.
+  if (item.eventId) {
+    if (desktopNotificationEvents.has(item.eventId)) return;
+    desktopNotificationEvents.add(item.eventId);
+    if (desktopNotificationEvents.size > 1000) desktopNotificationEvents.delete(desktopNotificationEvents.values().next().value!);
+  }
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted'
+    || localStorage.getItem('steam-chat.desktop-notifications') !== 'true') return;
+  if (state.view === 'chat' && state.activeId === item.id && state.chatPanel === 'thread'
+    && document.visibilityState === 'visible' && document.hasFocus()) return;
+  const context = chatContext();
+  const name = resolvedChatEntry({ id: item.id, name: item.name }).name || item.id;
+  try {
+    // Keep message contents off lock screens by default.
+    const notification = new Notification(name, { body: item.type === 'image' ? '发来了一张图片' : '发来了一条新消息', tag: item.eventId });
+    desktopNotifications.add(notification);
+    notification.onclose = () => desktopNotifications.delete(notification);
+    notification.onclick = () => {
+      notification.close();
+      desktopNotifications.delete(notification);
+      if (context !== chatContext() || !state.me || !steamAccessAllowed()) return;
+      window.focus();
+      const previous = state.view;
+      state.view = 'chat';
+      localStorage.setItem('steam-chat.view', 'chat');
+      if (previous !== 'chat') renderShell();
+      openConversation(item.id, name);
+    };
+  } catch { /* Unsupported desktop delivery must never interrupt incoming messages. */ }
+}
+
 function receiveHistoryMessage(item: MessageItem) {
   if (!item.id || !steamAccessAllowed()) return;
   const account = state.steam.activeAccount?.steamId || state.steam.steamId;
   if (item.steamAccountId && item.steamAccountId !== account) return;
   updateRecentConversation(item);
+  notifyIncomingMessage(item);
   if (item.id !== state.activeId) return;
   historyLive = uniqueMessages([...historyLive, item]).slice(-500);
   if (historyDetached || (item.eventId && historyItems.some((entry) => entry.eventId === item.eventId))) return;
