@@ -10,6 +10,7 @@ export type InventorySticker = {
 export type StickerInventoryOptions = {
   fetchImpl?: typeof fetch;
   timeoutMs?: number;
+  itemClass?: 11 | 12;
 };
 
 type Definition = { name: string; title: string; aliases: string[] };
@@ -22,10 +23,10 @@ const MAX_CACHE_ENTRIES = 64;
 const TIMEOUT_MS = 4000;
 const safeName = (name: string): boolean => Boolean(name.trim()) && name.length <= 512 && !/[\[\]"\\\x00-\x1f\x7f]/.test(name);
 
-function addDefinition(catalog: Catalog, value: unknown, appids: Set<number>): void {
+function addDefinition(catalog: Catalog, value: unknown, appids: Set<number>, itemClass = 11): void {
   const appid = isRecord(value) ? Number(value.appid) : NaN;
   if (!isRecord(value) || !Number.isSafeInteger(appid) || appid <= 0 || appid > 0xffffffff ||
-      (appids.size > 0 && !appids.has(appid)) || Number(value.community_item_class) !== 11 ||
+      (appids.size > 0 && !appids.has(appid)) || Number(value.community_item_class) !== itemClass ||
       !Number.isSafeInteger(value.community_item_type) || Number(value.community_item_type) <= 0 ||
       !isRecord(value.community_item_data)) return;
   const data = value.community_item_data;
@@ -37,7 +38,7 @@ function addDefinition(catalog: Catalog, value: unknown, appids: Set<number>): v
     .filter((label): label is string => typeof label === 'string' && safeName(label));
   const aliases = [...new Set(labels.flatMap(label => {
     const decorated = `${label} (Sticker)-${value.community_item_type}`;
-    return [label, `${appid}-${label}`, decorated, `${appid}-${decorated}`];
+    return [label, `${appid}-${label}`, `${label} (Sticker)`, `${appid}-${label} (Sticker)`, decorated, `${appid}-${decorated}`];
   }))];
   const definition = { name, title, aliases };
   for (const alias of aliases) {
@@ -47,7 +48,7 @@ function addDefinition(catalog: Catalog, value: unknown, appids: Set<number>): v
   }
 }
 
-async function fetchCatalog(appids: number[], fetchImpl: typeof fetch, timeoutMs: number): Promise<Catalog> {
+async function fetchCatalog(appids: number[], fetchImpl: typeof fetch, timeoutMs: number, itemClass: number): Promise<Catalog> {
   const controller = new AbortController();
   let timer: ReturnType<typeof setTimeout> | undefined;
   const deadline = new Promise<never>((_, reject) => {
@@ -67,7 +68,7 @@ async function fetchCatalog(appids: number[], fetchImpl: typeof fetch, timeoutMs
         if (controller.signal.aborted) throw new Error('Sticker catalog timed out');
         const url = new URL('https://api.steampowered.com/ILoyaltyRewardsService/QueryRewardItems/v1/');
         url.searchParams.set('input_json', JSON.stringify({
-          appids, community_item_classes: [11], count: 1000, language: 'english', ...(cursor ? { cursor } : {})
+          appids, community_item_classes: [itemClass], count: 1000, language: 'english', include_direct_purchase_disabled: true, ...(cursor ? { cursor } : {})
         }));
         const response = await fetchImpl(url, { signal: controller.signal });
         if (!response.ok) throw new Error(`Sticker catalog HTTP ${response.status}`);
@@ -76,7 +77,7 @@ async function fetchCatalog(appids: number[], fetchImpl: typeof fetch, timeoutMs
         if (body.response.count === 0 && !body.response.definitions) break;
         if (!Array.isArray(body.response.definitions)) throw new Error('Invalid sticker catalog');
         const definitions = body.response.definitions.slice(0, 1000);
-        for (const definition of definitions) addDefinition(catalog, definition, allowed);
+        for (const definition of definitions) addDefinition(catalog, definition, allowed, itemClass);
         received += definitions.length;
         const total = body.response.total_count;
         if (!definitions.length || (typeof total === 'number' && total >= 0 && received >= total)) break;
@@ -97,12 +98,13 @@ function getCatalog(appids: number[], options: StickerInventoryOptions): Promise
   let cache = caches.get(fetchImpl);
   if (!cache) caches.set(fetchImpl, cache = new Map());
   const timeoutMs = Math.max(1, Math.min(TIMEOUT_MS, options.timeoutMs || TIMEOUT_MS));
-  const key = `${appids.join(',')}:${timeoutMs}`;
+  const itemClass = options.itemClass ?? 11;
+  const key = `${itemClass}:${appids.join(',')}:${timeoutMs}`;
   const existing = cache.get(key);
   if (existing && existing.expires > Date.now()) return existing.promise;
   if (cache.size >= MAX_CACHE_ENTRIES) cache.delete(cache.keys().next().value!);
   const entry: CacheEntry = { expires: Infinity, promise: Promise.resolve(new Map()) };
-  entry.promise = fetchCatalog(appids, fetchImpl, timeoutMs).then(catalog => {
+  entry.promise = fetchCatalog(appids, fetchImpl, timeoutMs, itemClass).then(catalog => {
     entry.expires = Date.now() + 10 * 60_000;
     return catalog;
   }, () => {
@@ -124,7 +126,7 @@ export async function resolveStickerAlias(type: string, options: StickerInventor
 /** Resolve owned community inventory items; never derive decorated types by suffix stripping. */
 export async function resolveStickerInventory(inventory: unknown[], options: StickerInventoryOptions = {}): Promise<InventorySticker[]> {
   const items = inventory.filter(isRecord).filter(item => Array.isArray(item.tags) && item.tags.some(tag =>
-    isRecord(tag) && tag.category === 'item_class' && tag.internal_name === 'item_class_11'));
+    isRecord(tag) && tag.category === 'item_class' && tag.internal_name === `item_class_${options.itemClass ?? 11}`));
   const parsed = items.flatMap(item => {
     if (typeof item.market_hash_name !== 'string') return [];
     const match = /^(\d+)-(.+)$/.exec(item.market_hash_name);

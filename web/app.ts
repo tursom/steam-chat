@@ -120,7 +120,7 @@ type OpenGraphPreview = {
   description: string;
 };
 
-const supportedBbcodeTags = ['og', 'url', 'img', 'emoticon', 'sticker'] as const;
+const supportedBbcodeTags = ['og', 'url', 'img', 'emoticon', 'sticker', 'roomeffect'] as const;
 type SupportedBbcodeTag = (typeof supportedBbcodeTags)[number];
 const supportedBbcodeTagSet = new Set<string>(supportedBbcodeTags);
 const supportedBbcodePattern = new RegExp(`\\[(${supportedBbcodeTags.join('|')})(?=[\\s=\\]])`, 'gi');
@@ -178,6 +178,7 @@ type AppState = {
   groups: ListEntry[];
   emoticons: InventoryItem[];
   stickers: InventoryItem[];
+  effects: InventoryItem[];
   activeId: string;
   activeName: string;
   chatListTab: ChatListTab;
@@ -230,6 +231,7 @@ const state: AppState = {
   groups: [],
   emoticons: [],
   stickers: [],
+  effects: [],
   activeId: localStorage.getItem('steam-chat.target') || '',
   activeName: '',
   chatListTab: 'recent',
@@ -286,6 +288,7 @@ function chatContext() {
 }
 
 function resetHistory() {
+  document.querySelector('.room-effect-overlay')?.remove();
   for (const reader of pendingImageReaders) reader.abort();
   pendingImageReaders.clear();
   renderImageTransfers();
@@ -302,6 +305,7 @@ function resetHistory() {
 function invalidateChat() {
   closeDesktopNotifications();
   desktopNotificationEvents.clear();
+  roomEffectEvents.clear();
   chatEpoch += 1;
   listRequest += 1;
   healthRequest += 1;
@@ -1857,6 +1861,7 @@ async function refreshChatData() {
     state.groups = [];
     state.emoticons = [];
     state.stickers = [];
+    state.effects = [];
     updateChatLists();
     updateChatAvailability();
     return;
@@ -1888,6 +1893,7 @@ async function refreshChatData() {
       state.groups = asListEntries(groups);
       state.emoticons = isRecord(inventory) ? asInventory(inventory.emoticons) : [];
       state.stickers = isRecord(inventory) ? asInventory(inventory.stickers) : [];
+      state.effects = isRecord(inventory) ? asInventory(inventory.effects) : [];
       const picker = document.querySelector<HTMLElement>('#picker');
       if (picker && !picker.hidden) renderPicker(picker);
     } else {
@@ -1895,6 +1901,7 @@ async function refreshChatData() {
       state.groups = [];
       state.emoticons = [];
       state.stickers = [];
+    state.effects = [];
     }
     if (state.view === 'chat') {
       updateChatLists();
@@ -2264,6 +2271,16 @@ function receiveHistoryMessage(item: MessageItem) {
   if (item.steamAccountId && item.steamAccountId !== account) return;
   updateRecentConversation(item);
   notifyIncomingMessage(item);
+  if (item.id === state.activeId && state.view === 'chat' && !historyDetached && document.visibilityState === 'visible') {
+    const match = /^\[roomeffect\s+type="([a-z0-9_]+)"[^\]]*\]\s*\[\/roomeffect\]$/i.exec(item.message || '');
+      if (match && (!item.eventId || !roomEffectEvents.has(item.eventId))) {
+        if (item.eventId) {
+          roomEffectEvents.add(item.eventId);
+          if (roomEffectEvents.size > 1000) roomEffectEvents.delete(roomEffectEvents.values().next().value!);
+        }
+        playRoomEffect(match[1]);
+      }
+  }
   if (item.id !== state.activeId) return;
   historyLive = uniqueMessages([...historyLive, item]).slice(-500);
   if (historyDetached || (item.eventId && historyItems.some((entry) => entry.eventId === item.eventId))) return;
@@ -2445,9 +2462,9 @@ function renderMessage(item: MessageItem) {
   const meta = create('div', 'meta');
   meta.append(create('span', '', item.name || (item.echo ? '我' : item.id)), create('span', '', formatTime(item.sentAt || item.date)));
   if (item.eventId && item.echo) {
-    const unparsedSticker = /^\/sticker(?:\s|$)/i.test((item.message || '').trim());
+    const unparsedSticker = /^\/(?:sticker|roomeffect)(?:\s|$)/i.test((item.message || '').trim());
     row.dataset.sendState = unparsedSticker ? 'unknown' : 'sent';
-    meta.append(create('span', 'message-send-state', unparsedSticker ? '贴纸结果未确认' : '已发送'));
+    meta.append(create('span', 'message-send-state', unparsedSticker ? (/^\/roomeffect/i.test(item.message || '') ? '聊天效果结果未确认' : '贴纸结果未确认') : '已发送'));
   }
   const content = create('div', 'message-content');
   const message = item.message || '';
@@ -2552,6 +2569,14 @@ function appendSupportedBbcode(
     const name = normalizeEmoticonName(body.trim());
     if (attributes.trim() || !name) return false;
     container.append(emoticonNode(name));
+    return true;
+  }
+
+  if (tag === 'roomeffect') {
+    const values = parseBbcodeAttributes(attributes, new Set(['type', 'amount', 'limit']));
+    const type = values?.type?.trim() || '';
+    if (!type || body.trim()) return false;
+    container.append(roomEffectNode(type));
     return true;
   }
 
@@ -2781,6 +2806,44 @@ function emoticonNode(name: string) {
 
 function emoticonImageUrl(name: string): string {
   return proxiedImageUrl(`https://community.cloudflare.steamstatic.com/economy/emoticon/${encodeURIComponent(name)}`);
+}
+
+const roomEffectEvents = new Set<string>();
+const roomEffectNames: Record<string, string> = {
+  snow: '下雪', snowball: '雪球', balloons: '气球', confetti: '彩纸', goldfetti: '金色彩纸', firework: '烟花',
+  lny2020_lanterns: '灯笼', lny2020_firework: '新春烟花', lny2020_confetti: '新春彩纸'
+};
+
+function roomEffectNode(type: string) {
+  const node = create('div', 'room-effect-message');
+  node.append(create('span', '', `聊天效果：${roomEffectNames[type] || type}`));
+  if (roomEffectNames[type]) {
+    const replay = create('button', 'ghost-btn', '播放效果');
+    replay.type = 'button';
+    replay.addEventListener('click', () => playRoomEffect(type));
+    node.append(replay);
+  }
+  return node;
+}
+
+function playRoomEffect(type: string) {
+  const messages = document.querySelector<HTMLElement>('#messages');
+  if (!messages || !roomEffectNames[type] || window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) return;
+  document.querySelector('.room-effect-overlay')?.remove();
+  const overlay = create('div', 'room-effect-overlay');
+  overlay.setAttribute('aria-hidden', 'true');
+  const rect = messages.getBoundingClientRect();
+  Object.assign(overlay.style, { left: `${rect.left}px`, top: `${rect.top}px`, width: `${rect.width}px`, height: `${rect.height}px` });
+  const symbols: Record<string, string> = { snow: '❄', snowball: '⚪', balloons: '🎈', confetti: '▰', goldfetti: '✦', firework: '✺', lny2020_lanterns: '🏮', lny2020_firework: '✺', lny2020_confetti: '▰' };
+  for (let i = 0; i < (type === 'snowball' ? 1 : 32); i++) {
+    const particle = create('span', `room-effect-particle effect-${type}`, symbols[type]);
+    particle.style.left = `${Math.random() * 95}%`;
+    particle.style.animationDelay = `${Math.random() * 1.5}s`;
+    particle.style.setProperty('--effect-color', type === 'goldfetti' ? '#eab308' : `hsl(${Math.random() * 360} 80% 65%)`);
+    overlay.append(particle);
+  }
+  document.body.append(overlay);
+  setTimeout(() => overlay.remove(), 6500);
 }
 
 function stickerNode(type: string) {
@@ -3298,16 +3361,17 @@ function renderPicker(container: HTMLElement) {
   const tabs = create('div', 'picker-tabs');
   const emoticons = create('button', '', '表情');
   const stickers = create('button', '', '贴纸');
+  const effects = create('button', '', '效果'); effects.type = 'button';
   const custom = create('button', '', '自定义'); custom.type = 'button';
   const grid = create('div', 'picker-grid');
   const customPanel = create('div', 'custom-emote-picker');
-  function fill(type: 'emoticons' | 'stickers' | 'custom') {
+  function fill(type: 'emoticons' | 'stickers' | 'effects' | 'custom') {
     container.dataset.inventoryType = type;
     grid.hidden = type === 'custom'; customPanel.hidden = type !== 'custom';
-    for (const [button, selected] of [[emoticons, type === 'emoticons'], [stickers, type === 'stickers'], [custom, type === 'custom']] as const) button.setAttribute('aria-pressed', String(selected));
+    for (const [button, selected] of [[emoticons, type === 'emoticons'], [stickers, type === 'stickers'], [effects, type === 'effects'], [custom, type === 'custom']] as const) button.setAttribute('aria-pressed', String(selected));
     if (type === 'custom') { clear(customPanel); renderCustomImagePicker(customPanel); return; }
     clear(grid);
-    const source = type === 'emoticons' ? state.emoticons : state.stickers;
+    const source = type === 'emoticons' ? state.emoticons : type === 'effects' ? state.effects : state.stickers;
     if (!source.length) {
       grid.append(create('div', 'empty small', '暂无素材'));
       return;
@@ -3315,7 +3379,7 @@ function renderPicker(container: HTMLElement) {
     for (const item of source) {
       const rawName = String(item.name || '');
       const name = type === 'emoticons' ? normalizeEmoticonName(rawName) : rawName;
-      if (!name || (type === 'stickers' && /[\[\]"\\\x00-\x1f]/.test(name))) continue;
+      if (!name || (type !== 'emoticons' && /[\[\]"\\\x00-\x1f]/.test(name))) continue;
       const title = typeof item.title === 'string' && item.title ? item.title : name;
       const button = create('button');
       button.type = 'button';
@@ -3330,7 +3394,10 @@ function renderPicker(container: HTMLElement) {
         const input = document.querySelector<HTMLTextAreaElement>('#messageInput');
         if (!input) return;
         // Steam accepts a sticker command here; BBCode is the server's rendered reply.
-        if (type === 'stickers') {
+        if (type === 'effects') {
+          if (!canSendImages()) return;
+          void sendText(`/roomeffect ${name}`, `聊天效果：${title}`);
+        } else if (type === 'stickers') {
           if (!canSendImages()) return;
           void sendText(`/sticker ${name}`, `[sticker type="${name}" limit="0"][/sticker]`);
         } else {
@@ -3347,9 +3414,10 @@ function renderPicker(container: HTMLElement) {
   emoticons.addEventListener('click', () => fill('emoticons'));
   stickers.addEventListener('click', () => fill('stickers'));
   custom.addEventListener('click', () => fill('custom'));
-  tabs.append(emoticons, stickers, custom);
+  effects.addEventListener('click', () => fill('effects'));
+  tabs.append(emoticons, stickers, effects, custom);
   container.append(tabs, grid, customPanel);
-  fill(container.dataset.inventoryType === 'custom' ? 'custom' : container.dataset.inventoryType === 'stickers' ? 'stickers' : 'emoticons');
+  fill(container.dataset.inventoryType === 'effects' ? 'effects' : container.dataset.inventoryType === 'custom' ? 'custom' : container.dataset.inventoryType === 'stickers' ? 'stickers' : 'emoticons');
 }
 
 function ensureWebSocket() {

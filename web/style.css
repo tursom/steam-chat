@@ -2406,3 +2406,15 @@ dl.friend-facts {
     width: 100%;
   }
 }
+
+.room-effect-message { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; }
+.room-effect-overlay { position: fixed; pointer-events: none; overflow: hidden; z-index: 30; }
+.room-effect-particle { position: absolute; top: -40px; font-size: 28px; color: var(--effect-color); animation: room-effect-fall 4.5s linear both; }
+.effect-snow { color: #a5d8ff; }
+.effect-snowball { font-size: 64px; animation-name: room-effect-throw; }
+.effect-balloons, .effect-lny2020_lanterns { animation-direction: reverse; }
+.effect-firework, .effect-lny2020_firework { font-size: 64px; animation-name: room-effect-burst; }
+@keyframes room-effect-fall { from { top: -40px; transform: rotate(0); } to { top: 110%; transform: rotate(180deg); } }
+@keyframes room-effect-throw { from { top: 75%; left: -80px; } to { top: 20%; left: 110%; } }
+@keyframes room-effect-burst { 0% { top: 60%; opacity: 0; transform: scale(.1); } 30% { top: 25%; opacity: 1; transform: scale(2); } 100% { top: 30%; opacity: 0; transform: scale(4); } }
+@media (prefers-reduced-motion: reduce) { .room-effect-overlay { display: none; } }

@@ -41,7 +41,7 @@ for (const fixture of fixtures) {
       assert.equal(url.origin + url.pathname,
         'https://api.steampowered.com/ILoyaltyRewardsService/QueryRewardItems/v1/');
       assert.deepEqual(JSON.parse(url.searchParams.get('input_json')!), {
-        appids: [fixture.appid], community_item_classes: [11], count: 1000, language: 'english'
+        appids: [fixture.appid], community_item_classes: [11], count: 1000, language: 'english', include_direct_purchase_disabled: true
       });
       return response([fixture]);
     };
@@ -207,4 +207,38 @@ test('conflicting aliases are omitted from resolution and returned inventory ali
     assert.ok(!result[0]!.aliases.includes('Cat Cam talking'));
     assert.ok(!result[0]!.aliases.includes('637310-Cat Cam talking'));
   }
+});
+
+test('owned event rewards include purchase-disabled definitions and plain Sticker suffixes', async () => {
+  const event = { appid: 2640290, community_item_class: 11, community_item_type: 1,
+    internal_description: 'Stick Back and Relax 2023',
+    community_item_data: { item_name: 'Sit Back and Relax 2023' } };
+  const retro = { appid: 1239690, community_item_class: 11, community_item_type: 1,
+    internal_description: 'Retrowave', community_item_data: { item_name: 'Retrowave' } };
+  const fetchImpl: typeof fetch = async input => {
+    const query = JSON.parse(new URL(String(input)).searchParams.get('input_json')!);
+    return response(query.include_direct_purchase_disabled ? [event, retro] : [retro]);
+  };
+  const result = await resolveStickerInventory([
+    item('2640290-Sit Back and Relax 2023'), item('1239690-Retrowave (Sticker)')
+  ], { fetchImpl });
+  assert.deepEqual(result.map(x => x.name), ['Stick Back and Relax 2023', 'Retrowave']);
+  assert.equal(await resolveStickerAlias('1239690-Retrowave (Sticker)', { fetchImpl }), 'Retrowave');
+});
+
+test('chat effects use their own inventory class and catalog cache', async () => {
+  const effect = { appid: 1195690, community_item_class: 12, community_item_type: 1,
+    internal_description: 'snow', community_item_data: { item_name: 'Snow', item_title: 'Snow' } };
+  const classes: number[] = [];
+  const fetchImpl: typeof fetch = async input => {
+    const query = JSON.parse(new URL(String(input)).searchParams.get('input_json')!);
+    classes.push(query.community_item_classes[0]);
+    return response([effect]);
+  };
+  const inventory = [{ ...item('1195690-Snow'), tags: [{ category: 'item_class', internal_name: 'item_class_12' }] }];
+  const effects = await resolveStickerInventory(inventory, { fetchImpl, itemClass: 12 });
+  assert.deepEqual(effects.map(x => x.name), ['snow']);
+  assert.deepEqual(await resolveStickerInventory(inventory, { fetchImpl }), []);
+  assert.equal(await resolveStickerAlias('1195690-Snow', { fetchImpl }), undefined);
+  assert.deepEqual(classes, [12, 11]);
 });

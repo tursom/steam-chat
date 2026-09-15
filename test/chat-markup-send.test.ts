@@ -104,3 +104,28 @@ for (const result of [undefined, { ordinal: 7 }, { modified_message: '[sticker t
     }
   });
 }
+
+for (const canonical of ['[roomeffect type="snow" amount="1"][/roomeffect]', '/roomeffect snow']) {
+  test(`room effects require official parsed confirmation: ${canonical}`, async t => {
+    const user = new SteamUser({ autoRelogin: false });
+    let sends = 0;
+    user._sendUnified = (_method: string, payload: { message: string }, callback: (body: unknown, header: unknown) => void) => {
+      sends++; assert.equal(payload.message, '/roomeffect snow');
+      callback({ modified_message: canonical }, { proto: { eresult: 1 } });
+    };
+    const records: HistoryRecordInput[] = [];
+    const service = createChatService({ steamUser: user, logger, historyStorage: {
+      canSend: () => true, append(item: HistoryRecordInput) { records.push(item); return item; },
+      onMessage: () => () => {}, onStatus: () => () => {}, onDurable: () => () => {}
+    } });
+    t.after(() => service.stop());
+    if (canonical.startsWith('[')) {
+      const result = await service.sendTextMessage(peer, '/roomeffect snow', account);
+      assert.equal(result.message, canonical); assert.equal(records.length, 1);
+    } else {
+      await assert.rejects(service.sendTextMessage(peer, '/roomeffect snow', account), (e: { uncertain?: boolean }) => e.uncertain === true);
+      assert.equal(records.length, 0);
+    }
+    assert.equal(sends, 1);
+  });
+}

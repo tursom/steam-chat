@@ -155,7 +155,7 @@ type WebTestApi = {
   renderPicker: (container: FakeElement) => void;
   capturePickerSends: () => Array<{ text: string; preview: string }>;
   createElement: (tag: string) => FakeElement;
-  setMediaInventory: (emoticons: Record<string, unknown>[], stickers: Record<string, unknown>[]) => void;
+  setMediaInventory: (emoticons: Record<string, unknown>[], stickers: Record<string, unknown>[], effects?: Record<string, unknown>[]) => void;
   filterChatEntries: (items: Record<string, unknown>[], query: string) => Record<string, unknown>[];
   openConversation: (id: unknown, name?: string) => void;
   showChatList: () => void;
@@ -242,7 +242,7 @@ function loadWebTestApi(): WebTestApi & {
     setInterval,
     clearInterval
   };
-  const testSource = `${appSource.slice(0, bootstrapIndex)}\n;globalThis.__webTest = { pageSubtitle: () => { state.view = 'chat'; return pageSubtitle(); }, renderSteamView, renderMessage, renderPicker, capturePickerSends: () => { const calls = []; state.me = {id: 1}; state.view = 'chat'; state.activeId = 'peer'; state.steam.status = 'online'; state.steam.accessAllowed = true; sendText = (text, preview) => { calls.push({text, preview}); return Promise.resolve(true); }; return calls; }, createElement: (tag) => document.createElement(tag), setMediaInventory: (emoticons, stickers) => { state.emoticons = emoticons; state.stickers = stickers; }, filterChatEntries, openConversation, showChatList, getChatState: () => ({ activeId: state.activeId, activeName: state.activeName, chatPanel: state.chatPanel }), setChatAvailability: (online, accessAllowed, activeId) => { state.steam.status = online ? 'online' : 'logged_out'; state.steam.accessAllowed = accessAllowed; state.activeId = activeId; updateChatAvailability(); }, renderChatList: renderChatListSections, setChatListState: (recent, friends, groups, tab, query, activeId) => { state.conversations = recent; state.friends = friends; state.groups = groups; state.chatListTab = tab; state.chatQuery = query; state.activeId = activeId; }, renderChatView, mountChatView: () => { state.view = 'chat'; const view = renderChatView(); document.querySelector('#app').replaceChildren(view); return view; }, setFriendDetailsOpen, updateSteamStatus, renderFriendDetails };`;
+  const testSource = `${appSource.slice(0, bootstrapIndex)}\n;globalThis.__webTest = { pageSubtitle: () => { state.view = 'chat'; return pageSubtitle(); }, renderSteamView, renderMessage, renderPicker, capturePickerSends: () => { const calls = []; state.me = {id: 1}; state.view = 'chat'; state.activeId = 'peer'; state.steam.status = 'online'; state.steam.accessAllowed = true; sendText = (text, preview) => { calls.push({text, preview}); return Promise.resolve(true); }; return calls; }, createElement: (tag) => document.createElement(tag), setMediaInventory: (emoticons, stickers, effects = []) => { state.emoticons = emoticons; state.stickers = stickers; state.effects = effects; }, filterChatEntries, openConversation, showChatList, getChatState: () => ({ activeId: state.activeId, activeName: state.activeName, chatPanel: state.chatPanel }), setChatAvailability: (online, accessAllowed, activeId) => { state.steam.status = online ? 'online' : 'logged_out'; state.steam.accessAllowed = accessAllowed; state.activeId = activeId; updateChatAvailability(); }, renderChatList: renderChatListSections, setChatListState: (recent, friends, groups, tab, query, activeId) => { state.conversations = recent; state.friends = friends; state.groups = groups; state.chatListTab = tab; state.chatQuery = query; state.activeId = activeId; }, renderChatView, mountChatView: () => { state.view = 'chat'; const view = renderChatView(); document.querySelector('#app').replaceChildren(view); return view; }, setFriendDetailsOpen, updateSteamStatus, renderFriendDetails };`;
   vm.runInNewContext(testSource, sandbox);
   assert.ok(sandbox.__webTest);
   return { ...sandbox.__webTest, clipboardWrites, lightbox, lightboxImage, offlineNote, chatControls, dispatchDocument };
@@ -796,4 +796,23 @@ test('web chat closes the attachment menu with Escape or an outside click', asyn
   assert.equal(menu.hidden, false);
   await dispatchDocument('pointerdown', { target: new FakeElement('div') });
   assert.equal(menu.hidden, true);
+});
+
+test('room effect picker preserves drafts and sends official command; history supports replay', async () => {
+  const api = loadWebTestApi();
+  const view = api.mountChatView();
+  const sent = api.capturePickerSends();
+  view.findById('messageInput')!.value = 'unfinished draft';
+  api.setMediaInventory([], [], [{ name: 'snow', title: 'Snow', imageUrl: 'https://community.cloudflare.steamstatic.com/economy/image/snow' }]);
+  const picker = api.createElement('div'); picker.dataset.inventoryType = 'effects'; api.renderPicker(picker);
+  await picker.findByClass('picker-grid')!.findByTag('button')!.dispatch('click');
+  assert.equal(sent[0].text, '/roomeffect snow');
+  assert.equal(view.findById('messageInput')!.value, 'unfinished draft');
+  const rendered = api.renderMessage({ id: 'peer', message: '[roomeffect type="snow" amount="1"][/roomeffect]' });
+  assert.ok(rendered.findByClass('room-effect-message'));
+  assert.match(rendered.textContent, /下雪/);
+  assert.match(rendered.textContent, /播放效果/);
+  const unknown = api.renderMessage({ id: 'peer', message: '[roomeffect type="future_effect"][/roomeffect]' });
+  assert.match(unknown.textContent, /future_effect/);
+  assert.equal(unknown.findByClass('room-effect-message')!.findByTag('button'), null);
 });

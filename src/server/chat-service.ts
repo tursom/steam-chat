@@ -93,6 +93,7 @@ type SteamCommunityLike = {
 type EmoticonPayload = {
   emoticons: unknown[];
   stickers: unknown[];
+  effects?: unknown[];
 };
 
 type GetEmoticonsOptions = {
@@ -1075,6 +1076,9 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (/^\/sticker(?:\s|$)/i.test(message.trim()) && !/^\[sticker\b[^\]]*\]\s*\[\/sticker\]$/i.test(canonicalMessage.trim())) {
       throw Object.assign(new Error('Steam 未确认贴纸解析，请先检查官方客户端。'), { statusCode: 502, uncertain: true });
     }
+    if (/^\/roomeffect(?:\s|$)/i.test(message.trim()) && !/^\[roomeffect\b[^\]]*\]\s*\[\/roomeffect\]$/i.test(canonicalMessage.trim())) {
+      throw Object.assign(new Error('Steam 未确认聊天效果解析，请先检查官方客户端。'), { statusCode: 502, uncertain: true });
+    }
     remember(recentSentText, `${id}:${canonicalMessage}`);
     const record: HistoryRecordInput = {
       type: 'message',
@@ -1590,14 +1594,18 @@ async function defaultGetEmoticons({ steamUser, steamCommunity, waitForLogin, wa
   let stickers = isRecord(response)
     ? entries(response.stickers || response.sticker_list)
     : [];
+  let effects: unknown[] = [];
   const steamId = steamUser?.steamID || steamCommunity?.steamID;
   if (steamCommunity?.getUserInventoryContents && steamId) {
     // The SDK joins asset descriptions and follows all inventory pages, including non-tradable items.
     const inventory = await callMaybeCallback(steamCommunity.getUserInventoryContents, steamCommunity, [steamId, 753, 6, false]);
     const { resolveStickerInventory } = await import('./sticker-inventory.js');
-    stickers = await resolveStickerInventory(entries(inventory));
+    [stickers, effects] = await Promise.all([
+      resolveStickerInventory(entries(inventory)),
+      resolveStickerInventory(entries(inventory), { itemClass: 12 })
+    ]);
   }
-  return { emoticons, stickers };
+  return { emoticons, stickers, effects };
 }
 
 async function listFriends(steamUser?: SteamUserLike): Promise<FriendSummary[]> {
