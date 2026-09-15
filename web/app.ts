@@ -1320,9 +1320,70 @@ async function loadAuditLogs() {
   }
 }
 
+type AppInstallEvent = Event & {
+  prompt(): Promise<void>;
+  userChoice: Promise<{ outcome: 'accepted' | 'dismissed' }>;
+};
+let pendingAppInstall: AppInstallEvent | null = null;
+let installSetup = false;
+
+function setupAppInstallation() {
+  if (installSetup) return;
+  installSetup = true;
+  window.addEventListener('beforeinstallprompt', event => {
+    event.preventDefault();
+    pendingAppInstall = event as AppInstallEvent;
+    updateAppInstallation();
+  });
+  window.addEventListener('appinstalled', () => {
+    pendingAppInstall = null;
+    updateAppInstallation(true);
+  });
+  if ('serviceWorker' in navigator && window.isSecureContext) {
+    void navigator.serviceWorker.register('/sw.js', { scope: '/', updateViaCache: 'none' }).catch(() => {
+      // Installation UI remains useful even when a browser blocks service workers.
+    });
+  }
+}
+
+function updateAppInstallation(installed = false) {
+  const button = document.querySelector<HTMLButtonElement>('#installApp');
+  if (!button) return;
+  const standalone = installed || window.matchMedia('(display-mode: standalone)').matches
+    || (navigator as Navigator & { standalone?: boolean }).standalone;
+  button.textContent = standalone ? '已在应用窗口中打开' : pendingAppInstall ? '安装 Steam Chat' : '查看安装方法';
+  button.disabled = Boolean(standalone);
+}
+
+function appInstallationPanel() {
+  const section = panel('安装应用', 'form-panel');
+  const button = create('button', 'ghost-btn', '安装 Steam Chat');
+  button.id = 'installApp'; button.type = 'button';
+  const instructions = create('p', 'muted', '安装到桌面或主屏幕后，可用独立窗口打开 Steam Chat。');
+  button.addEventListener('click', async () => {
+    const prompt = pendingAppInstall;
+    if (!prompt) {
+      instructions.textContent = 'Chrome / Edge：打开浏览器菜单，选择“安装应用”。iPhone / iPad：在 Safari 中点击分享，再选择“添加到主屏幕”。Mac Safari：在文件菜单中选择“添加到程序坞”。若没有安装选项，请使用支持安装的浏览器并通过 HTTPS 打开。';
+      return;
+    }
+    pendingAppInstall = null;
+    button.disabled = true;
+    try {
+      await prompt.prompt();
+      const choice = await prompt.userChoice;
+      instructions.textContent = choice.outcome === 'accepted' ? '已接受安装，请从桌面或应用列表打开。' : '已取消安装，可以稍后从浏览器菜单安装。';
+    } catch { instructions.textContent = '无法启动安装，请从浏览器菜单安装或添加到主屏幕。'; }
+    updateAppInstallation();
+  });
+  section.append(instructions, button, create('p', 'muted', '安装后仍需联网。关闭应用后的消息推送暂不支持。'));
+  queueMicrotask(() => updateAppInstallation());
+  return section;
+}
+
 function renderSettingsView() {
   // Keep the persisted account view key compatible with existing bookmarks/preferences.
   const view = create('div', 'account-view settings-view');
+  view.append(appInstallationPanel());
   const notifications = panel('消息通知', 'form-panel');
   notifications.append(
     create('p', 'muted', '开启后，网页在后台或正在查看其他会话时，新消息会触发桌面通知。点击通知可打开对应会话。'),
@@ -3518,6 +3579,7 @@ async function logoutApp() {
 }
 
 async function bootstrap() {
+  setupAppInstallation();
   const mePayload = await api('/api/auth/me') as MeResponse;
   state.needsSetup = Boolean(mePayload.needsSetup);
   state.me = mePayload.user || null;

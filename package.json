@@ -5,7 +5,7 @@
   "type": "commonjs",
   "main": "dist/src/index.js",
   "scripts": {
-    "build": "tsc -p tsconfig.json && tsc -p tsconfig.web.json && mkdir -p dist/web && cp web/index.html web/style.css dist/web/ && cp -R web/icons dist/web/",
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.web.json && mkdir -p dist/web && cp web/index.html web/style.css web/manifest.webmanifest web/sw.js dist/web/ && cp -R web/icons dist/web/",
     "typecheck": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.web.json --noEmit",
     "history:maintain": "npm run build && node dist/src/storage/history-maintenance.js",
     "start": "npm run build && node dist/src/index.js",

@@ -343,6 +343,7 @@ async function readJsonBody(req: IncomingMessage): Promise<UnknownRecord> {
 function contentTypeForPath(filePath: string) {
   const ext = path.extname(filePath).toLowerCase();
   const types: Record<string, string> = {
+    '.webmanifest': 'application/manifest+json; charset=utf-8',
     '.css': 'text/css; charset=utf-8',
     '.html': 'text/html; charset=utf-8',
     '.js': 'text/javascript; charset=utf-8',
@@ -371,6 +372,8 @@ function isStaticRequest(pathname: string) {
     || pathname === '/index.html'
     || pathname === '/style.css'
     || pathname === '/app.js'
+    || pathname === '/sw.js'
+    || pathname === '/manifest.webmanifest'
     || pathname.startsWith('/icons/')
     || pathname === '/favicon.ico';
 }
@@ -385,7 +388,7 @@ async function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: 
     const data = await fs.readFile(filePath);
     textResponse(res, 200, data, {
       'Content-Type': contentTypeForPath(filePath),
-      'Cache-Control': pathname === '/' ? 'no-store' : 'public, max-age=60'
+      'Cache-Control': ['/', '/index.html', '/sw.js', '/manifest.webmanifest'].includes(pathname) ? 'no-store' : 'public, max-age=60'
     });
     return true;
   } catch (error) {
