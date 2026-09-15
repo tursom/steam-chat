@@ -659,7 +659,7 @@ function renderShell() {
   if (hasPermission('steam.account.manage')) nav.append(navButton('steamAccounts', 'Steam 账户'));
   if (hasPermission('audit.view')) nav.append(navButton('audit', '审计日志'));
   if (state.me.role === 'admin') nav.append(navButton('imageEmotes', '图片表情'));
-  nav.append(navButton('account', '账号'));
+  nav.append(navButton('account', '设置'));
   sidebar.append(brand, nav);
   if (state.view === 'chat') {
     const railLogout = chatIconButton('log-out', '退出后台', 'rail-logout');
@@ -721,7 +721,7 @@ function pageTitle() {
   if (state.view === 'steamAccounts') return 'Steam 账户';
   if (state.view === 'audit') return '审计日志';
   if (state.view === 'imageEmotes') return '图片表情';
-  if (state.view === 'account') return '账号';
+  if (state.view === 'account') return '设置';
   return 'Steam 连接';
 }
 
@@ -734,7 +734,7 @@ function pageSubtitle() {
   if (state.view === 'steamAccounts') return 'Steam 账户资料、连接状态和授权计数';
   if (state.view === 'audit') return '关键管理动作和敏感字段脱敏记录';
   if (state.view === 'imageEmotes') return '管理共享图片表情、分组和素材';
-  if (state.view === 'account') return '修改当前后台账号密码';
+  if (state.view === 'account') return '管理通知偏好、账号安全和服务配置';
   return state.me?.role === 'admin' ? '管理员在这里完成 Steam 登录和 Guard 验证' : '等待管理员连接 Steam';
 }
 
@@ -744,7 +744,7 @@ function renderCurrentView() {
   if (state.view === 'steamAccounts' && hasPermission('steam.account.manage')) return renderSteamAccountsView();
   if (state.view === 'audit' && hasPermission('audit.view')) return renderAuditView();
   if (state.view === 'imageEmotes' && state.me?.role === 'admin') return renderImageEmotesView();
-  if (state.view === 'account') return renderAccountView();
+  if (state.view === 'account') return renderSettingsView();
   return renderSteamView();
 }
 
@@ -1316,9 +1316,39 @@ async function loadAuditLogs() {
   }
 }
 
-function renderAccountView() {
-  const view = create('div', 'account-view');
-  const accountPanel = panel('修改密码', 'form-panel');
+function renderSettingsView() {
+  // Keep the persisted account view key compatible with existing bookmarks/preferences.
+  const view = create('div', 'account-view settings-view');
+  const notifications = panel('消息通知', 'form-panel');
+  notifications.append(
+    create('p', 'muted', '开启后，网页在后台或正在查看其他会话时，新消息会触发桌面通知。点击通知可打开对应会话。'),
+    desktopNotificationControl(),
+    create('p', 'muted', '此偏好仅保存在当前浏览器。需要允许浏览器和系统通知，并保持网页打开。通知不显示消息正文。')
+  );
+  view.append(notifications);
+  const configuration = panel('服务配置', 'form-panel');
+  const links = create('div', 'settings-links');
+  const entries: Array<[View, string, string]> = [
+    ['steam', 'Steam 连接', '查看连接状态和管理 Steam 登录']
+  ];
+  if (hasPermission('steam.account.manage')) entries.push(['steamAccounts', 'Steam 账户', '管理 Steam 账户和活动账号']);
+  if (hasPermission('user.manage')) entries.push(['users', '用户管理', '管理后台用户、权限和账号授权']);
+  if (state.me?.role === 'admin') entries.push(['imageEmotes', '图片表情', '管理共享图片素材和分组']);
+  for (const [target, title, description] of entries) {
+    const row = create('div', 'settings-link');
+    const button = create('button', 'ghost-btn', title);
+    button.type = 'button';
+    button.addEventListener('click', () => {
+      state.view = target;
+      localStorage.setItem('steam-chat.view', target);
+      renderShell();
+    });
+    row.append(button, create('span', 'muted', description));
+    links.append(row);
+  }
+  configuration.append(links);
+  view.append(configuration);
+  const accountPanel = panel('账号安全 · 修改密码', 'form-panel');
   const form = create('form', 'stack-form narrow-form') as HTMLFormElement;
   form.innerHTML = `
     <label>当前密码<input name="oldPassword" type="password" autocomplete="current-password" required></label>
@@ -1405,7 +1435,7 @@ function renderChatView() {
     });
     tabList.append(button);
   }
-  listHead.append(account, titleRow, desktopNotificationControl(), search, tabList);
+  listHead.append(account, titleRow, search, tabList);
 
   const listBody = create('div', 'conversation-list');
   listBody.id = 'chatListSections';
