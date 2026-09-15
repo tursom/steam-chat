@@ -2623,6 +2623,8 @@ function appendSupportedBbcode(
     const url = parseUrlTarget(attributes, body);
     if (!url) return false;
     container.append(externalLink('', url, body.trim() ? body : url));
+    const player = neteasePlayer(url);
+    if (player) container.append(player);
     return true;
   }
 
@@ -2804,6 +2806,43 @@ function externalLink(className: string, url: string, text = '') {
   return link;
 }
 
+function neteaseSongId(value: string): string | null {
+  try {
+    const url = new URL(value);
+    if (!['http:', 'https:'].includes(url.protocol) || !['music.163.com', 'www.music.163.com', 'y.music.163.com'].includes(url.hostname)
+      || url.username || url.password || url.port) return null;
+    const route = url.hash.startsWith('#/') ? new URL(url.hash.slice(1), url.origin) : url;
+    if (!['/song', '/song/', '/m/song', '/m/song/'].includes(route.pathname)) return null;
+    const id = route.searchParams.get('id');
+    return id && /^[1-9]\d{0,19}$/.test(id) ? id : null;
+  } catch { return null; }
+}
+
+function neteasePlayer(url: string): HTMLElement | null {
+  const id = neteaseSongId(url);
+  if (!id) return null;
+  const shell = create('div', 'netease-player');
+  const button = create('button', 'ghost-btn', '♫ 播放网易云音乐');
+  button.type = 'button';
+  const note = create('p', 'muted', '通过网易云官方播放器播放；若歌曲不可用，请打开原链接。');
+  button.addEventListener('click', () => {
+    if (shell.querySelector('iframe')) return;
+    const frame = document.createElement('iframe');
+    frame.title = '网易云音乐歌曲播放器';
+    frame.src = `https://music.163.com/outchain/player?type=2&id=${id}&auto=0&height=66`;
+    frame.setAttribute('allow', 'autoplay');
+    frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups allow-popups-to-escape-sandbox');
+    frame.referrerPolicy = 'no-referrer';
+    const close = create('button', 'ghost-btn', '关闭播放器');
+    close.type = 'button';
+    close.addEventListener('click', () => { frame.remove(); close.remove(); button.hidden = false; });
+    button.hidden = true;
+    shell.append(frame, close);
+  });
+  shell.append(button, note);
+  return shell;
+}
+
 function openGraphNode(preview: OpenGraphPreview) {
   const card = create('section', 'og-card');
   const main = create('div', 'og-main');
@@ -2848,6 +2887,8 @@ function openGraphNode(preview: OpenGraphPreview) {
   });
   footer.append(domain, copyButton);
   card.append(main, footer);
+  const player = neteasePlayer(preview.url);
+  if (player) card.append(player);
   return card;
 }
 
@@ -2953,6 +2994,8 @@ function appendInlineMessageText(container: HTMLElement, text: string) {
       container.append(emoticonNode(match[1] || match[2]));
     } else if (match[3]) {
       container.append(externalLink('', match[3], match[3]));
+      const player = neteasePlayer(match[3]);
+      if (player) container.append(player);
     }
     lastIndex = match.index + match[0].length;
   }

@@ -816,3 +816,29 @@ test('room effect picker preserves drafts and sends official command; history su
   assert.match(unknown.textContent, /future_effect/);
   assert.equal(unknown.findByClass('room-effect-message')!.findByTag('button'), null);
 });
+
+test('NetEase song links load only the official player after a click', async () => {
+  const { renderMessage } = loadWebTestApi();
+  for (const url of ['https://music.163.com/song?id=347230', 'https://music.163.com/#/song?id=347230&userid=1', 'https://y.music.163.com/m/song?id=347230']) {
+    const row = renderMessage({ id: 'peer', message: url });
+    const player = row.findByClass('netease-player')!;
+    assert.ok(player);
+    assert.equal(player.findByTag('iframe'), null);
+    await player.findByTag('button')!.dispatch('click');
+    assert.equal(player.findByTag('iframe')!.src, 'https://music.163.com/outchain/player?type=2&id=347230&auto=0&height=66');
+  }
+  for (const url of ['https://music.163.com.evil.test/song?id=1', 'https://music.163.com/playlist?id=1', 'https://music.163.com/song?id=abc', 'https://music.163.com/song?id=1%26auto%3D1']) {
+    assert.equal(renderMessage({ id: 'peer', message: url }).findByClass('netease-player'), null);
+  }
+});
+
+test('NetEase OpenGraph and BBCode links preserve the source and add one player', () => {
+  const { renderMessage } = loadWebTestApi();
+  const url = 'https://music.163.com/song?id=347230';
+  for (const message of [`[og url="${url}" title="九月のパンプキン" desc="歌曲介绍"]${url}[/og]`, `[url=${url}]歌曲[/url]`]) {
+    const row = renderMessage({ id: 'peer', message });
+    assert.equal(row.findAllByClass('netease-player').length, 1);
+    assert.equal(row.findByTag('a')!.href, url);
+    assert.equal(row.findByTag('iframe'), null);
+  }
+});
