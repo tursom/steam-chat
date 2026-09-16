@@ -1,6 +1,7 @@
 'use strict';
 
 import { createHistoryStorage } from './storage/history-storage';
+import { replaceableSteamClient } from './steam/replaceable-client';
 import type { CallbackStyleFunction, Persona, UnknownRecord } from './types';
 import type { IncomingMessage } from 'node:http';
 import { errorMessage, isRecord } from './types';
@@ -24,7 +25,7 @@ type PersonaResponse = UnknownRecord & {
   users?: Record<string, Persona>;
 };
 
-type SteamUserMain = {
+type SteamUserMain = import('node:events').EventEmitter & {
   users?: Record<string, Persona>;
   steamID?: unknown;
   getPersonas?: (ids: string[], callback: (error: unknown, response: PersonaResponse) => void) => void;
@@ -71,7 +72,8 @@ const SteamUser = require('steam-user') as SteamUserConstructor;
 
 const config = loadConfig();
 // The application owns reconnects; SDK auto-relogin would race scheduleReconnect.
-const steamUser = new SteamUser({ renewRefreshTokens: true, autoRelogin: false });
+const steamClient = replaceableSteamClient(() => new SteamUser({ renewRefreshTokens: true, autoRelogin: false }));
+const steamUser = steamClient.client;
 const steamCommunity = new SteamCommunity();
 const users: Record<string, Persona> = {};
 const authStore = createAuthStore({ dbPath: AUTH_DB_PATH });
@@ -139,6 +141,7 @@ async function getSelfName(steamAccountId?: string) {
 }
 
 const lifecycle = createSteamLoginService({
+  replaceClient: steamClient.replace,
   steamUser,
   steamCommunity,
   config: {

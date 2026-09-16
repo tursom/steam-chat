@@ -105,6 +105,7 @@ type SteamLoginRequest = {
 };
 
 type SteamLoginServiceOptions = SteamLifecycleOptions & {
+  replaceClient?: () => void;
   getDefaultLogonID?: () => number;
   onLoggedOn?: (steamId: string | null) => void;
   onRefreshToken?: (refreshToken: string, steamId: string | null) => void;
@@ -433,7 +434,11 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
       // Do not reuse this client after an unbounded SDK attempt.
       retired = true;
       status = 'error';
-      lastError = 'Steam login timed out after 120000 ms; restart the service to retry';
+      lastError = options.replaceClient
+        ? 'Steam login timed out after 120000 ms; reconnecting with a new client'
+        : 'Steam login timed out after 120000 ms; restart the service to retry';
+      latestWebSession = null;
+      steamId = null;
       guard = null;
       pendingGuardCallback = null;
       const error = new Error(lastError);
@@ -441,6 +446,7 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
       webDeferred.reject(error);
       log('error', lastError);
       steamUser.logOff?.();
+      if (options.replaceClient) scheduleReconnect(error);
     }, LOGIN_TIMEOUT_MS);
     if (typeof loginTimer === 'object') loginTimer.unref?.();
   }
@@ -510,7 +516,7 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
   }
 
   function scheduleReconnect(reason: unknown) {
-    if (stopped || retired || manualLogoff || retryTimer !== null) return;
+    if (stopped || (retired && !options.replaceClient) || manualLogoff || retryTimer !== null) return;
     const refreshToken = readRefreshToken(refreshTokenPath, fileSystem);
     if (!refreshToken) {
       status = 'logged_out';
@@ -525,11 +531,16 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
     retryTimer = timers.setTimeout(() => {
       if (generation !== retryGeneration) return;
       retryTimer = null;
-      if (stopped || retired || manualLogoff) return;
+      if (stopped || manualLogoff) return;
       try {
+        if (retired) {
+          options.replaceClient?.();
+          retired = false;
+        }
         tryTokenLogin('reconnecting').catch(() => {});
       } catch (error) {
-        handleLoginFailure(error);
+        if (retired) scheduleReconnect(error);
+        else handleLoginFailure(error);
       }
     }, delay);
   }
