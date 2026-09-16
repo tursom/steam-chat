@@ -304,6 +304,8 @@ function resetHistory() {
 
 function invalidateChat() {
   closeDesktopNotifications();
+  notificationAudio?.pause();
+  lastNotificationSound = 0;
   desktopNotificationEvents.clear();
   roomEffectEvents.clear();
   chatEpoch += 1;
@@ -1388,6 +1390,7 @@ function renderSettingsView() {
   notifications.append(
     create('p', 'muted', '开启后，网页在后台或正在查看其他会话时，新消息会触发桌面通知。点击通知可打开对应会话。'),
     desktopNotificationControl(),
+    notificationSoundControls(),
     create('p', 'muted', '此偏好仅保存在当前浏览器。需要允许浏览器和系统通知，并保持网页打开。通知不显示消息正文。')
   );
   view.append(notifications);
@@ -1653,6 +1656,7 @@ function chatAccountLabel() {
 }
 
 function friendStatusLabel(item: ListEntry | null) {
+  if (item && isCommunityGroup(item.id)) return 'Steam 社区群组';
   if (!steamOnline()) return `Steam ${steamLabel()}`;
   if (!steamAccessAllowed()) return '无账户访问权限';
   if (item?.gameName) return `正在玩 ${item.gameName}`;
@@ -1899,9 +1903,14 @@ function resizeComposerInput(input: HTMLTextAreaElement) {
   input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
 }
 
+function isCommunityGroup(id = state.activeId) {
+  return state.groups.some(group => group.id === id);
+}
+
 function updateChatAvailability() {
+  const group = isCommunityGroup();
   const unavailable = !steamOnline() || !steamAccessAllowed();
-  const disabled = unavailable || !state.activeId;
+  const disabled = unavailable || group || !state.activeId;
   document.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>('[data-chat-control]').forEach((node) => {
     node.disabled = disabled;
   });
@@ -1909,8 +1918,8 @@ function updateChatAvailability() {
   if (send) send.disabled = disabled || composerSending.has(`${chatContext()}|${state.activeId}`);
   const note = document.querySelector<HTMLElement>('#offlineNote');
   if (note) {
-    note.textContent = !steamOnline() ? 'Steam 未在线，聊天发送和素材操作不可用。' : '当前账号未被授权访问活动 Steam 账户。';
-    note.hidden = !unavailable;
+    note.textContent = group ? '这是 Steam 社区群组。当前尚未接入群聊频道，不能在此发送私聊消息；可从资料面板打开群组主页。' : !steamOnline() ? 'Steam 未在线，聊天发送和素材操作不可用。' : '当前账号未被授权访问活动 Steam 账户。';
+    note.hidden = !unavailable && !group;
   }
 }
 
@@ -2169,6 +2178,14 @@ function uniqueMessages(items: MessageItem[]): MessageItem[] {
 async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest', date = '') {
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages || !state.activeId || !steamAccessAllowed()) return;
+  if (isCommunityGroup()) {
+    resetHistory();
+    clear(messages);
+    const empty = create('div', 'thread-empty');
+    empty.append(create('strong', '', 'Steam 社区群组'), create('p', 'muted', '群聊频道尚未接入'), externalLink('ghost-btn', `https://steamcommunity.com/gid/${state.activeId}`, '打开群组主页'));
+    messages.append(empty);
+    return;
+  }
   if ((mode === 'older' || mode === 'newer') && (historyBusy || !(mode === 'older' ? historyBefore : historyAfter))) return;
   const target = state.activeId;
   const context = chatContext();
@@ -2254,6 +2271,58 @@ function updateRecentConversation(item: MessageItem) {
 
 const desktopNotificationEvents = new Set<string>();
 const desktopNotifications = new Set<Notification>();
+const notificationSounds = [
+  { id: 'steam-message', label: 'Steam 消息（默认）' },
+  { id: 'steam-room', label: 'Steam 聊天室' },
+  { id: 'steam-mention', label: 'Steam 提及' }
+];
+let notificationAudio: HTMLAudioElement | null = null;
+let lastNotificationSound = 0;
+
+function selectedNotificationSound() {
+  const selected = localStorage.getItem('steam-chat.notification-sound');
+  return notificationSounds.find(sound => sound.id === selected)?.id || 'steam-message';
+}
+
+async function playNotificationSound(preview = false) {
+  if (typeof Audio === 'undefined') return false;
+  if (!preview && (localStorage.getItem('steam-chat.sound-enabled') === 'false' || Date.now() - lastNotificationSound < 1500)) return false;
+  if (!preview) lastNotificationSound = Date.now();
+  try {
+    notificationAudio ||= new Audio();
+    notificationAudio.pause();
+    notificationAudio.src = `/sounds/${selectedNotificationSound()}.m4a`;
+    notificationAudio.volume = 0.6;
+    await notificationAudio.play();
+    return true;
+  } catch { return false; }
+}
+
+function notificationSoundControls() {
+  const section = create('div', 'stack-form');
+  const enabled = create('input'); enabled.type = 'checkbox';
+  enabled.checked = localStorage.getItem('steam-chat.sound-enabled') !== 'false';
+  const label = create('label', '', '新消息提示音'); label.append(enabled);
+  const selectLabel = create('label', '', '提示音');
+  const select = create('select');
+  for (const sound of notificationSounds) {
+    const option = create('option', '', sound.label); option.value = sound.id; select.append(option);
+  }
+  select.value = selectedNotificationSound();
+  select.addEventListener('change', () => localStorage.setItem('steam-chat.notification-sound', select.value));
+  selectLabel.append(select);
+  const preview = create('button', 'ghost-btn', '试听提示音'); preview.type = 'button';
+  const hint = create('p', 'muted', '提示音独立于桌面通知，默认开启。后台或其他会话收到消息时播放；首次使用请点击试听以允许浏览器播放声音。');
+  preview.addEventListener('click', async () => {
+    hint.textContent = await playNotificationSound(true) ? '试听已播放，设置保存在当前浏览器。' : '声音播放被阻止或加载失败，请检查浏览器网站声音权限后重试。';
+  });
+  enabled.addEventListener('change', () => {
+    localStorage.setItem('steam-chat.sound-enabled', String(enabled.checked));
+    if (!enabled.checked) notificationAudio?.pause();
+  });
+  section.append(label, selectLabel, preview, hint);
+  return section;
+}
 
 function closeDesktopNotifications() {
   for (const notification of desktopNotifications) notification.close();
@@ -2301,10 +2370,11 @@ function notifyIncomingMessage(item: MessageItem) {
     desktopNotificationEvents.add(item.eventId);
     if (desktopNotificationEvents.size > 1000) desktopNotificationEvents.delete(desktopNotificationEvents.values().next().value!);
   }
-  if (typeof Notification === 'undefined' || Notification.permission !== 'granted'
-    || localStorage.getItem('steam-chat.desktop-notifications') !== 'true') return;
   if (state.view === 'chat' && state.activeId === item.id && state.chatPanel === 'thread'
     && document.visibilityState === 'visible' && document.hasFocus()) return;
+  void playNotificationSound();
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted'
+    || localStorage.getItem('steam-chat.desktop-notifications') !== 'true') return;
   const context = chatContext();
   const name = resolvedChatEntry({ id: item.id, name: item.name }).name || item.id;
   try {
@@ -3064,7 +3134,7 @@ async function sendText(explicitMessage?: string, previewMessage?: string): Prom
   const input = document.querySelector<HTMLTextAreaElement>('#messageInput');
   const draft = explicitMessage ?? input?.value ?? '';
   const msg = draft.trim();
-  if (!id || !msg) return false;
+  if (!id || !msg || isCommunityGroup(id)) return false;
   const outgoing = beginOutgoing(id, previewMessage ?? msg.replace(/\[/g, '\\['));
   if (explicitMessage === undefined && input) { input.value = ''; resizeComposerInput(input); }
   try {
@@ -3252,7 +3322,7 @@ async function sendImage(payload: Record<string, string>, existing?: ImageTransf
 }
 
 function canSendImages() {
-  return Boolean(state.me && state.view === 'chat' && steamOnline() && steamAccessAllowed() && state.activeId);
+  return Boolean(state.me && state.view === 'chat' && steamOnline() && steamAccessAllowed() && state.activeId && !isCommunityGroup());
 }
 
 function handleImagePaste(event: ClipboardEvent) {

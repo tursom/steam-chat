@@ -348,6 +348,7 @@ function contentTypeForPath(filePath: string) {
     '.html': 'text/html; charset=utf-8',
     '.js': 'text/javascript; charset=utf-8',
     '.json': 'application/json; charset=utf-8',
+    '.m4a': 'audio/mp4',
     '.png': 'image/png',
     '.jpg': 'image/jpeg',
     '.jpeg': 'image/jpeg',
@@ -374,6 +375,7 @@ function isStaticRequest(pathname: string) {
     || pathname === '/app.js'
     || pathname === '/sw.js'
     || pathname === '/manifest.webmanifest'
+    || pathname.startsWith('/sounds/')
     || pathname.startsWith('/icons/')
     || pathname === '/favicon.ico';
 }
@@ -1055,7 +1057,15 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
   }
 
+  function rejectGroupRecipient(id: unknown) {
+    const value = String(id || '');
+    if (/^\d{17}$/.test(value) && [7n, 8n].includes((BigInt(value) >> 52n) & 15n)) {
+      throw Object.assign(new Error('群组频道尚未接入，不能使用私聊接口发送群消息'), { statusCode: 400 });
+    }
+  }
+
   async function sendTextMessage(id: unknown, msg: unknown, steamAccountId?: string, authorize?: () => void): Promise<HistoryItem> {
+    rejectGroupRecipient(id);
     steamAccountId = steamAccountId || ensureActiveSteamAccount()?.steamId || currentSteamStatus().steamId || undefined;
     checkSend(steamAccountId);
     const selfName = settleMetadata(getSelfName(steamAccountId), 'Me');
@@ -1100,6 +1110,7 @@ function createChatService(options: ChatServiceOptions = {}) {
   }
 
   async function sendImageMessage(id: unknown, body: ImageBody, steamAccountId?: string, authorize?: () => void): Promise<HistoryItem> {
+    rejectGroupRecipient(id);
     steamAccountId = steamAccountId || ensureActiveSteamAccount()?.steamId || currentSteamStatus().steamId || undefined;
     checkSend(steamAccountId);
     const selfName = settleMetadata(getSelfName(steamAccountId), 'Me');
@@ -1632,7 +1643,7 @@ async function listFriends(steamUser?: SteamUserLike): Promise<FriendSummary[]> 
 
 function groupFromUnknown(group: unknown, fallbackId = ''): GroupSummary {
   if (!isRecord(group)) {
-    const id = steamIdToString(group || fallbackId);
+    const id = fallbackId || steamIdToString(group);
     return { id, clanId: '', name: id };
   }
   const id = steamIdToString(group.steamID || group.id || fallbackId || group);
@@ -1641,7 +1652,9 @@ function groupFromUnknown(group: unknown, fallbackId = ''): GroupSummary {
     : typeof group.clanID === 'string'
       ? group.clanID
       : '';
-  const name = typeof group.name === 'string'
+  const name = isRecord(group.name_info) && typeof group.name_info.clan_name === 'string'
+    ? group.name_info.clan_name
+    : typeof group.name === 'string'
     ? group.name
     : typeof group.group_name === 'string'
       ? group.group_name
@@ -1656,7 +1669,9 @@ async function listGroups(steamUser?: SteamUserLike): Promise<GroupSummary[]> {
     return groups.map((group) => groupFromUnknown(group));
   }
   if (!isRecord(groups)) return [];
-  return Object.entries(groups).map(([id, group]) => groupFromUnknown(group, id));
+  const metadata = isRecord(steamUser.groups) ? steamUser.groups : {};
+  return Object.entries(groups).filter(([, group]) => typeof group !== 'number' || group === 3)
+    .map(([id, group]) => groupFromUnknown(isRecord(metadata[id]) ? metadata[id] : group, id));
 }
 
 module.exports = {

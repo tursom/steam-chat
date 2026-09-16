@@ -842,3 +842,16 @@ test('NetEase OpenGraph and BBCode links preserve the source and add one player'
     assert.equal(row.findByTag('iframe'), null);
   }
 });
+
+test('community groups show their identity and disable private-message controls', () => {
+  const api = loadWebTestApi();
+  const group = { id: '103582791429521412', name: 'Test community' };
+  api.setChatAvailability(true, true, group.id);
+  api.setChatListState([], [], [group], 'groups', '', group.id);
+  const view = api.mountChatView();
+  api.setChatAvailability(true, true, group.id);
+  assert.equal(view.findById('sendButton')!.disabled, true);
+  assert.match(api.offlineNote.textContent, /群聊频道/);
+  assert.match(view.findById('threadHead')!.textContent, /Test community/);
+  assert.match(view.findById('threadHead')!.textContent, /Steam 社区群组/);
+});

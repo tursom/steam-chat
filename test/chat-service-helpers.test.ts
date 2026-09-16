@@ -176,3 +176,16 @@ test('decodeBase64Image accepts data URLs and readRequestBody enforces byte limi
     return true;
   });
 });
+
+test('group membership values are not IDs; SDK clan metadata provides group names', async () => {
+  const groups = await listGroups({
+    myGroups: { '103582791429521412': 3, '103582791429521413': 3, '103582791429521414': 2 },
+    groups: {
+      '103582791429521412': { name_info: { clan_name: 'First community' } },
+      '103582791429521413': { name_info: { clan_name: 'Second community' } }
+    }
+  });
+  assert.deepEqual(groups.map((group: { id: string; name: string }) => [group.id, group.name]), [
+    ['103582791429521412', 'First community'], ['103582791429521413', 'Second community']
+  ]);
+});
