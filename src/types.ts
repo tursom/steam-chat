@@ -16,6 +16,7 @@ export type Persona = UnknownRecord & {
   player_name?: string;
   personaName?: string;
   name?: string;
+  avatar_url_full?: string;
   avatar_url_icon?: string;
   avatar_url_medium?: string;
   avatar?: string;

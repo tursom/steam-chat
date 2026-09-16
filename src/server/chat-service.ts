@@ -1633,7 +1633,7 @@ async function listFriends(steamUser?: SteamUserLike): Promise<FriendSummary[]> 
     return {
       id,
       name: persona.player_name || persona.personaName || persona.name || id,
-      avatar: persona.avatar_url_icon || persona.avatar_url_medium || persona.avatar || '',
+      avatar: persona.avatar_url_full || persona.avatar_url_medium || persona.avatar_url_icon || persona.avatar || '',
       personaState: state,
       online: Number(state || 0) > 0,
       gameName: persona.game_name || persona.gameName || ''

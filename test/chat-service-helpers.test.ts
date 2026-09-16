@@ -189,3 +189,14 @@ test('group membership values are not IDs; SDK clan metadata provides group name
     ['103582791429521412', 'First community'], ['103582791429521413', 'Second community']
   ]);
 });
+
+test('friends prefer full-size Steam avatars with medium and icon fallbacks', async () => {
+  const friends = await listFriends({ myFriends: { full: 3, medium: 3, icon: 3 }, users: {
+    full: { avatar_url_full: 'full.jpg', avatar_url_medium: 'medium.jpg', avatar_url_icon: 'icon.jpg' },
+    medium: { avatar_url_medium: 'medium.jpg', avatar_url_icon: 'icon.jpg' },
+    icon: { avatar_url_icon: 'icon.jpg' }
+  } });
+  assert.equal(friends.find((friend: { id: string }) => friend.id === 'full').avatar, 'full.jpg');
+  assert.equal(friends.find((friend: { id: string }) => friend.id === 'medium').avatar, 'medium.jpg');
+  assert.equal(friends.find((friend: { id: string }) => friend.id === 'icon').avatar, 'icon.jpg');
+});
