@@ -107,6 +107,10 @@ async function run() {
       await page.waitForTimeout(100);
       assert.match(await uncertain.innerText(), /未确认/);
       assert.equal(writes.length, 4, 'uncertain sends must not retry automatically');
+      const later = { ...item, eventId: 'later-message', echo: false, message: 'Later incoming message', sentAt: new Date().toISOString() };
+      history.push(later);
+      socket.send(JSON.stringify(later));
+      await page.locator('[data-event-id="later-message"]').waitFor();
       const dataUrl = await page.evaluate(() => {
         const canvas = document.createElement('canvas');
         canvas.width = 240; canvas.height = 160;
@@ -126,6 +130,13 @@ async function run() {
       assert.match(await page.locator('.msg-row').filter({ has: preview }).innerText(), /发送中/);
       await page.waitForTimeout(50);
       assert.equal(writes.length, 5);
+      const order = await page.locator('#messages .msg-row').allTextContents();
+      assert.ok(order.findIndex(text => text.includes('Uncertain text')) < order.findIndex(text => text.includes('Later incoming message')), 'uncertain attempt must stay before newer history after rerender');
+      assert.match(await failed.innerText(), /Rejected for regression test/);
+      await uncertain.getByRole('button', { name: '移除此提示' }).click();
+      assert.equal(await uncertain.count(), 0);
+      assert.equal(await page.locator('[data-event-id="later-message"]').count(), 1);
+      assert.equal(writes.length, 5, 'dismiss does not resend');
       assert.ok(await page.locator('#messages').evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop < 2), 'sending images must scroll to the bottom');
       if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, `steam-chat-outgoing-pending-${width}.png`) });
       const imageItem = { ...item, eventId: 'image-confirmed', type: 'image', message: 'https://images.example.test/confirmed.png' };

@@ -2423,3 +2423,6 @@ dl.friend-facts {
 .netease-player iframe { display: block; width: 100%; height: 86px; border: 0; }
 .netease-player p { font-size: 12px; margin: 0; }
 .netease-player button { justify-self: start; }
+
+.outgoing-error { display: block; margin-top: 4px; font-size: 12px; overflow-wrap: anywhere; }
+.outgoing-dismiss { display: block; margin-top: 6px; font-size: 12px; }

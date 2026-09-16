@@ -2486,12 +2486,17 @@ function renderHistory(items: MessageItem[]) {
     .map(row => [(row as HTMLElement).dataset.eventId, row]));
   clear(messages);
   const outgoing = visibleOutgoing();
+  const historyRows = new Map<MessageItem, Element>();
   if (!items.length && !outgoing.length) {
     const empty = create('div', 'thread-empty');
     empty.append(create('strong', '', state.activeId ? '暂无消息' : '未选择会话'));
     messages.append(empty);
   } else {
-    for (const item of items) messages.append((item.eventId && existing.get(item.eventId)) || renderMessage(item));
+    for (const item of items) {
+      const row = (item.eventId && existing.get(item.eventId)) || renderMessage(item);
+      historyRows.set(item, row);
+      messages.append(row);
+    }
   }
   for (const entry of outgoing) {
     const localImage = entry.item.type === 'image' && (/^data:image\//i.test(entry.item.message || '') || (entry.item.message || '').startsWith('/api/image-emotes/file/'));
@@ -2508,9 +2513,32 @@ function renderHistory(items: MessageItem[]) {
     const labels: Record<OutgoingState, string> = { sending: '发送中…', sent: '已发送', failed: '发送失败', unknown: '结果未确认，请先检查聊天记录' };
     const status = create('span', 'message-send-state', labels[entry.state]);
     status.setAttribute('role', 'status');
-    if (entry.error) status.title = entry.error;
-    (row.querySelector('.bubble') || row).append(status);
-    messages.append(row);
+    if (entry.error) {
+      status.title = entry.error;
+      const reason = entry.error === 'RateLimitExceeded' ? 'Steam 发送频率受限，请稍后再试' : entry.error;
+      status.append(create('span', 'outgoing-error', reason));
+    }
+    const bubble = row.querySelector('.bubble') || row;
+    bubble.append(status);
+    if (entry.state === 'failed' || entry.state === 'unknown') {
+      const dismiss = create('button', 'ghost-btn outgoing-dismiss', '移除此提示');
+      dismiss.type = 'button';
+      dismiss.title = '仅移除本地发送提示，不删除聊天记录，也不重发消息';
+      dismiss.addEventListener('click', () => {
+        outgoingMessages.delete(entry.localId);
+        refreshOutgoing();
+      });
+      bubble.append(dismiss);
+    }
+    // Insert local attempts at their send time instead of pinning them after all history.
+    const sentAt = Date.parse(entry.item.sentAt || entry.item.date || '');
+    const next = Number.isFinite(sentAt) ? items.find(item => {
+      const time = Date.parse(item.sentAt || item.date || '');
+      return Number.isFinite(time) && time > sentAt;
+    }) : undefined;
+    const nextRow = next ? historyRows.get(next) : undefined;
+    if (nextRow) messages.insertBefore(row, nextRow);
+    else messages.append(row);
   }
   if (historyDetached) watchHistoryLayout(messages, false);
   else followHistoryBottom(messages);
