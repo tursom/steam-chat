@@ -28,6 +28,12 @@ async function run() {
       let previewImage;
       const writes = [];
       const history = Array.from({ length: 30 }, (_, i) => ({ id: peer, eventId: `history-${i}`, type: 'message', message: `History ${i}` }));
+      history[0] = { ...history[0], message: 'https://music.163.com/song?id=347230' };
+      let playerLoads = 0;
+      await page.route('https://music.163.com/outchain/player**', route => {
+        playerLoads++;
+        return route.fulfill({ contentType: 'text/html', body: '<script>window.playbackMarker = "initial";</script><p>Player fixture</p>' });
+      });
       const errors = [];
       page.on('pageerror', error => errors.push(error.message));
       await page.routeWebSocket(/.*/, connection => { socket = connection; });
@@ -51,6 +57,12 @@ async function run() {
       await page.goto('http://steam-chat.test');
       await page.locator('.list-item').first().click();
       await page.waitForFunction(() => document.querySelectorAll('.msg-row').length === 30);
+      await page.getByRole('button', { name: '♫ 播放网易云音乐' }).click();
+      await page.waitForFunction(() => document.querySelector('.netease-player iframe'));
+      const player = await page.locator('.netease-player iframe').elementHandle();
+      const playerFrame = await player.contentFrame();
+      await playerFrame.waitForFunction(() => window.playbackMarker === 'initial');
+      await playerFrame.evaluate(() => window.playbackMarker = 'playing-42s');
       await page.locator('#messages').hover();
       await page.mouse.wheel(0, -800);
       await page.waitForTimeout(100);
@@ -150,6 +162,9 @@ async function run() {
       await page.waitForFunction(() => document.querySelector('[data-event-id="image-confirmed"] img')?.naturalWidth === 240);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
       if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, `steam-chat-outgoing-${width}.png`) });
+      assert.equal(playerLoads, 1, 'sending, confirmation and dismissal must not reload the player');
+      assert.equal(await playerFrame.evaluate(() => window.playbackMarker), 'playing-42s');
+      assert.equal(await player.evaluate(node => node.isConnected), true);
       assert.deepEqual(errors, []);
       console.log(`PASS ${width}px: immediate text and images, consecutive sends, all states, echo deduplication`);
       await page.close();

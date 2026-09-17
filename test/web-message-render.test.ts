@@ -14,6 +14,7 @@ class FakeElement {
   tagName: string;
   className = '';
   children: FakeElement[] = [];
+  parent: FakeElement | null = null;
   dataset: Record<string, string> = {};
   href = '';
   src = '';
@@ -39,11 +40,12 @@ class FakeElement {
   }
 
   append(...nodes: FakeElement[]) {
-    this.children.push(...nodes);
+    for (const node of nodes) { node.remove(); node.parent = this; this.children.push(node); }
   }
 
   replaceChildren(...nodes: FakeElement[]) {
-    this.children = [...nodes];
+    for (const child of [...this.children]) child.remove();
+    this.append(...nodes);
     this.ownText = '';
   }
 
@@ -77,7 +79,9 @@ class FakeElement {
     return node === this || this.children.some((child) => child.contains(node));
   }
 
-  remove() {}
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); this.parent = null; }
+
+  insertBefore(node: FakeElement, before: FakeElement | null) { node.remove(); node.parent = this; const index = before ? this.children.indexOf(before) : this.children.length; this.children.splice(index, 0, node); }
 
   get textContent(): string {
     return this.ownText + this.children.map((child) => child.textContent).join('');

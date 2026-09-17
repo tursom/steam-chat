@@ -6,6 +6,7 @@ import { runInNewContext } from 'node:vm';
 
 class Element {
   children: Element[] = [];
+  parent: Element | null = null;
   dataset: Record<string, string> = {};
   textContent = '';
   scrollTop = 0;
@@ -17,9 +18,11 @@ class Element {
   extraHeight = 0;
   listeners = new Map<string, Set<() => void>>();
   get scrollHeight() { return this.children.length * 50 + this.extraHeight; }
-  append(...nodes: Element[]) { this.children.push(...nodes); }
-  prepend(...nodes: Element[]) { this.children.unshift(...nodes); }
-  replaceChildren(...nodes: Element[]) { this.children = nodes; }
+  append(...nodes: Element[]) { for (const node of nodes) { node.remove(); node.parent = this; this.children.push(node); } }
+  prepend(...nodes: Element[]) { for (const node of [...nodes].reverse()) this.insertBefore(node, this.children[0] || null); }
+  replaceChildren(...nodes: Element[]) { for (const child of [...this.children]) child.remove(); this.append(...nodes); }
+  remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); this.parent = null; }
+  insertBefore(node: Element, before: Element | null) { node.remove(); node.parent = this; const index = before ? this.children.indexOf(before) : this.children.length; this.children.splice(index, 0, node); }
   querySelector(): null { return null; }
   removeAttribute() {}
   setAttribute() {}

@@ -2549,23 +2549,26 @@ function outgoingFailure(error: unknown): 'failed' | 'unknown' {
   return isRecord(error) && typeof error.status === 'number' && error.status >= 400 && error.status < 500 ? 'failed' : 'unknown';
 }
 
+const renderedHistoryRows = new WeakMap<MessageItem, HTMLElement>();
+
 function renderHistory(items: MessageItem[]) {
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages) return;
   const existing = new Map(Array.from(messages.children).filter(row => (row as HTMLElement).dataset.eventId)
     .map(row => [(row as HTMLElement).dataset.eventId, row]));
-  clear(messages);
+  const desired: Element[] = [];
   const outgoing = visibleOutgoing();
   const historyRows = new Map<MessageItem, Element>();
   if (!items.length && !outgoing.length) {
     const empty = create('div', 'thread-empty');
     empty.append(create('strong', '', state.activeId ? '暂无消息' : '未选择会话'));
-    messages.append(empty);
+    desired.push(empty);
   } else {
     for (const item of items) {
-      const row = (item.eventId && existing.get(item.eventId)) || renderMessage(item);
+      const row = (item.eventId && existing.get(item.eventId)) || renderedHistoryRows.get(item) || renderMessage(item);
+      renderedHistoryRows.set(item, row as HTMLElement);
       historyRows.set(item, row);
-      messages.append(row);
+      desired.push(row);
     }
   }
   for (const entry of outgoing) {
@@ -2607,8 +2610,21 @@ function renderHistory(items: MessageItem[]) {
       return Number.isFinite(time) && time > sentAt;
     }) : undefined;
     const nextRow = next ? historyRows.get(next) : undefined;
-    if (nextRow) messages.insertBefore(row, nextRow);
-    else messages.append(row);
+    if (nextRow) desired.splice(desired.indexOf(nextRow), 0, row);
+    else desired.push(row);
+  }
+  // Detaching an iframe resets its browsing context, even if the same node is reused.
+  // Keep retained history connected; only remove obsolete rows and insert new ones.
+  const retained = new Set(desired);
+  for (const child of Array.from(messages.children)) if (!retained.has(child)) child.remove();
+  let position = 0;
+  for (const row of desired) {
+    const cursor = messages.children[position];
+    if (row !== cursor) {
+      if (cursor) messages.insertBefore(row, cursor);
+      else messages.append(row);
+    }
+    position++;
   }
   if (historyDetached) watchHistoryLayout(messages, false);
   else followHistoryBottom(messages);
