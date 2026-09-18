@@ -1942,22 +1942,21 @@ async function refreshChatData() {
     await loadConversations();
     if (context !== chatContext() || request !== listRequest) return;
     if (steamOnline()) {
-      const [friends, groups, inventory] = await Promise.all([
-        api('/api/friends').then(friends => {
-          if (context === chatContext() && request === listRequest) {
-            state.friends = asListEntries(friends);
-            if (state.view === 'chat') {
-              updateChatLists();
-              const head = document.querySelector<HTMLElement>('#threadHead');
-              if (head) renderThreadHeader(head);
-              syncFriendDetails();
-            }
+      const friendsRequest = api('/api/friends').catch((): InventoryItem[] => []);
+      friendsRequest.then(friends => {
+        if (context === chatContext() && request === listRequest) {
+          state.friends = asListEntries(friends);
+          if (state.view === 'chat') {
+            updateChatLists();
+            const head = document.querySelector<HTMLElement>('#threadHead');
+            if (head) renderThreadHeader(head);
+            syncFriendDetails();
           }
-          return friends;
-        }),
-        api('/api/groups'),
-        api('/api/emoticons')
-      ]);
+        }
+      }).catch(() => {});
+      const groupsRequest = api('/api/groups').catch((): ListEntry[] => []);
+      const inventoryRequest = api('/api/emoticons').catch((): { emoticons: InventoryItem[]; stickers: InventoryItem[]; effects: InventoryItem[] } => ({ emoticons: [], stickers: [], effects: [] }));
+      const [friends, groups, inventory] = await Promise.all([friendsRequest, groupsRequest, inventoryRequest]);
       if (context !== chatContext() || request !== listRequest) return;
       state.friends = asListEntries(friends);
       state.groups = asListEntries(groups);
