@@ -308,6 +308,9 @@ function invalidateChat() {
   lastNotificationSound = 0;
   desktopNotificationEvents.clear();
   roomEffectEvents.clear();
+  reactionSnapshots.clear();
+  reactionGeneration++;
+  reactionLastLoad = 0;
   chatEpoch += 1;
   listRequest += 1;
   healthRequest += 1;
@@ -2231,6 +2234,7 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
       historyBefore = pageCursor(payload);
       historyAfter = pageCursor(payload, 'previousCursor');
       renderHistory(historyItems);
+      void loadReactionSnapshots(true);
       if (historyDetached) messages.scrollTop = 0;
       const input = document.querySelector<HTMLInputElement>('#historyDate');
       if (input) input.value = historyAt;
@@ -2629,6 +2633,117 @@ function renderHistory(items: MessageItem[]) {
   else followHistoryBottom(messages);
 }
 
+type MessageReaction = { type: number; name: string; users: string[] };
+const reactionSnapshots = new Map<string, MessageReaction[]>();
+let reactionGeneration = 0;
+let reactionLastLoad = 0;
+let reactionLoading = false;
+const reactionPending = new Set<string>();
+
+function messageReactionKey(item: MessageItem) {
+  const timestamp = Math.floor(Date.parse(item.sentAt || item.date || '') / 1000);
+  const ordinal = Number(item.ordinal);
+  return item.eventId && Number.isInteger(timestamp) && timestamp > 0 && Number.isInteger(ordinal)
+    ? `${item.id}:${timestamp}:${ordinal}` : '';
+}
+
+function refreshReactionBars() {
+  const nodes = document.querySelectorAll<HTMLElement>('#messages [data-event-id]');
+  for (const node of Array.from(nodes)) {
+    const item = historyItems.find(item => item.eventId === node.dataset.eventId);
+    const bar = node.querySelector<HTMLElement>('.message-reactions');
+    if (item && bar && !bar.querySelector('.reaction-picker')) renderReactionBar(bar, item);
+  }
+}
+
+async function loadReactionSnapshots(force = false) {
+  if (!state.me || !steamOnline() || !steamAccessAllowed() || isCommunityGroup() || state.view !== 'chat'
+    || !state.activeId || !historyItems.length || reactionLoading || reactionPending.size
+    || (!force && Date.now() - reactionLastLoad < 10000)) return;
+  const context = chatContext(), peer = state.activeId, generation = reactionGeneration;
+  const newest = Math.max(...historyItems.map(item => Math.floor(Date.parse(item.sentAt || item.date || '') / 1000)).filter(Number.isFinite));
+  if (!Number.isFinite(newest)) return;
+  reactionLoading = true; reactionLastLoad = Date.now();
+  try {
+    const params = new URLSearchParams({ id: peer, before: String(newest + 1), steamAccountId: state.steam.activeAccount?.steamId || state.steam.steamId || '' });
+    const result = await api(`/api/message-reactions?${params}`);
+    if (context !== chatContext() || peer !== state.activeId || generation !== reactionGeneration || !isRecord(result) || !Array.isArray(result.items)) return;
+    for (const item of result.items) {
+      if (!isRecord(item) || !Array.isArray(item.reactions)) continue;
+      const key = `${peer}:${item.timestamp}:${item.ordinal}`;
+      reactionSnapshots.set(key, item.reactions as MessageReaction[]);
+    }
+    while (reactionSnapshots.size > 1000) reactionSnapshots.delete(reactionSnapshots.keys().next().value!);
+    refreshReactionBars();
+  } catch { /* Keep the last confirmed reactions when Steam is temporarily unavailable. */ }
+  finally { reactionLoading = false; }
+}
+
+function renderReactionBar(bar: HTMLElement, item: MessageItem) {
+  clear(bar);
+  const key = messageReactionKey(item);
+  if (!key || !reactionSnapshots.has(key) || isCommunityGroup(item.id)) return;
+  const reactions = reactionSnapshots.get(key)!;
+  const account = state.steam.activeAccount?.steamId || state.steam.steamId;
+  const eligible = steamOnline() && steamAccessAllowed() && !reactionPending.has(key);
+  const reactorName = (id: string) => id === account ? '你' : state.friends.find(friend => friend.id === id)?.name || (id === item.id ? resolvedChatEntry({ id }).name : '') || id;
+  const icon = (type: number, name: string) => type === 1 ? emoticonNode(name.replace(/^:|:$/g, '')) : stickerNode(name);
+  const change = async (type: number, name: string, add: boolean) => {
+    if (reactionPending.has(key)) return;
+    const context = chatContext();
+    reactionGeneration++; reactionPending.add(key); renderReactionBar(bar, item);
+    try {
+      const [, timestamp, ordinal] = key.split(':');
+      const result = await api('/api/message-reactions', jsonBody({ id: item.id, timestamp: Number(timestamp), ordinal: Number(ordinal), reactionType: type, reaction: name, add, steamAccountId: account }));
+      if (context !== chatContext() || !isRecord(result) || !Array.isArray(result.users)) return;
+      const current = (reactionSnapshots.get(key) || []).filter(reaction => reaction.type !== type || reaction.name !== name);
+      if (result.users.length) current.push({ type, name, users: result.users as string[] });
+      reactionSnapshots.set(key, current);
+    } catch (error) {
+      if (context === chatContext()) setFeedback(`表情回应未确认：${errorMessage(error)}。请检查后再操作。`, 'warn');
+    } finally {
+      reactionPending.delete(key);
+      if (context === chatContext()) refreshReactionBars();
+    }
+  };
+  for (const reaction of reactions) {
+    if (!reaction.users.length) continue;
+    const mine = reaction.users.includes(account || '');
+    const button = create('button', `reaction-chip${mine ? ' is-self' : ''}`);
+    button.type = 'button'; button.disabled = !eligible;
+    button.setAttribute('aria-pressed', String(mine));
+    button.title = `${reaction.users.map(reactorName).join('、')} 以 ${reaction.name} 回应`;
+    button.setAttribute('aria-label', button.title);
+    button.append(icon(reaction.type, reaction.name), create('span', '', String(reaction.users.length)));
+    button.addEventListener('click', () => void change(reaction.type, reaction.name, !mine));
+    bar.append(button);
+  }
+  const add = create('button', 'reaction-add', '☺'); add.type = 'button'; add.disabled = !eligible;
+  add.title = '添加表情回应'; add.setAttribute('aria-label', '添加表情回应');
+  add.addEventListener('click', () => {
+    const existing = bar.querySelector('.reaction-picker');
+    if (existing) { existing.remove(); return; }
+    const picker = create('div', 'reaction-picker');
+    const close = create('button', 'ghost-btn', '关闭'); close.type = 'button'; close.addEventListener('click', () => picker.remove());
+    picker.append(close);
+    const grid = create('div', 'picker-grid');
+    for (const [type, inventory] of [[1, state.emoticons], [2, state.stickers]] as const) {
+      for (const entry of inventory) {
+        const emoticon = normalizeEmoticonName(String(entry.name || ''));
+        const name = type === 1 ? (emoticon ? `:${emoticon}:` : '') : String(entry.name || '');
+        if (!name) continue;
+        const button = create('button'); button.type = 'button'; button.title = String(entry.title || name);
+        button.append(icon(type, name));
+        const mine = reactions.some(reaction => reaction.type === type && reaction.name === name && reaction.users.includes(account || ''));
+        button.addEventListener('click', () => void change(type, name, !mine)); grid.append(button);
+      }
+    }
+    if (!grid.children.length) grid.append(create('span', 'muted', '暂无可用表情，请稍后重试'));
+    picker.append(grid); bar.append(picker);
+  });
+  bar.append(add);
+}
+
 function renderMessage(item: MessageItem) {
   const row = create('article', `msg-row${item.echo ? ' is-self' : ''}`);
   if (item.eventId) row.dataset.eventId = item.eventId;
@@ -2649,6 +2764,9 @@ function renderMessage(item: MessageItem) {
     appendMessageText(content, message);
   }
   bubble.append(meta, content);
+  const reactions = create('div', 'message-reactions');
+  bubble.append(reactions);
+  renderReactionBar(reactions, item);
   row.append(bubble);
   return row;
 }
@@ -3709,7 +3827,10 @@ function startStatusPolling() {
         renderShell();
         return;
       }
-      if (state.view === 'chat') await loadStorageHealth();
+      if (state.view === 'chat') {
+        await loadStorageHealth();
+        void loadReactionSnapshots();
+      }
       ensureWebSocket();
       if (state.view === 'chat' && (steamOnline() !== wasOnline || steamStatusSignature() !== previousSignature)) await refreshChatData();
     } catch (_) {

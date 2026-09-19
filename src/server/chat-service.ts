@@ -2,6 +2,7 @@
 
 import { ImageEmoteStore } from '../storage/image-emotes';
 import { handleDeployWebhook } from './deploy-webhook';
+import { readMessageReactions, updateMessageReaction, type ReactionClient } from './message-reactions';
 import { resolveStickerAlias } from './sticker-inventory';
 import { settleMetadata } from '../steam/metadata';
 import { steamEventKey } from '../storage/history-message';
@@ -70,7 +71,7 @@ type SteamChatApi = {
   removeListener?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
 };
 
-type SteamUserLike = {
+type SteamUserLike = ReactionClient & {
   steamID?: unknown;
   chat?: SteamChatApi;
   sendFriendMessage?: CallbackStyleFunction;
@@ -1237,6 +1238,30 @@ function createChatService(options: ChatServiceOptions = {}) {
       }
 
       requireLegacyOrSession(req);
+
+      if (url.pathname === '/api/message-reactions') {
+        const access = requireSteamAccountAccess(req, true);
+        if (!steamUser || !access.steamAccountId) throw Object.assign(new Error('Steam is not online'), { statusCode: 503 });
+        if (req.method === 'GET') {
+          const authorize = httpSendAuthorization(req, access, url.searchParams.get('steamAccountId') || undefined);
+          authorize();
+          const result = await readMessageReactions(steamUser, access.steamAccountId, url.searchParams.get('id') || '', url.searchParams.get('before'));
+          authorize();
+          jsonResponse(res, 200, result, { 'Cache-Control': 'no-store' });
+          return;
+        }
+        if (req.method === 'POST') {
+          const body = await readJsonBody(req);
+          const authorize = httpSendAuthorization(req, access, body.steamAccountId);
+          authorize();
+          const result = await updateMessageReaction(steamUser, body);
+          authorize();
+          jsonResponse(res, 200, result, { 'Cache-Control': 'no-store' });
+          return;
+        }
+        jsonResponse(res, 405, { error: 'Method not allowed' });
+        return;
+      }
 
       if (req.method === 'GET') {
         if (url.pathname === '/api/messages/sync') {

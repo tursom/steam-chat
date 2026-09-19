@@ -2426,3 +2426,11 @@ dl.friend-facts {
 
 .outgoing-error { display: block; margin-top: 4px; font-size: 12px; overflow-wrap: anywhere; }
 .outgoing-dismiss { display: block; margin-top: 6px; font-size: 12px; }
+
+.message-reactions { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; margin-top: 6px; }
+.message-reactions:empty { display: none; }
+.reaction-chip, .reaction-add { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); color: var(--text); }
+.reaction-chip.is-self { border-color: #347d70; background: #dceee7; }
+.reaction-chip img, .reaction-picker img { width: 24px; height: 24px; object-fit: contain; }
+.reaction-picker { flex-basis: 100%; width: min(340px, 100%); max-height: 240px; overflow: auto; padding: 8px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); }
+.reaction-picker .picker-grid { max-height: 180px; overflow: auto; }
