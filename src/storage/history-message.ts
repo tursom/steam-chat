@@ -11,6 +11,16 @@ export function steamEventKey(account: string | undefined, peer: string, echo: b
   return createHash('sha256').update(JSON.stringify([account, peer, echo, message, at.getTime(), sequence])).digest('hex');
 }
 
+// Steam can echo an upload as either image BBCode or a bare UGC image URL.
+export function isSteamImageUrl(message: string): boolean {
+  try {
+    const url = new URL(message);
+    return url.href === message && url.protocol === 'https:' && !url.username && !url.password && !url.port
+      && url.hostname === 'images.steamusercontent.com'
+      && /^\/ugc\/\d+\/[a-f0-9]+\/$/i.test(url.pathname) && !url.search && !url.hash;
+  } catch { return false; }
+}
+
 // Only the upload callback and a complete realtime image echo may be paired.
 export function imageEchoIdentity(input: HistoryRecordInput) {
   const source = input.imageSendSource;
@@ -18,10 +28,12 @@ export function imageEchoIdentity(input: HistoryRecordInput) {
   let raw = input.message || '';
   if (source === 'echo') {
     const tag = /^\[img\b([^\]]*)\]([\s\S]*)\[\/img\]$/i.exec(raw);
-    if (!tag || /\[\/?img\b/i.test(tag[2])) return undefined;
-    const src = /\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s\]]+))/i.exec(tag[1]);
-    if (!src) return undefined;
-    raw = src[1] || src[2] || src[3];
+    if (tag) {
+      if (/\[\/?img\b/i.test(tag[2])) return undefined;
+      const src = /\bsrc\s*=\s*(?:"([^"]+)"|'([^']+)'|([^\s\]]+))/i.exec(tag[1]);
+      if (!src) return undefined;
+      raw = src[1] || src[2] || src[3];
+    } else if (!isSteamImageUrl(raw)) return undefined;
   }
   try {
     const url = new URL(raw);
@@ -47,7 +59,7 @@ export function normalizeStoredMessage(input: HistoryRecordInput): StoredMessage
   const eventId = input.eventId === undefined ? randomBytes(16).toString('hex') : input.eventId.replace(/-/g, '').toLowerCase();
   if (!/^[0-9a-f]{32}$/.test(eventId)) throw new Error('Invalid eventId');
   const result: StoredMessage = {
-    eventId, type: item.type, date: input.date || formatDate(new Date(at)),
+    eventId, type: input.imageSendSource === 'echo' && isSteamImageUrl(item.message || '') ? 'image' : item.type, date: input.date || formatDate(new Date(at)),
     echo: item.echo, steamAccountId: BigInt(item.steamAccountId).toString(),
     id: BigInt(item.id).toString(), name: item.name, message: item.message,
     ordinal, sentAt: new Date(at).toISOString()

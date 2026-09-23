@@ -21,8 +21,10 @@ async function until(check: () => boolean | Promise<boolean>) {
   assert.fail('Timed out waiting for image persistence');
 }
 
-for (const echoFirst of [false, true]) {
-  test(`image upload and Steam BBCode echo persist one identity (${echoFirst ? 'echo' : 'callback'} first)`, async (t) => {
+for (const bare of [false, true]) for (const echoFirst of [false, true]) {
+  const image = bare ? 'https://images.steamusercontent.com/ugc/18217404977881574781/AC9568A54E76859401A51E9AB825ED88204E33F8/' : 'https://media.example.test/image';
+  const markup = bare ? image : `[img src=${image} thumbnail_src=${image}?imw=512][/img]`;
+  test(`image upload and Steam ${bare ? 'bare URL' : 'BBCode'} echo persist one identity (${echoFirst ? 'echo' : 'callback'} first)`, async (t) => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'image-echo-'));
     const storage = createHistoryStorage({ logPath: path.join(dir, 'chat.jsonl'), dbPath: path.join(dir, 'db'), logger: quiet });
     const steamUser = Object.assign(new EventEmitter(), { chat: new EventEmitter() });
@@ -45,6 +47,7 @@ for (const echoFirst of [false, true]) {
     await until(() => storage.status().rocksdb.durable >= 2 && storage.status().jsonl.durable >= 2);
     const page = await storage.history({ steamAccountId: account, id: peer });
     assert.equal(page.items.length, 1, 'One upload must not become a URL message plus a BBCode echo');
+    if (bare) assert.equal(page.items[0].type, 'image', 'A bare upload echo renders as an image regardless of callback ordering');
     assert.equal(page.items[0].eventId, response.eventId, 'HTTP ack must refer to the same event the phone syncs');
     assert.equal(visible.length, 1, 'WebSocket must not display both representations');
     const sync = await storage.sync({ steamAccountId: account });
@@ -298,4 +301,21 @@ test('Steam image identity admission bounds pending lookups and rejects after cl
   await accepted;
   await storage.close();
   await assert.rejects(storage.appendSteamImage!(input), /storage closed/);
+});
+
+test('bare UGC echoes pair one-to-one but ordinary links and intentional repeats are retained', async t => {
+  const { storage, upload, echo } = await storageFixture(t);
+  const url = 'https://images.steamusercontent.com/ugc/123456/ABCDEF012345/';
+  const first = storage.append({ ...upload, message: url });
+  const second = storage.append({ ...upload, message: url });
+  const at = new Date(echo.sentAt!);
+  const record = { ...echo, message: url, steamEventKey: steamEventKey(account, peer, true, url, at, 0) };
+  assert.equal((await storage.appendSteamImage!(record)).eventId, first.eventId);
+  assert.equal((await storage.appendSteamImage!(record)).eventId, first.eventId);
+  const next = { ...record, ordinal: 1, steamEventKey: steamEventKey(account, peer, true, url, at, 1) };
+  assert.equal((await storage.appendSteamImage!(next)).eventId, second.eventId);
+  for (const message of ['https://example.com/image.jpg', `${url} caption`, `See ${url}`]) {
+    const own = storage.append({ ...upload, message });
+    assert.notEqual(storage.append({ ...echo, message }).eventId, own.eventId);
+  }
 });
