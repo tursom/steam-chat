@@ -1,6 +1,5 @@
 package io.github.steamchat.android.ui
 
-import android.app.Application
 import android.content.Context
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.*
@@ -14,7 +13,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35], application = Application::class)
+@Config(sdk = [35], application = ComposeTestApplication::class)
 class RestReadinessScreenTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
 

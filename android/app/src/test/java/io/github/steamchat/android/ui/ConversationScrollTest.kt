@@ -1,6 +1,5 @@
 package io.github.steamchat.android.ui
 
-import android.app.Application
 import androidx.activity.ComponentActivity
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.test.assertIsDisplayed
@@ -19,7 +18,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35], application = Application::class, qualifiers = "w390dp-h844dp")
+@Config(sdk = [35], application = ComposeTestApplication::class, qualifiers = "w390dp-h844dp")
 class ConversationScrollTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
     private fun messages(peer: String = "peer", count: Int = 80) = (0 until count).map {

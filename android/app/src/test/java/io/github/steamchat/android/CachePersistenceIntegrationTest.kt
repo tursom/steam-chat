@@ -108,12 +108,112 @@ class CachePersistenceIntegrationTest {
         cache.ingest(scope, JSONArray().put(item("existing")), "saved", false, "")
         // Reconstruct the shipped v1 schema, which has no alias table.
         cache.writableDatabase.execSQL("DROP TABLE event_aliases")
+        restoreOldCheckpoints()
         cache.writableDatabase.version = 1
         cache.close()
         cache = ChatCache(RuntimeEnvironment.getApplication())
         assertTrue(cache.containsEvent(scope, "existing"))
         assertEquals("saved", cache.checkpoint(scope).first)
         assertEquals(1, cache.messages(scope, "peer1").size)
+    }
+
+    private fun restoreOldCheckpoints() {
+        cache.writableDatabase.execSQL("DROP TABLE history_pending")
+        cache.writableDatabase.execSQL("ALTER TABLE checkpoints RENAME TO new_checkpoints")
+        cache.writableDatabase.execSQL("CREATE TABLE checkpoints (scope TEXT PRIMARY KEY, cursor TEXT NOT NULL, bootstrap INTEGER NOT NULL, notification_floor INTEGER NOT NULL)")
+        cache.writableDatabase.execSQL("INSERT INTO checkpoints SELECT scope,cursor,bootstrap,notification_floor FROM new_checkpoints")
+        cache.writableDatabase.execSQL("DROP TABLE new_checkpoints")
+    }
+
+    @Test fun versionTwoUpgradeRestartsOnlyUnfinishedBootstrapAndKeepsMessages() {
+        cache.ingest(scope, JSONArray().put(item("partial")), "old-first-page", true, "")
+        cache.ingest("complete", JSONArray().put(item("complete")), "live-saved", false, "")
+        restoreOldCheckpoints()
+        cache.writableDatabase.version = 2
+        cache.close()
+        cache = ChatCache(RuntimeEnvironment.getApplication())
+        assertEquals("" to true, cache.checkpoint(scope))
+        assertEquals("live-saved" to false, cache.checkpoint("complete"))
+        assertTrue(cache.containsEvent(scope, "partial"))
+        assertNull(cache.historyCursor(scope))
+        assertNull(cache.historyCursor("complete"))
+    }
+
+    @Test fun recentPageAndTwoCursorsSurviveRestartWhileNewMessagesNotifyDuringBackfill() {
+        val recent = item("recent")
+        cache.ingestHistory(scope, JSONArray().put(recent), "history-1", true, "live-start")
+        assertEquals("live-start" to false, cache.checkpoint(scope))
+        assertEquals("history-1", cache.historyCursor(scope))
+        assertEquals(0, cache.conversations(scope).single().unread)
+        cache.close()
+        cache = ChatCache(RuntimeEnvironment.getApplication())
+        assertEquals("history-1", cache.historyCursor(scope))
+        assertEquals("live-start" to false, cache.checkpoint(scope))
+        assertEquals(1, cache.ingest(scope, JSONArray().put(item("new")), "live-next", false, "").size)
+        assertEquals("history-1", cache.historyCursor(scope))
+        // Even a recent timestamp in a backfill page is historical and remains silent.
+        cache.ingestHistory(scope, JSONArray().put(item("earlier")).put(recent), "history-2", true)
+        assertEquals("live-next", cache.checkpoint(scope).first)
+        assertEquals("history-2", cache.historyCursor(scope))
+        assertEquals(1, cache.conversations(scope).single().unread)
+        assertEquals(3, cache.messages(scope, "peer1").size)
+        cache.ingestHistory(scope, JSONArray(), "history-end", false)
+        assertNull(cache.historyCursor(scope))
+        assertEquals("live-next", cache.checkpoint(scope).first)
+        assertTrue(cache.ingest(scope, JSONArray().put(recent), "live-end", false, "").isEmpty())
+        assertNull(cache.historyCursor("other-account"))
+    }
+
+    @Test fun malformedRecentAndOlderPagesRollBackMessagesAndBothCursors() {
+        val malformed = JSONArray().put(item("valid")).put(JSONObject().put("id", "peer1"))
+        assertThrows(Exception::class.java) { cache.ingestHistory(scope, malformed, "history-1", true, "live-start") }
+        assertEquals("" to true, cache.checkpoint(scope))
+        assertNull(cache.historyCursor(scope))
+        assertFalse(cache.containsEvent(scope, "valid"))
+        cache.ingestHistory(scope, JSONArray().put(item("recent")), "history-1", true, "live-start")
+        assertThrows(Exception::class.java) { cache.ingestHistory(scope, malformed, "history-2", false) }
+        assertEquals("live-start" to false, cache.checkpoint(scope))
+        assertEquals("history-1", cache.historyCursor(scope))
+        assertFalse(cache.containsEvent(scope, "valid"))
+        cache.reset(scope)
+        assertEquals("" to true, cache.checkpoint(scope))
+        assertNull(cache.historyCursor(scope))
+        assertTrue(cache.containsEvent(scope, "recent"))
+    }
+
+    @Test fun liveNoticesSurviveHistoryWinningTheRaceAndDoNotResurrectReadMessages() {
+        cache.ingestHistory(scope, JSONArray(), "h1", true, "live-start")
+        val late = item("late")
+        cache.ingestHistory(scope, JSONArray().put(late), "h2", true)
+        assertEquals(0, cache.conversations(scope).single().unread)
+        cache.close()
+        cache = ChatCache(RuntimeEnvironment.getApplication())
+        assertEquals(1, cache.ingest(scope, JSONArray().put(late), "live-next", false, "").size)
+        assertEquals(1, cache.conversations(scope).single().unread)
+        assertTrue(cache.ingest(scope, JSONArray().put(late), "replay", false, "").isEmpty())
+        val read = item("already-read")
+        cache.ingestHistory(scope, JSONArray().put(read), "h3", true)
+        cache.read(scope, "peer1")
+        assertTrue(cache.ingest(scope, JSONArray().put(read), "live-read", false, "").isEmpty())
+        assertEquals(0, cache.conversations(scope).single().unread)
+        val visible = item("visible")
+        cache.ingestHistory(scope, JSONArray().put(visible), "h4", true, foregroundPeer = "peer1")
+        assertTrue(cache.ingest(scope, JSONArray().put(visible), "live-visible", false, "").isEmpty())
+    }
+
+    @Test fun historyOnlyRestartKeepsLiveProgressAndPendingNotices() {
+        cache.ingestHistory(scope, JSONArray(), "history", true, "live-start")
+        val late = item("late")
+        cache.ingestHistory(scope, JSONArray().put(late), "history-next", true)
+        cache.restartHistory(scope)
+        cache.close()
+        cache = ChatCache(RuntimeEnvironment.getApplication())
+        assertEquals("live-start" to false, cache.checkpoint(scope))
+        assertEquals("", cache.historyCursor(scope))
+        assertEquals(1, cache.ingest(scope, JSONArray().put(late), "live-next", false, "").size)
+        cache.ingestHistory(scope, JSONArray().put(late), "history-new", false)
+        assertEquals("live-next", cache.checkpoint(scope).first)
+        assertNull(cache.historyCursor(scope))
     }
 
     @Test fun semanticAliasesSurviveReopenAndStayScoped() {

@@ -1,6 +1,5 @@
 package io.github.steamchat.android.ui
 
-import android.app.Application
 import androidx.activity.ComponentActivity
 import androidx.compose.ui.test.*
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
@@ -15,7 +14,7 @@ import org.robolectric.RuntimeEnvironment
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35], application = Application::class, qualifiers = "w390dp-h844dp")
+@Config(sdk = [35], application = ComposeTestApplication::class, qualifiers = "w390dp-h844dp")
 class StickerPickerTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()
     private val names = listOf("Cat Cam talking", "Rumi : Why...?")

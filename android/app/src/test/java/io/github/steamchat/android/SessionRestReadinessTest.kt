@@ -53,7 +53,7 @@ class SessionRestReadinessTest {
                         return MockResponse().setResponseCode(authCode).setBody("""{"user":{"id":1,"username":"test"}}""")
                     }
                     "/api/steam/status" -> """{"accessAllowed":true,"status":"$steamStatus","activeAccount":{"steamId":"$steam"}}"""
-                    "/api/messages/sync" -> """{"steamAccountId":"$steam","items":[{"syncId":"event1","eventId":"event1","id":"peer","name":"Friend","message":"REST catchup","sentAt":"2026-09-08T12:00:00Z","ordinal":1,"echo":false}],"nextCursor":"c1","hasMore":false}"""
+                    "/api/messages/sync" -> """{"steamAccountId":"$steam","items":[{"syncId":"event1","eventId":"event1","id":"peer","name":"Friend","message":"REST catchup","sentAt":"2026-09-08T12:00:00Z","ordinal":1,"echo":false}],"nextCursor":"c1","liveCursor":"live1","hasMore":false}"""
                     "/api/config" -> """{"wsPath":"/ws"}"""
                     "/ws" -> return MockResponse().setResponseCode(503)
                     "/api/friends" -> "[]"

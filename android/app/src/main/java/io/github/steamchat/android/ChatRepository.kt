@@ -9,6 +9,7 @@ import android.os.SystemClock
 import android.util.Base64
 import androidx.core.content.ContextCompat
 import io.github.steamchat.android.data.ChatCache
+import io.github.steamchat.android.data.BilibiliShare
 import io.github.steamchat.android.data.MediaDiskCache
 import io.github.steamchat.android.data.Protocol
 import io.github.steamchat.android.data.SessionVault
@@ -34,7 +35,8 @@ import java.util.concurrent.TimeUnit
 import kotlin.random.Random
 
 class ChatRepository(private val context: Context, private val socketFactory: WebSocket.Factory? = null,
-                     private val sessionLoader: (() -> JSONObject?)? = null, httpClient: OkHttpClient? = null) {
+                     private val sessionLoader: (() -> JSONObject?)? = null, httpClient: OkHttpClient? = null,
+                     private val bilibiliShare: BilibiliShare = BilibiliShare()) {
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val gate = Mutex()
     private val vault = SessionVault(context)
@@ -78,7 +80,8 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     private var worker: Job? = null
     private val hints = Channel<Unit>(Channel.CONFLATED)
     private val outgoing = linkedMapOf<String, Outgoing>()
-    private data class Outgoing(val message: Message, val scope: String, val uri: Uri? = null, val confirmedItem: JSONObject? = null, val wireText: String = message.text)
+    private data class Outgoing(val message: Message, val scope: String, val uri: Uri? = null, val confirmedItem: JSONObject? = null,
+                                val wireText: String = message.text, val shareUrl: HttpUrl? = null)
     private class HttpFailure(val status: Int) : IOException("HTTP $status")
 
     init {
@@ -219,6 +222,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         sessionEnding = true
         generation++
         client.dispatcher.cancelAll()
+        bilibiliShare.cancel()
         mutable.update { AppState(server = it.server, backgroundEnabled = it.backgroundEnabled, notificationPreview = it.notificationPreview, notificationsEnabled = it.notificationsEnabled) }
         scope.launch {
             gate.withLock { endSession("") }
@@ -234,6 +238,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         cancelMetadata()
         httpRetryAt = 0; syncAt = 0; reconnectAt = 0; attempts = 0
         cookie = ""; expires = 0; vault.clear()
+        bilibiliShare.cancel()
         worker?.cancel(); worker = null
         synchronized(connectionLock) {
             invalidateSocket()
@@ -260,9 +265,9 @@ class ChatRepository(private val context: Context, private val socketFactory: We
                         if (cookie.isNotEmpty()) {
                             if ((syncRequested || now() >= syncAt || (httpRetryAt > 0 && now() >= httpRetryAt)) && now() >= httpRetryAt) {
                                 if (!state.value.loggedIn) validateSession()
-                                if (state.value.loggedIn) catchUp()
+                                val pending = state.value.loggedIn && catchUp()
                                 httpRetryAt = 0
-                                syncAt = now() + if (foreground && !state.value.connected) 3_000 else 30_000
+                                syncAt = now() + if (pending) 250 else if (foreground && !state.value.connected) 3_000 else 30_000
                                 syncRequested = false
                             }
                             connectionHints.trySend(Unit)
@@ -279,23 +284,29 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         }
         updateService()
     }
-    private fun catchUp() {
+    private fun catchUp(): Boolean {
         mutable.update { it.copy(restSyncText = "REST 正在同步…", restSyncStatus = RestSyncStatus.SYNCING) }
         try {
-            syncMessages()
-            mutable.update { it.copy(restSyncText = if (it.accessAllowed) "REST 同步完成" else "REST 无账户访问权限", restSyncStatus = RestSyncStatus.READY) }
+            val pending = syncMessages()
+            httpRetryAt = 0
+            mutable.update { it.copy(restSyncText = when {
+                !it.accessAllowed -> "REST 无账户访问权限"
+                pending -> "REST 正在分批同步历史…"
+                else -> "REST 同步完成"
+            }, restSyncStatus = if (pending) RestSyncStatus.SYNCING else RestSyncStatus.READY) }
+            return pending
         } catch (e: Exception) {
             mutable.update { it.copy(restSyncText = "REST 同步未完成，等待重试", restSyncStatus = RestSyncStatus.FAILED) }
             throw e
         }
     }
-    private fun syncMessages() {
+    private fun syncMessages(): Boolean {
         val status = json("/api/steam/status")
         val account = status.optJSONObject("activeAccount")
         val permitted = status.optBoolean("accessAllowed") && account != null
         val steam = if (permitted) account!!.optString("steamId") else ""
         val online = status.optString("status") == "online"
-        if (!permitted || steam.isEmpty()) { hideAccount(if (!online) "Steam 未连接，等待管理员登录" else "无 Steam 账户访问权限"); return }
+        if (!permitted || steam.isEmpty()) { hideAccount(if (!online) "Steam 未连接，等待管理员登录" else "无 Steam 账户访问权限"); return false }
         val nextScope = JSONArray(listOf(base.toString(), userId, steam)).toString()
         if (nextScope != cacheScope) {
             val selectedPeer = state.value.selectedPeer
@@ -306,32 +317,59 @@ class ChatRepository(private val context: Context, private val socketFactory: We
             if (firstAccount) mutable.update { it.copy(selectedPeer = selectedPeer, selectedName = selectedName) }
         }
         mutable.update { it.copy(activeAccountId = steam, accessAllowed = true, steamOnline = online, connectionText = connectionText(it.connected, online)) }
-        var reset = false
-        for (pageNumber in 0 until 50) {
-            if (!allowed()) break
-            val checkpoint = cache.checkpoint(cacheScope)
+        publishCache()
+        if (online) refreshMetadata()
+        if (!allowed()) return false
+        val checkpoint = cache.checkpoint(cacheScope)
+        var fetchingHistory = false
+        fun fetchPage(cursor: String?, history: Boolean): JSONObject {
+            fetchingHistory = history
             val url = Protocol.endpoint(base!!, "/api/messages/sync").newBuilder().addQueryParameter("limit", "100").addQueryParameter("steamAccountId", accountSteamId).apply {
-                if (checkpoint.first.isNotEmpty()) addQueryParameter("cursor", checkpoint.first)
+                if (cursor != null) addQueryParameter("cursor", cursor)
+                if (history) addQueryParameter("mode", "history")
             }.build()
-            val page = try { JSONObject(execute(url)) } catch (e: HttpFailure) {
-                if (e.status == 409 && !reset) { cache.reset(cacheScope); reset = true; continue }
-                throw e
+            val page = JSONObject(execute(url))
+            if (page.getString("steamAccountId") != accountSteamId) {
+                hideAccount(); hints.trySend(Unit)
+                throw RecoveryInterrupted()
             }
-            if (page.getString("steamAccountId") != accountSteamId) { hideAccount(); hints.trySend(Unit); return }
+            val next = page.getString("nextCursor")
+            require(next.isNotEmpty() && (!page.getBoolean("hasMore") || next != cursor)) { "同步游标未推进" }
+            return page
+        }
+        try {
+            if (checkpoint.second || checkpoint.first.isEmpty()) {
+                val page = fetchPage(null, history = true)
+                val liveCursor = page.getString("liveCursor")
+                require(liveCursor.isNotEmpty()) { "缺少增量同步游标" }
+                cache.ingestHistory(cacheScope, page.getJSONArray("items"), page.getString("nextCursor"), page.getBoolean("hasMore"), liveCursor)
+                publishCache()
+                return page.getBoolean("hasMore")
+            }
+            // Bounded batches release gate between rounds so user actions can run.
+            // Always catch up live messages before spending a request on older history.
+            val page = fetchPage(checkpoint.first, history = false)
             val more = page.getBoolean("hasMore")
-            val cursor = page.getString("nextCursor")
-            require(!more || cursor != checkpoint.first) { "同步游标未推进" }
-            val notices = cache.ingest(cacheScope, page.getJSONArray("items"), cursor, more, if (foreground) state.value.selectedPeer else "")
+            val notices = cache.ingest(cacheScope, page.getJSONArray("items"), page.getString("nextCursor"), more, if (foreground) state.value.selectedPeer else "")
             publishCache()
             for (message in notices) {
                 if (state.value.loggedIn && !(foreground && state.value.selectedPeer == message.peerId)) ChatNotifications.message(context, state.value, message)
             }
-            if (!more) break
-            if (pageNumber == 49) hints.trySend(Unit)
+            if (more) return true
+            val historyCursor = cache.historyCursor(cacheScope)
+            if (historyCursor != null && allowed()) {
+                val history = fetchPage(historyCursor.takeIf { it.isNotEmpty() }, history = true)
+                cache.ingestHistory(cacheScope, history.getJSONArray("items"), history.getString("nextCursor"), history.getBoolean("hasMore"),
+                    foregroundPeer = if (foreground) state.value.selectedPeer else "")
+                publishCache()
+            }
+            return cache.historyCursor(cacheScope) != null
+        } catch (e: HttpFailure) {
+            if (e.status != 409) throw e
+            if (fetchingHistory && !checkpoint.second && checkpoint.first.isNotEmpty()) cache.restartHistory(cacheScope)
+            else cache.reset(cacheScope)
+            return true
         }
-        httpRetryAt = 0
-        if (online) refreshMetadata()
-        publishCache()
     }
     private fun cancelMetadata() {
         metadataVersion++
@@ -603,26 +641,50 @@ class ChatRepository(private val context: Context, private val socketFactory: We
             current.copy(conversations = conversations, messages = if (current.selectedPeer.isEmpty()) emptyList() else cache.messages(cacheScope, current.selectedPeer) + outgoing.values.filter { it.scope == cacheScope && it.message.peerId == current.selectedPeer }.map { it.message })
         }
     }
-    fun sendText(text: String) { if (text.isNotBlank()) queueSend(text, null) }
+    fun sendText(text: String) { if (text.isNotBlank()) queueSend(text, null, shareUrl = BilibiliShare.extract(text)) }
     fun sendImage(uri: Uri) = queueSend("[图片]", uri)
     fun sendSticker(raw: String) {
         val name = Protocol.stickerName(raw) ?: return
         queueSend("[sticker type=\"$name\" limit=\"0\"][/sticker]", null, "/sticker $name")
     }
-    private fun queueSend(text: String, uri: Uri?, wireText: String = text) {
+    private fun queueSend(text: String, uri: Uri?, wireText: String = text, shareUrl: HttpUrl? = null) {
         val peer = state.value.selectedPeer
         val account = cacheScope
         launchAction {
             if (!state.value.canSend || peer.isEmpty() || account != cacheScope) return@launchAction
             val message = Message("local:${UUID.randomUUID()}", peer, state.value.username, text, true, Instant.now().toString(), pending = true, imageUrl = uri?.toString())
-            val item = Outgoing(message, cacheScope, uri, wireText = wireText)
-            outgoing[message.key] = item; publishCache(); transmit(item)
+            val item = Outgoing(message, cacheScope, uri, wireText = wireText, shareUrl = shareUrl)
+            prepareAndTransmit(item)
         }
     }
     fun retryMessage(key: String) = launchAction {
         val item = outgoing[key] ?: return@launchAction
         if (!state.value.canSend || !item.message.failed || item.scope != cacheScope) return@launchAction
-        transmit(item.copy(message = item.message.copy(pending = true, failed = false, error = "")))
+        prepareAndTransmit(item.copy(message = item.message.copy(pending = true, failed = false, error = "")))
+    }
+    private fun prepareAndTransmit(item: Outgoing) {
+        val url = item.shareUrl ?: return transmit(item)
+        outgoing[item.message.key] = item; publishCache()
+        val version = generation
+        // Public short-link resolution never occupies the message sync/action gate.
+        scope.launch {
+            if (version != generation || sessionEnding) return@launch
+            val result = try { Result.success(bilibiliShare.resolve(url)) }
+                catch (e: TimeoutCancellationException) { Result.failure(e) }
+                catch (e: CancellationException) { throw e }
+                catch (e: Exception) { Result.failure(e) }
+            gate.withLock {
+                if (version != generation || sessionEnding || item.scope != cacheScope || outgoing[item.message.key] !== item) return@withLock
+                val text = result.getOrNull()
+                if (text != null && state.value.canSend) {
+                    transmit(item.copy(message = item.message.copy(text = text), wireText = text, shareUrl = null))
+                } else {
+                    outgoing[item.message.key] = item.copy(message = item.message.copy(pending = false, failed = true,
+                        retryMayDuplicate = false, error = if (text == null) "哔哩哔哩链接解析失败，消息尚未发送。请重试。" else "当前无法发送消息，请恢复连接后重试。"))
+                    publishCache()
+                }
+            }
+        }
     }
     private fun transmit(item: Outgoing) {
         outgoing[item.message.key] = item; publishCache()
@@ -654,7 +716,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
             )
             hints.trySend(Unit)
         } catch (e: CancellationException) { throw e } catch (e: Exception) {
-            outgoing[item.message.key] = item.copy(message = item.message.copy(pending = false, failed = true, error = "发送结果不确定，可能已送达。手动重试可能重复发送。"))
+            outgoing[item.message.key] = item.copy(message = item.message.copy(pending = false, failed = true, retryMayDuplicate = true, error = "发送结果不确定，可能已送达。手动重试可能重复发送。"))
             handleFailure(e)
         }
         publishCache()

@@ -3,8 +3,8 @@ import * as path from 'node:path';
 import type { ConversationSummary, HistoryItem, HistoryRecordInput, LoggerLike } from '../types';
 import { canonicalMessage, imageEchoIdentity, normalizeStoredMessage, type StoredMessage } from './history-message';
 
-export type SyncQuery = { steamAccountId: string; cursor?: string; limit?: number };
-export type SyncPage = { items: Array<HistoryItem & { syncId: string }>; nextCursor: string; hasMore: boolean; steamAccountId: string };
+export type SyncQuery = { steamAccountId: string; cursor?: string; limit?: number; mode?: 'history' };
+export type SyncPage = { items: Array<HistoryItem & { syncId: string }>; nextCursor: string; hasMore: boolean; steamAccountId: string; liveCursor?: string };
 export type HistoryQuery = { steamAccountId: string; id: string; limit?: number; before?: string; after?: string; at?: number };
 export type ConversationQuery = { steamAccountId: string; limit?: number; before?: string };
 export type HistoryPage = { items: HistoryItem[]; nextCursor?: string; previousCursor?: string };

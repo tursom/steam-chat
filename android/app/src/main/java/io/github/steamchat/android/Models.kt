@@ -3,7 +3,7 @@ package io.github.steamchat.android
 data class Friend(val id: String, val name: String, val avatar: String = "", val online: Boolean = false, val gameName: String = "")
 data class Sticker(val name: String, val title: String = name, val imageUrl: String = "", val aliases: List<String> = emptyList())
 data class Conversation(val id: String, val name: String, val avatar: String = "", val preview: String = "", val updatedAt: String = "", val unread: Int = 0)
-data class Message(val key: String, val peerId: String, val name: String, val text: String, val echo: Boolean, val time: String, val pending: Boolean = false, val failed: Boolean = false, val error: String = "", val imageUrl: String? = null)
+data class Message(val key: String, val peerId: String, val name: String, val text: String, val echo: Boolean, val time: String, val pending: Boolean = false, val failed: Boolean = false, val error: String = "", val imageUrl: String? = null, val retryMayDuplicate: Boolean = true)
 enum class SessionRestoration { NONE, LOADING, RETRY }
 
 enum class RestSyncStatus { IDLE, SYNCING, READY, FAILED }

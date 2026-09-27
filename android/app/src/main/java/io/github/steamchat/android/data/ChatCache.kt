@@ -10,28 +10,50 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-class ChatCache(context: Context) : SQLiteOpenHelper(context, File(context.noBackupFilesDir, "chat.sqlite").absolutePath, null, 2) {
+class ChatCache(context: Context) : SQLiteOpenHelper(context, File(context.noBackupFilesDir, "chat.sqlite").absolutePath, null, 3) {
     override fun onCreate(db: SQLiteDatabase) {
-        db.execSQL("CREATE TABLE checkpoints (scope TEXT PRIMARY KEY, cursor TEXT NOT NULL, bootstrap INTEGER NOT NULL, notification_floor INTEGER NOT NULL)")
+        db.execSQL("CREATE TABLE checkpoints (scope TEXT PRIMARY KEY, cursor TEXT NOT NULL, bootstrap INTEGER NOT NULL, notification_floor INTEGER NOT NULL, history_cursor TEXT)")
         db.execSQL("CREATE TABLE messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, sync_id TEXT NOT NULL, event_id TEXT, semantic_id TEXT NOT NULL, peer TEXT NOT NULL, payload TEXT NOT NULL, sent_at INTEGER NOT NULL, ordinal INTEGER NOT NULL, unread INTEGER NOT NULL DEFAULT 0, UNIQUE(scope,sync_id), UNIQUE(scope,event_id), UNIQUE(scope,semantic_id))")
         db.execSQL("CREATE INDEX messages_peer ON messages(scope,peer,sent_at DESC,ordinal DESC,seq DESC)")
         createEventAliases(db)
+        createHistoryPending(db)
     }
     private fun createEventAliases(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE event_aliases (scope TEXT NOT NULL, event_id TEXT NOT NULL, message_seq INTEGER NOT NULL, PRIMARY KEY(scope,event_id))")
         db.execSQL("INSERT INTO event_aliases SELECT scope,event_id,seq FROM messages WHERE event_id IS NOT NULL AND event_id<>''")
     }
+    private fun createHistoryPending(db: SQLiteDatabase) {
+        db.execSQL("CREATE TABLE history_pending (scope TEXT NOT NULL, sync_id TEXT NOT NULL, peer TEXT NOT NULL, PRIMARY KEY(scope,sync_id))")
+    }
     override fun onUpgrade(db: SQLiteDatabase, oldVersion: Int, newVersion: Int) {
         if (oldVersion < 2) createEventAliases(db)
+        if (oldVersion < 3) {
+            db.execSQL("ALTER TABLE checkpoints ADD COLUMN history_cursor TEXT")
+            createHistoryPending(db)
+            // An unfinished oldest-first bootstrap should now begin with recent history.
+            db.execSQL("UPDATE checkpoints SET cursor='' WHERE bootstrap=1")
+        }
     }
     fun checkpoint(scope: String): Pair<String, Boolean> = readableDatabase.rawQuery("SELECT cursor,bootstrap FROM checkpoints WHERE scope=?", arrayOf(scope)).use {
         if (it.moveToFirst()) it.getString(0) to (it.getInt(1) != 0) else "" to true
+    }
+    fun historyCursor(scope: String): String? = readableDatabase.rawQuery("SELECT history_cursor FROM checkpoints WHERE scope=?", arrayOf(scope)).use {
+        if (it.moveToFirst() && !it.isNull(0)) it.getString(0) else null
     }
     private fun notificationFloor(scope: String): Long = readableDatabase.rawQuery("SELECT notification_floor FROM checkpoints WHERE scope=?", arrayOf(scope)).use {
         if (it.moveToFirst()) it.getLong(0) else System.currentTimeMillis() - 60_000
     }
     fun reset(scope: String) {
-        writableDatabase.execSQL("INSERT OR REPLACE INTO checkpoints VALUES (?, '', 1, ?)", arrayOf<Any>(scope, notificationFloor(scope)))
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.execSQL("INSERT OR REPLACE INTO checkpoints(scope,cursor,bootstrap,notification_floor) VALUES (?, '', 1, ?)", arrayOf<Any>(scope, notificationFloor(scope)))
+            db.delete("history_pending", "scope=?", arrayOf(scope))
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
+    fun restartHistory(scope: String) {
+        writableDatabase.execSQL("UPDATE checkpoints SET history_cursor='' WHERE scope=?", arrayOf(scope))
     }
     fun clearAll() {
         val db = writableDatabase
@@ -40,10 +62,21 @@ class ChatCache(context: Context) : SQLiteOpenHelper(context, File(context.noBac
             db.delete("event_aliases", null, null)
             db.delete("messages", null, null)
             db.delete("checkpoints", null, null)
+            db.delete("history_pending", null, null)
             db.setTransactionSuccessful()
         } finally { db.endTransaction() }
     }
-    fun ingest(scope: String, items: JSONArray, cursor: String, hasMore: Boolean, foregroundPeer: String): List<Message> {
+    fun ingest(scope: String, items: JSONArray, cursor: String, hasMore: Boolean, foregroundPeer: String): List<Message> =
+        ingestPage(scope, items, cursor, hasMore, foregroundPeer, history = false)
+
+    // Only the first recent page establishes the live watermark. Later history pages
+    // must never move it: messages arriving during backfill belong to the live lane.
+    fun ingestHistory(scope: String, items: JSONArray, cursor: String, hasMore: Boolean, liveCursor: String? = null, foregroundPeer: String = "") {
+        ingestPage(scope, items, cursor, hasMore, foregroundPeer, history = true, liveCursor = liveCursor)
+    }
+
+    private fun ingestPage(scope: String, items: JSONArray, cursor: String, hasMore: Boolean, foregroundPeer: String,
+                           history: Boolean, liveCursor: String? = null): List<Message> {
         val db = writableDatabase
         val notifications = mutableListOf<Message>()
         db.beginTransaction()
@@ -56,7 +89,7 @@ class ChatCache(context: Context) : SQLiteOpenHelper(context, File(context.noBac
                 val syncId = item.getString("syncId")
                 require(syncId.isNotEmpty()) { "Missing sync ID" }
                 val message = decode(item, syncId)
-                val eligible = Protocol.freshIncoming(bootstrap, message.echo, message.time, System.currentTimeMillis(), floor)
+                val eligible = Protocol.freshIncoming(history || bootstrap, message.echo, message.time, System.currentTimeMillis(), floor)
                 val eventId = item.optString("eventId")
                 val semanticId = Protocol.semanticIdentity(item)
                 val values = ContentValues().apply {
@@ -76,14 +109,41 @@ class ChatCache(context: Context) : SQLiteOpenHelper(context, File(context.noBac
                     db.execSQL("INSERT OR IGNORE INTO event_aliases(scope,event_id,message_seq) SELECT scope,?,seq FROM messages WHERE scope=? AND (sync_id=? OR event_id=? OR semantic_id=?) ORDER BY seq LIMIT 1",
                         arrayOf(eventId, scope, syncId, eventId, semanticId))
                 }
-                if (Protocol.shouldNotify(inserted, eligible, message.peerId, foregroundPeer)) notifications.add(message)
+                // A late incoming message can arrive between the live and history
+                // requests. Storage deduplication must not consume its live notice.
+                if (history && liveCursor == null && inserted && message.peerId != foregroundPeer) {
+                    db.execSQL("INSERT INTO history_pending VALUES (?,?,?)", arrayOf(scope, syncId, message.peerId))
+                }
+                val fromHistory = !history && db.delete("history_pending", "scope=? AND sync_id=?", arrayOf(scope, syncId)) > 0
+                if (fromHistory && eligible && message.peerId != foregroundPeer) {
+                    db.execSQL("UPDATE messages SET unread=1 WHERE scope=? AND sync_id=?", arrayOf(scope, syncId))
+                }
+                if (Protocol.shouldNotify(inserted || fromHistory, eligible, message.peerId, foregroundPeer)) notifications.add(message)
             }
-            db.execSQL("INSERT OR REPLACE INTO checkpoints VALUES (?, ?, ?, ?)", arrayOf<Any>(scope, cursor, if (Protocol.bootstrapAfterPage(bootstrap, hasMore)) 1 else 0, floor))
+            // All pending history rows predate this live snapshot. Once it is
+            // drained, rows not returned by live belonged to the initial archive.
+            if (!history && !hasMore) db.delete("history_pending", "scope=?", arrayOf(scope))
+            val values = ContentValues().apply {
+                put("scope", scope)
+                put("cursor", if (history) liveCursor ?: checkpoint(scope).first else cursor)
+                put("bootstrap", if (!history && Protocol.bootstrapAfterPage(bootstrap, hasMore)) 1 else 0)
+                put("notification_floor", floor)
+                put("history_cursor", if (history) cursor.takeIf { hasMore } else historyCursor(scope))
+            }
+            check(db.insertWithOnConflict("checkpoints", null, values, SQLiteDatabase.CONFLICT_REPLACE) != -1L)
             db.setTransactionSuccessful()
         } finally { db.endTransaction() }
         return notifications
     }
-    fun read(scope: String, peer: String) { writableDatabase.execSQL("UPDATE messages SET unread=0 WHERE scope=? AND peer=?", arrayOf(scope, peer)) }
+    fun read(scope: String, peer: String) {
+        val db = writableDatabase
+        db.beginTransaction()
+        try {
+            db.execSQL("UPDATE messages SET unread=0 WHERE scope=? AND peer=?", arrayOf(scope, peer))
+            db.delete("history_pending", "scope=? AND peer=?", arrayOf(scope, peer))
+            db.setTransactionSuccessful()
+        } finally { db.endTransaction() }
+    }
     fun containsEvent(scope: String, eventId: String): Boolean = readableDatabase.rawQuery("SELECT 1 FROM event_aliases WHERE scope=? AND event_id=? LIMIT 1", arrayOf(scope, eventId)).use { it.moveToFirst() }
     fun containsConfirmed(scope: String, item: JSONObject): Boolean {
         val eventId = item.optString("eventId")

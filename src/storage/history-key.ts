@@ -58,6 +58,16 @@ export function syncKey(account: string, sequence: bigint): Buffer {
   return key;
 }
 
+export function historySyncKey(message: Buffer): Buffer {
+  const { steamAccountId } = decodeMessageKey(message);
+  return Buffer.concat([accountPrefix(0x23, steamAccountId), message.subarray(17)]);
+}
+
+// Above every valid timestamp, but still bound to this account and index type.
+export function historySyncStart(account: string): Buffer {
+  return Buffer.concat([accountPrefix(0x23, account), Buffer.alloc(20, 0xff)]);
+}
+
 export function eventKey(eventId: string): Buffer {
   if (!/^[0-9a-f]{32}$/.test(eventId)) throw new Error('Invalid eventId');
   return Buffer.concat([Buffer.from([0x40]), Buffer.from(eventId, 'hex')]);

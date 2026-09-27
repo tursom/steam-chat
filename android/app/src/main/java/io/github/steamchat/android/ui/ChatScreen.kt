@@ -100,7 +100,9 @@ internal fun ChatScreen(state: AppState, repository: ChatRepository, loader: UiI
         LazyColumn(Modifier.weight(1f).fillMaxWidth().testTag("chat-messages"), state = scroll, contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(18.dp)) {
             if (messages.isEmpty()) item { EmptyState(if (state.loading) "正在加载消息…" else "暂无消息") }
             items(messages, key = { it.key }) { message ->
-                MessageRow(message, avatar, loader, { lightbox = it }, { retry = message.key })
+                MessageRow(message, avatar, loader, { lightbox = it }, {
+                    if (message.retryMayDuplicate) retry = message.key else repository.retryMessage(message.key)
+                })
             }
             item(key = "chat-end") { Spacer(Modifier.fillMaxWidth().height(1.dp).testTag("chat-end")) }
         }

@@ -1,6 +1,6 @@
 # Offline History Operations
 
-For schema-2 sync-index upgrades, cursor resets and client polling, see
+For schema-3 ingestion/time-index upgrades, cursor resets and client polling, see
 [durable message sync](android-durable-sync.md). Back up before opening an older
 DB with the new build; schema-1 binaries cannot reopen an upgraded database.
 

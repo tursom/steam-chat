@@ -1,6 +1,5 @@
 package io.github.steamchat.android.ui
 
-import android.app.Application
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import androidx.activity.ComponentActivity
@@ -28,7 +27,7 @@ import org.robolectric.annotation.GraphicsMode
 import java.io.File
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35], application = Application::class, qualifiers = "w390dp-h844dp")
+@Config(sdk = [35], application = ComposeTestApplication::class, qualifiers = "w390dp-h844dp")
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class NativeScreenTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()

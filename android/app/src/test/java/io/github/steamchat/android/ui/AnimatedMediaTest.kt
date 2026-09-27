@@ -1,6 +1,5 @@
 package io.github.steamchat.android.ui
 
-import android.app.Application
 import android.graphics.Color
 import android.net.Uri
 import androidx.activity.ComponentActivity
@@ -39,7 +38,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [35], application = Application::class)
+@Config(sdk = [35], application = ComposeTestApplication::class)
 @GraphicsMode(GraphicsMode.Mode.NATIVE)
 class AnimatedMediaTest {
     @get:Rule val compose = createAndroidComposeRule<ComponentActivity>()

@@ -51,6 +51,8 @@ class ForegroundSyncLatencyTest {
     @Volatile private var friendsCode = 200
     private var syncFail = false
     private var syncDenied = false
+    private var syncResponse: ((okhttp3.HttpUrl) -> Pair<Int, String>)? = null
+    private val syncRequests = mutableListOf<okhttp3.HttpUrl>()
     private var steam = "steam1"
     private var mediaBody = """{"emoticons":[],"stickers":[]}"""
     private var onFriends: () -> Unit = {}
@@ -94,6 +96,12 @@ class ForegroundSyncLatencyTest {
                 "/api/steam/status" -> """{"accessAllowed":true,"status":"online","activeAccount":{"steamId":"$steam"}}"""
                 "/api/messages/sync" -> {
                     syncCalls++
+                    syncRequests += chain.request().url
+                    val custom = syncResponse?.invoke(chain.request().url)
+                    if (custom != null) {
+                        code = custom.first
+                        custom.second
+                    } else {
                     if (syncFail) code = 503
                     if (syncDenied) code = 403
                     val items = JSONArray()
@@ -102,7 +110,8 @@ class ForegroundSyncLatencyTest {
                         .put("name", "Friend").put("message", "foreground message")
                         .put("sentAt", "2026-09-08T12:00:00Z").put("ordinal", 1).put("echo", false))
                     JSONObject().put("steamAccountId", steam).put("items", items)
-                        .put("nextCursor", "cursor-$syncCalls").put("hasMore", false).toString()
+                        .put("nextCursor", "cursor-$syncCalls").put("liveCursor", "live-$syncCalls").put("hasMore", false).toString()
+                    }
                 }
                 "/api/friends" -> { code = if (friendsFail) 503 else friendsCode; onFriends(); """[{"id":"peer1","name":"Metadata friend"}]""" }
                 "/api/emoticons" -> mediaBody
@@ -127,6 +136,116 @@ class ForegroundSyncLatencyTest {
         field<ChatCache>("cache").close()
         field<OkHttpClient>("client").dispatcher.cancelAll()
         field<OkHttpClient>("client").connectionPool.evictAll()
+    }
+
+    private fun historyItem(id: String, secondsAgo: Long = 0) = JSONObject()
+        .put("syncId", id).put("eventId", id).put("id", "peer1").put("name", "Friend")
+        .put("message", id).put("sentAt", java.time.Instant.now().minusSeconds(secondsAgo).toString())
+        .put("ordinal", 1).put("echo", false)
+
+    private fun syncPage(cursor: String, more: Boolean, vararg items: JSONObject, live: String = "watermark") =
+        200 to JSONObject().put("steamAccountId", steam).put("items", JSONArray(items.toList()))
+            .put("nextCursor", cursor).put("liveCursor", live).put("hasMore", more).toString()
+
+    @Test fun firstLoginPublishesRecentPageThenInterleavesLiveMessagesAndOlderPages() {
+        val cache = field<ChatCache>("cache")
+        val account = field<String>("cacheScope")
+        cache.reset(account)
+        val recent = historyItem("recent", 20)
+        val new = historyItem("live")
+        val older = historyItem("older", 60)
+        syncResponse = { url ->
+            when (url.queryParameter("cursor")) {
+                null -> { assertEquals("history", url.queryParameter("mode")); syncPage("h1", true, recent) }
+                "watermark" -> { assertNull(url.queryParameter("mode")); syncPage("live1", false, new) }
+                "h1" -> { assertEquals("history", url.queryParameter("mode")); syncPage("h2", true, older, live = "must-not-skip-live") }
+                "live1" -> { assertNull(url.queryParameter("mode")); syncPage("live2", false) }
+                "h2" -> { assertEquals("history", url.queryParameter("mode")); syncPage("h3", false, historyItem("oldest", 120)) }
+                else -> error("Unexpected sync URL $url")
+            }
+        }
+        startWorker()
+        assertEquals(listOf("recent"), repository.state.value.messages.map { it.key })
+        assertEquals("watermark", cache.checkpoint(account).first)
+        assertEquals("h1", cache.historyCursor(account))
+        assertFalse(field<Mutex>("gate").isLocked)
+        assertEquals(RestSyncStatus.SYNCING, repository.state.value.restSyncStatus)
+        // User actions run between pages without waiting for the whole archive.
+        repository.selectConversation("another-peer", "Other")
+        scheduler.runCurrent()
+        assertEquals("another-peer", repository.state.value.selectedPeer)
+        scheduler.advanceTimeBy(249); scheduler.runCurrent()
+        assertEquals(1, syncCalls)
+        scheduler.advanceTimeBy(1); scheduler.runCurrent()
+        assertEquals(3, syncCalls)
+        assertEquals(listOf("older", "recent", "live"), cache.messages(account, "peer1").map { it.key })
+        assertEquals(1, cache.conversations(account).single().unread)
+        assertEquals("live1", cache.checkpoint(account).first)
+        assertEquals("h2", cache.historyCursor(account))
+        scheduler.advanceTimeBy(250); scheduler.runCurrent()
+        assertEquals(listOf(null, "watermark", "h1", "live1", "h2"), syncRequests.map { it.queryParameter("cursor") })
+        assertEquals(listOf("oldest", "older", "recent", "live"), cache.messages(account, "peer1").map { it.key })
+        assertNull(cache.historyCursor(account))
+        assertEquals("live2", cache.checkpoint(account).first)
+        assertEquals(RestSyncStatus.READY, repository.state.value.restSyncStatus)
+    }
+
+    @Test fun liveBacklogDrainsBeforeMoreHistoryAndHistoryFailureResumesSavedCursor() {
+        val cache = field<ChatCache>("cache")
+        val account = field<String>("cacheScope")
+        cache.ingestHistory(account, JSONArray(), "older", true, "live-start")
+        var failHistory = true
+        syncResponse = { url ->
+            when (url.queryParameter("cursor")) {
+                "live-start" -> syncPage("live-next", true, historyItem("new1"))
+                "live-next" -> syncPage("live-end", false, historyItem("new2"))
+                "live-end" -> syncPage("live-end", false)
+                "older" -> if (failHistory) 503 to "{}" else syncPage("history-end", false, historyItem("old", 120))
+                else -> error("Unexpected sync URL $url")
+            }
+        }
+        startWorker()
+        assertEquals(1, syncCalls)
+        assertEquals("older", cache.historyCursor(account))
+        scheduler.advanceTimeBy(250); scheduler.runCurrent()
+        assertEquals("live-end", cache.checkpoint(account).first)
+        assertEquals("older", cache.historyCursor(account))
+        assertEquals(RestSyncStatus.FAILED, repository.state.value.restSyncStatus)
+        failHistory = false
+        scheduler.advanceTimeBy(30_000); scheduler.runCurrent()
+        assertEquals(listOf("live-start", "live-next", "older", "live-end", "older"), syncRequests.map { it.queryParameter("cursor") })
+        assertNull(cache.historyCursor(account))
+        assertEquals(listOf("old", "new1", "new2"), cache.messages(account, "peer1").map { it.key })
+    }
+
+    @Test fun staleHistoryCursorRestartsFromRecentWithoutClearingCachedMessages() {
+        val cache = field<ChatCache>("cache")
+        val account = field<String>("cacheScope")
+        val mutable = field<MutableStateFlow<AppState>>("mutable")
+        mutable.value = mutable.value.copy(selectedPeer = "")
+        val recent = historyItem("recent")
+        cache.ingestHistory(account, JSONArray().put(recent), "stale-history", true, "live-start")
+        syncResponse = { url ->
+            when (url.queryParameter("cursor")) {
+                "live-start" -> syncPage("live-next", false)
+                "live-next" -> syncPage("live-end", false, historyItem("new-after-reset"))
+                "stale-history" -> 409 to """{"resetRequired":true}"""
+                null -> syncPage("new-history", false, recent, live = "new-watermark")
+                else -> error("Unexpected sync URL $url")
+            }
+        }
+        ChatRepository::class.java.getDeclaredMethod("startWorker").apply { isAccessible = true }.invoke(repository)
+        scheduler.runCurrent()
+        assertEquals("live-next" to false, cache.checkpoint(account))
+        assertEquals("", cache.historyCursor(account))
+        assertEquals(1, cache.messages(account, "peer1").size)
+        scheduler.advanceTimeBy(250); scheduler.runCurrent()
+        assertEquals(listOf("live-start", "stale-history", "live-next", null), syncRequests.map { it.queryParameter("cursor") })
+        assertEquals("history", syncRequests.last().queryParameter("mode"))
+        assertEquals("live-end", cache.checkpoint(account).first)
+        assertEquals(2, cache.messages(account, "peer1").size)
+        assertEquals(1, cache.conversations(account).single().unread)
+        assertNull(cache.historyCursor(account))
     }
 
     @Test fun stickerInventoryRetainsPreviewAndAliasMetadata() {

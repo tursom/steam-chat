@@ -76,7 +76,7 @@ class BackgroundReconnectTest {
             var code = 200
             val body = when (path) {
                 "/api/steam/status" -> """{"accessAllowed":true,"status":"online","activeAccount":{"steamId":"$steam"}}"""
-                "/api/messages/sync" -> { onSync(); code = syncCode; """{"steamAccountId":"$steam","items":[],"nextCursor":"next","hasMore":false}""" }
+                "/api/messages/sync" -> { onSync(); code = syncCode; """{"steamAccountId":"$steam","items":[],"nextCursor":"next","liveCursor":"live-next","hasMore":false}""" }
                 "/api/config" -> { onConfig(); code = configCode; """{"wsPath":"/ws"}""" }
                 "/api/friends" -> "[]"
                 "/api/emoticons" -> "{}"

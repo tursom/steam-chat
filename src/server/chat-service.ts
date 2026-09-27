@@ -1270,8 +1270,10 @@ function createChatService(options: ChatServiceOptions = {}) {
           const requestedAccount = url.searchParams.get('steamAccountId') ?? undefined;
           validateAccountPrecondition(requestedAccount);
           const steamAccountId = historyAccount(access, requestedAccount);
+          const mode = url.searchParams.get('mode') ?? undefined;
+          if (mode !== undefined && mode !== 'history') throw Object.assign(new Error('Invalid sync mode'), { statusCode: 400 });
           if (!historyStorage) throw Object.assign(new Error('History storage unavailable'), { statusCode: 503 });
-          const page = await historyStorage.sync({ steamAccountId,
+          const page = await historyStorage.sync({ steamAccountId, mode,
             cursor: url.searchParams.has('cursor') ? url.searchParams.get('cursor')! : undefined,
             limit: url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : undefined });
           const current = requireSteamAccountAccess(req, false);
