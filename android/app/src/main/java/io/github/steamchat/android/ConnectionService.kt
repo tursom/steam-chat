@@ -16,6 +16,7 @@ import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.distinctUntilChangedBy
 
 class ConnectionService : Service() {
     companion object {
@@ -33,7 +34,8 @@ class ConnectionService : Service() {
         if (Build.VERSION.SDK_INT >= 34) startForeground(ChatNotifications.SERVICE_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_REMOTE_MESSAGING)
         else startForeground(ChatNotifications.SERVICE_ID, notification)
         scope.launch {
-            repository.state.collectLatest { state ->
+            // Every sync round emits several state updates; only re-post the notice when its text changes.
+            repository.state.distinctUntilChangedBy { it.backgroundEnabled to ChatNotifications.connectionText(it) }.collectLatest { state ->
                 if (!state.backgroundEnabled) { stopSelf(); return@collectLatest }
                 getSystemService(NotificationManager::class.java).notify(ChatNotifications.SERVICE_ID, ChatNotifications.connection(this@ConnectionService, state))
             }
@@ -89,13 +91,14 @@ internal object ChatNotifications {
             .putExtra("peerId", peer).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP)
         return PendingIntent.getActivity(context, 0, intent, PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE)
     }
+    fun connectionText(state: AppState) = when {
+        state.loggedIn -> state.connectionText
+        state.restoration != SessionRestoration.NONE -> "正在恢复已保存的会话"
+        else -> "未登录"
+    }
     fun connection(context: Context, state: AppState): Notification = NotificationCompat.Builder(context, CONNECTION)
         .setSmallIcon(android.R.drawable.stat_notify_chat).setContentTitle("Steam Chat")
-        .setContentText(when {
-            state.loggedIn -> state.connectionText
-            state.restoration != SessionRestoration.NONE -> "正在恢复已保存的会话"
-            else -> "未登录"
-        })
+        .setContentText(connectionText(state))
         .setOngoing(true).setOnlyAlertOnce(true).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
         .setContentIntent(intent(context)).setCategory(NotificationCompat.CATEGORY_SERVICE).build()
     fun message(context: Context, state: AppState, message: Message) {

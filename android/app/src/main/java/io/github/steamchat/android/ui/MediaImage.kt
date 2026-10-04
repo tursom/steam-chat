@@ -80,6 +80,8 @@ class UiImageLoader(private val repository: ChatRepository) {
     private val epoch = MutableStateFlow(0L)
     internal val generation = epoch.asStateFlow()
     @Synchronized fun clear() { epoch.value++; cache.evictAll() }
+    /** Memory-cache hit for the first frame, so rows scrolled back into view skip the IO dispatch and spinner. */
+    @Synchronized internal fun cached(source: String, version: Long): UiMedia? = if (epoch.value == version) cache.get(source) else null
 
     internal suspend fun load(source: String, context: Context, version: Long = generation.value): UiMedia? =
         withContext(Dispatchers.IO) {
@@ -178,11 +180,12 @@ fun MediaImage(source: String, loader: UiImageLoader, description: String, modif
     val context = LocalContext.current
     val generation by loader.generation.collectAsState()
     val requestGeneration = remember(source, loader) { generation }
-    var media by remember(source, loader) { mutableStateOf<UiMedia?>(null) }
-    var loading by remember(source, loader) { mutableStateOf(true) }
+    var media by remember(source, loader) { mutableStateOf(loader.cached(source, requestGeneration)) }
+    var loading by remember(source, loader) { mutableStateOf(media == null) }
     var visible by remember(source, loader) { mutableStateOf(false) }
     val lifecycle = LocalLifecycleOwner.current.lifecycle.currentStateAsState().value
     LaunchedEffect(source, loader, generation) {
+        if (requestGeneration == generation && media != null) return@LaunchedEffect
         media = null
         try {
             if (requestGeneration == generation) media = loader.load(source, context, requestGeneration)

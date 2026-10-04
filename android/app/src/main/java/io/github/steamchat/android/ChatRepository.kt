@@ -286,7 +286,14 @@ class ChatRepository(private val context: Context, private val socketFactory: We
                                 if (!state.value.loggedIn) validateSession()
                                 val pending = state.value.loggedIn && catchUp()
                                 httpRetryAt = 0
-                                syncAt = now() + if (pending) 250 else if (foreground && !state.value.connected) 3_000 else 30_000
+                                syncAt = now() + when {
+                                    pending -> 250
+                                    foreground && !state.value.connected -> 3_000
+                                    // A live socket delivers sync hints and the server heartbeat prunes dead ones;
+                                    // background polling is only a safety net, so spare the radio.
+                                    !foreground && state.value.connected -> BACKGROUND_POLL_MS
+                                    else -> 30_000
+                                }
                                 syncRequested = false
                             }
                             connectionHints.trySend(Unit)
@@ -297,7 +304,9 @@ class ChatRepository(private val context: Context, private val socketFactory: We
                     connectionHints.trySend(Unit)
                     val next = if (httpRetryAt > 0) httpRetryAt else if (syncRequested) now() else syncAt
                     // Keep the CPU only across back-to-back batches; idle waits may sleep until the next wake.
-                    (next - now()).coerceAtLeast(1).also { if (it > 1_000) syncWake.drop() }
+                    // Re-check at least every 30s so deadlines shortened outside the gate (socket loss) apply;
+                    // a re-check that is not due issues no request.
+                    (next - now()).coerceIn(1, 30_000).also { if (it > 1_000) syncWake.drop() }
                 }
                 syncRequested = withTimeoutOrNull(wait) { hints.receive(); true } ?: false
             } } finally { syncWake.drop() }
@@ -328,7 +337,8 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         val online = status.optString("status") == "online"
         if (!permitted || steam.isEmpty()) { hideAccount(if (!online) "Steam 未连接，等待管理员登录" else "无 Steam 账户访问权限"); return false }
         val nextScope = JSONArray(listOf(base.toString(), userId, steam)).toString()
-        if (nextScope != cacheScope) {
+        val scopeChanged = nextScope != cacheScope
+        if (scopeChanged) {
             val selectedPeer = state.value.selectedPeer
             val selectedName = state.value.selectedName
             val firstAccount = cacheScope.isEmpty()
@@ -337,8 +347,10 @@ class ChatRepository(private val context: Context, private val socketFactory: We
             if (firstAccount) mutable.update { it.copy(selectedPeer = selectedPeer, selectedName = selectedName) }
         }
         mutable.update { it.copy(activeAccountId = steam, accessAllowed = true, steamOnline = online, connectionText = connectionText(it.connected, online)) }
-        publishCache()
-        if (online) refreshMetadata()
+        // Republishing re-queries conversations and decodes the open chat; the cache only changes when pages ingest rows.
+        if (scopeChanged) publishCache()
+        // Friends/emoticons only feed the UI; returning to the foreground triggers a sync that refreshes them.
+        if (online && foreground) refreshMetadata()
         if (!allowed()) return false
         val checkpoint = cache.checkpoint(cacheScope)
         var fetchingHistory = false
@@ -363,7 +375,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
                 val liveCursor = page.getString("liveCursor")
                 require(liveCursor.isNotEmpty()) { "缺少增量同步游标" }
                 cache.ingestHistory(cacheScope, page.getJSONArray("items"), page.getString("nextCursor"), page.getBoolean("hasMore"), liveCursor)
-                publishCache()
+                if (page.getJSONArray("items").length() > 0) publishCache()
                 return page.getBoolean("hasMore")
             }
             // Bounded batches release gate between rounds so user actions can run.
@@ -371,7 +383,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
             val page = fetchPage(checkpoint.first, history = false)
             val more = page.getBoolean("hasMore")
             val notices = cache.ingest(cacheScope, page.getJSONArray("items"), page.getString("nextCursor"), more, if (foreground) state.value.selectedPeer else "")
-            publishCache()
+            if (page.getJSONArray("items").length() > 0) publishCache()
             for (message in notices) {
                 if (state.value.loggedIn && !(foreground && state.value.selectedPeer == message.peerId)) ChatNotifications.message(context, state.value, message)
             }
@@ -381,7 +393,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
                 val history = fetchPage(historyCursor.takeIf { it.isNotEmpty() }, history = true)
                 cache.ingestHistory(cacheScope, history.getJSONArray("items"), history.getString("nextCursor"), history.getBoolean("hasMore"),
                     foregroundPeer = if (foreground) state.value.selectedPeer else "")
-                publishCache()
+                if (history.getJSONArray("items").length() > 0) publishCache()
             }
             return cache.historyCursor(cacheScope) != null
         } catch (e: HttpFailure) {
@@ -536,7 +548,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         if (foreground) {
             syncAt = minOf(syncAt, now())
             hints.trySend(Unit)
-        }
+        } else syncAt = minOf(syncAt, now() + 30_000) // Without hints, fall back to the normal poll interval.
         connectionHints.trySend(Unit)
     }
     private suspend fun connectSocket() {
@@ -919,5 +931,6 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     private companion object {
         const val SYNC_WAKE_MS = 60_000L // Covers status + sync round trips within the 45s call timeout.
         const val CONNECT_WAKE_MS = 30_000L // Config request plus the 20s handshake deadline.
+        const val BACKGROUND_POLL_MS = 5 * 60_000L
     }
 }

@@ -280,6 +280,50 @@ class ForegroundSyncLatencyTest {
         assertEquals("Healthy realtime channel returns to low-frequency catchup", before, syncCalls)
     }
 
+    @Test fun emptySyncRoundsDoNotRequeryOrRepublishCachedLists() {
+        startWorker()
+        pendingMessage = true
+        hint(); scheduler.runCurrent()
+        val messages = repository.state.value.messages
+        val conversations = repository.state.value.conversations
+        assertEquals(listOf("new"), messages.map { it.key })
+        pendingMessage = false
+        repeat(3) { hint(); scheduler.runCurrent() }
+        assertEquals(5, syncCalls)
+        assertSame("An empty page must not rebuild the open chat", messages, repository.state.value.messages)
+        assertSame(conversations, repository.state.value.conversations)
+    }
+
+    @Test fun backgroundWithLiveSocketPollsEveryFiveMinutesWithoutMetadata() {
+        background()
+        startWorker()
+        awaitMetadata()
+        assertTrue("Friends/emoticons only feed the UI", requests.none { it == "/api/friends" || it == "/api/emoticons" })
+        scheduler.advanceTimeBy(5 * 60_000 - 1); scheduler.runCurrent()
+        assertEquals(1, syncCalls)
+        scheduler.advanceTimeBy(1); scheduler.runCurrent()
+        assertEquals(2, syncCalls)
+        setField("foreground", true)
+        hint(); scheduler.runCurrent(); awaitMetadata()
+        assertEquals("Returning to the foreground refreshes metadata", 1, requests.count { it == "/api/friends" })
+    }
+
+    @Test fun backgroundSocketLossFallsBackToThirtySecondPolling() {
+        background()
+        startWorker()
+        ChatRepository::class.java.getDeclaredMethod("scheduleSocketRetry").apply { isAccessible = true }.invoke(repository)
+        assertFalse(repository.state.value.connected)
+        scheduler.advanceTimeBy(30_000); scheduler.runCurrent()
+        assertEquals(2, syncCalls)
+        scheduler.advanceTimeBy(30_000); scheduler.runCurrent()
+        assertEquals(3, syncCalls)
+    }
+
+    private fun background() {
+        setField("foreground", false)
+        field<MutableStateFlow<AppState>>("mutable").value = repository.state.value.copy(backgroundEnabled = true)
+    }
+
     @Test fun websocketFailureImmediatelyWakesRestCatchup() {
         startWorker()
         pendingMessage = true

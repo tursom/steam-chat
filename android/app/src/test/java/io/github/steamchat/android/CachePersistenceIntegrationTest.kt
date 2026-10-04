@@ -235,6 +235,51 @@ class CachePersistenceIntegrationTest {
         assertFalse(cache.containsEvent(scope, "alias"))
     }
 
+    @Test fun semanticAliasPointsAtTheOriginalRowThroughUniqueIndexes() {
+        val original = item("original")
+        cache.ingest(scope, JSONArray().put(item("first", peer = "peer2")).put(original), "first", false, "")
+        val alias = JSONObject(original.toString()).put("eventId", "alias").put("syncId", "alias-sync")
+        cache.ingest(scope, JSONArray().put(alias), "second", false, "")
+        fun seq(sql: String, vararg args: String) = cache.readableDatabase.rawQuery(sql, arrayOf(*args)).use { it.moveToFirst(); it.getLong(0) }
+        assertEquals(2L, seq("SELECT COUNT(*) FROM messages WHERE scope=?", scope))
+        assertEquals(seq("SELECT seq FROM messages WHERE scope=? AND sync_id=?", scope, "original"),
+            seq("SELECT message_seq FROM event_aliases WHERE scope=? AND event_id=?", scope, "alias"))
+        // Alias lookup must probe the unique indexes, never scan and sort the account's rows per message.
+        val plan = cache.readableDatabase.rawQuery("EXPLAIN QUERY PLAN SELECT ?1,?2,seq FROM (" +
+            "SELECT seq FROM messages WHERE scope=?1 AND sync_id=?3 UNION ALL SELECT seq FROM messages WHERE scope=?1 AND event_id=?2 UNION ALL " +
+            "SELECT seq FROM messages WHERE scope=?1 AND semantic_id=?4) ORDER BY seq LIMIT 1", arrayOf(scope, "e", "s", "x")).use { c ->
+            buildList { while (c.moveToNext()) add(c.getString(3)) } }
+        assertEquals(3, plan.count { it.contains("sqlite_autoindex_messages") })
+        assertFalse(plan.joinToString().contains("messages_peer"))
+    }
+
+    @Test fun conversationsOrderByLatestMessageAndCountOnlyUnreadRows() {
+        cache.ingest(scope, JSONArray(), "initial", false, "")
+        val now = System.currentTimeMillis()
+        cache.ingest(scope, JSONArray().put(item("a1", Instant.ofEpochMilli(now - 3_000).toString(), "peerA"))
+            .put(item("b1", Instant.ofEpochMilli(now - 2_000).toString(), "peerB"))
+            .put(item("a2", Instant.ofEpochMilli(now - 1_000).toString(), "peerA"))
+            .put(item("c1", Instant.ofEpochMilli(now - 500).toString(), "peerC", echo = true)), "next", false, "peerB")
+        val conversations = cache.conversations(scope)
+        assertEquals(listOf("peerC", "peerA", "peerB"), conversations.map { it.id })
+        assertEquals(listOf("message-c1", "message-a2", "message-b1"), conversations.map { it.preview })
+        assertEquals(listOf(0, 2, 0), conversations.map { it.unread })
+        cache.read(scope, "peerA")
+        assertEquals(0, cache.conversations(scope).sumOf { it.unread })
+    }
+
+    @Test fun versionThreeUpgradeAddsUnreadIndexAndKeepsData() {
+        cache.ingest(scope, JSONArray(), "initial", false, "")
+        cache.ingest(scope, JSONArray().put(item("unread")), "saved", false, "")
+        cache.writableDatabase.execSQL("DROP INDEX messages_unread")
+        cache.writableDatabase.version = 3
+        cache.close()
+        cache = ChatCache(RuntimeEnvironment.getApplication())
+        assertTrue(cache.readableDatabase.rawQuery("SELECT 1 FROM sqlite_master WHERE type='index' AND name='messages_unread'", null).use { it.moveToFirst() })
+        assertEquals("saved", cache.checkpoint(scope).first)
+        assertEquals(1, cache.conversations(scope).single().unread)
+    }
+
     @Test fun cursorSurvivesReopeningAndResetDoesNotDuplicateRows() {
         cache.ingest(scope, JSONArray().put(item("one")), "saved", false, "")
         cache.close()

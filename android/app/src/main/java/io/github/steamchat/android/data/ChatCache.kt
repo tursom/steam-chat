@@ -10,13 +10,18 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 
-class ChatCache(context: Context) : SQLiteOpenHelper(context, File(context.noBackupFilesDir, "chat.sqlite").absolutePath, null, 3) {
+class ChatCache(context: Context) : SQLiteOpenHelper(context, File(context.noBackupFilesDir, "chat.sqlite").absolutePath, null, 4) {
     override fun onCreate(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE checkpoints (scope TEXT PRIMARY KEY, cursor TEXT NOT NULL, bootstrap INTEGER NOT NULL, notification_floor INTEGER NOT NULL, history_cursor TEXT)")
         db.execSQL("CREATE TABLE messages (seq INTEGER PRIMARY KEY AUTOINCREMENT, scope TEXT NOT NULL, sync_id TEXT NOT NULL, event_id TEXT, semantic_id TEXT NOT NULL, peer TEXT NOT NULL, payload TEXT NOT NULL, sent_at INTEGER NOT NULL, ordinal INTEGER NOT NULL, unread INTEGER NOT NULL DEFAULT 0, UNIQUE(scope,sync_id), UNIQUE(scope,event_id), UNIQUE(scope,semantic_id))")
         db.execSQL("CREATE INDEX messages_peer ON messages(scope,peer,sent_at DESC,ordinal DESC,seq DESC)")
         createEventAliases(db)
         createHistoryPending(db)
+        createUnreadIndex(db)
+    }
+    // Unread rows are few; a partial index lets per-conversation counts skip the read history.
+    private fun createUnreadIndex(db: SQLiteDatabase) {
+        db.execSQL("CREATE INDEX IF NOT EXISTS messages_unread ON messages(scope,peer) WHERE unread=1")
     }
     private fun createEventAliases(db: SQLiteDatabase) {
         db.execSQL("CREATE TABLE event_aliases (scope TEXT NOT NULL, event_id TEXT NOT NULL, message_seq INTEGER NOT NULL, PRIMARY KEY(scope,event_id))")
@@ -33,6 +38,7 @@ class ChatCache(context: Context) : SQLiteOpenHelper(context, File(context.noBac
             // An unfinished oldest-first bootstrap should now begin with recent history.
             db.execSQL("UPDATE checkpoints SET cursor='' WHERE bootstrap=1")
         }
+        if (oldVersion < 4) createUnreadIndex(db)
     }
     fun checkpoint(scope: String): Pair<String, Boolean> = readableDatabase.rawQuery("SELECT cursor,bootstrap FROM checkpoints WHERE scope=?", arrayOf(scope)).use {
         if (it.moveToFirst()) it.getString(0) to (it.getInt(1) != 0) else "" to true
@@ -106,8 +112,12 @@ class ChatCache(context: Context) : SQLiteOpenHelper(context, File(context.noBac
                 val knownEvent = eventId.isNotEmpty() && containsEvent(scope, eventId)
                 val inserted = !knownEvent && db.insertWithOnConflict("messages", null, values, SQLiteDatabase.CONFLICT_IGNORE) != -1L
                 if (!knownEvent && eventId.isNotEmpty()) {
-                    db.execSQL("INSERT OR IGNORE INTO event_aliases(scope,event_id,message_seq) SELECT scope,?,seq FROM messages WHERE scope=? AND (sync_id=? OR event_id=? OR semantic_id=?) ORDER BY seq LIMIT 1",
-                        arrayOf(eventId, scope, syncId, eventId, semanticId))
+                    // One probe per unique index; an OR with ORDER BY seq would scan and sort the whole account per row.
+                    db.execSQL("INSERT OR IGNORE INTO event_aliases(scope,event_id,message_seq) SELECT ?1,?2,seq FROM (" +
+                        "SELECT seq FROM messages WHERE scope=?1 AND sync_id=?3 UNION ALL " +
+                        "SELECT seq FROM messages WHERE scope=?1 AND event_id=?2 UNION ALL " +
+                        "SELECT seq FROM messages WHERE scope=?1 AND semantic_id=?4) ORDER BY seq LIMIT 1",
+                        arrayOf(scope, eventId, syncId, semanticId))
                 }
                 // A late incoming message can arrive between the live and history
                 // requests. Storage deduplication must not consume its live notice.
@@ -157,8 +167,12 @@ class ChatCache(context: Context) : SQLiteOpenHelper(context, File(context.noBac
     fun messages(scope: String, peer: String): List<Message> = readableDatabase.rawQuery(
         "SELECT sync_id,payload FROM messages WHERE scope=? AND peer=? ORDER BY sent_at DESC,ordinal DESC,seq DESC LIMIT 500", arrayOf(scope, peer)
     ).use { c -> buildList { while (c.moveToNext()) add(decode(JSONObject(c.getString(1)), c.getString(0))) }.reversed() }
+    // Drive from distinct peers (an index-only scan), not from every message row with a correlated subquery each.
     fun conversations(scope: String): List<Conversation> = readableDatabase.rawQuery(
-        "SELECT m.peer,m.payload,(SELECT SUM(unread) FROM messages u WHERE u.scope=m.scope AND u.peer=m.peer) FROM messages m WHERE m.scope=? AND m.seq=(SELECT seq FROM messages n WHERE n.scope=m.scope AND n.peer=m.peer ORDER BY sent_at DESC,ordinal DESC,seq DESC LIMIT 1) ORDER BY m.sent_at DESC,m.ordinal DESC,m.seq DESC LIMIT 1000", arrayOf(scope)
+        "SELECT p.peer,m.payload,(SELECT COUNT(*) FROM messages u WHERE u.scope=?1 AND u.peer=p.peer AND u.unread=1) " +
+            "FROM (SELECT DISTINCT peer FROM messages WHERE scope=?1) p " +
+            "JOIN messages m ON m.seq=(SELECT seq FROM messages n WHERE n.scope=?1 AND n.peer=p.peer ORDER BY sent_at DESC,ordinal DESC,seq DESC LIMIT 1) " +
+            "ORDER BY m.sent_at DESC,m.ordinal DESC,m.seq DESC LIMIT 1000", arrayOf(scope)
     ).use { c -> buildList {
         while (c.moveToNext()) {
             val item = JSONObject(c.getString(1))
