@@ -41,6 +41,9 @@ android {
     lint { abortOnError = true }
 }
 
+// Recognizable APK names, e.g. steam-chat-0.1.11-debug.apk / steam-chat-0.1.11-release-unsigned.apk.
+base { archivesName.set("steam-chat-${android.defaultConfig.versionName}") }
+
 dependencies {
     implementation(platform("androidx.compose:compose-bom:2025.05.01"))
     implementation("androidx.activity:activity-compose:1.10.1")

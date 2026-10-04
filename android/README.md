@@ -168,7 +168,7 @@ export ANDROID_HOME=/path/to/android-sdk
 ./gradlew :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
 ```
 
-输出为 `app/build/outputs/apk/debug/app-debug.apk`。这是供个人测试安装的 debug 签名包。持续升级必须保留同一签名；正式长期使用应另行配置私有 release 签名，不能把签名密钥或密码提交到仓库。
+输出为 `app/build/outputs/apk/debug/steam-chat-<版本>-debug.apk`，例如 `steam-chat-0.1.11-debug.apk`；release 构建为 `app/build/outputs/apk/release/steam-chat-<版本>-release-unsigned.apk`。这是供个人测试安装的 debug 签名包。持续升级必须保留同一签名；正式长期使用应另行配置私有 release 签名，不能把签名密钥或密码提交到仓库。
 
 磁盘较小时可把 Gradle 缓存和输出移到外部目录：
 
@@ -178,7 +178,7 @@ export STEAM_CHAT_ANDROID_BUILD_DIR=/tmp/steam-chat-android-build
 ./gradlew :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
 ```
 
-外部输出为 `$STEAM_CHAT_ANDROID_BUILD_DIR/app/outputs/apk/debug/app-debug.apk`。Robolectric 还会下载 Android 测试运行时，默认写入 `~/.m2`；已准备好这些 JAR 的机器可设置 `STEAM_CHAT_ROBOLECTRIC_JARS` 指向离线 JAR 目录，避免重复下载到根盘。
+外部输出为 `$STEAM_CHAT_ANDROID_BUILD_DIR/app/outputs/apk/debug/steam-chat-<版本>-debug.apk`。Robolectric 还会下载 Android 测试运行时，默认写入 `~/.m2`；已准备好这些 JAR 的机器可设置 `STEAM_CHAT_ROBOLECTRIC_JARS` 指向离线 JAR 目录，避免重复下载到根盘。
 
 早期启动/REST 改动使用过以下离线验证命令（在 `android` 目录执行；保留为配置示例，路径需按实际机器调整）：
 
@@ -193,7 +193,7 @@ export STEAM_CHAT_ANDROID_BUILD_DIR=/tmp/steam-chat-android-rest-build
   :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
 ```
 
-上述 `/tmp` 路径是早期验证环境示例。常规构建无需加载它，直接执行 `./gradlew build`；debug APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。连接测试设备后可执行 `adb install -r <APK路径>`。
+上述 `/tmp` 路径是早期验证环境示例。常规构建无需加载它，直接执行 `./gradlew build`；debug APK 位于 `app/build/outputs/apk/debug/steam-chat-<版本>-debug.apk`。连接测试设备后可执行 `adb install -r <APK路径>`。
 
 ## 数据与安全
 
