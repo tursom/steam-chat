@@ -294,13 +294,13 @@ class ForegroundSyncLatencyTest {
         assertSame(conversations, repository.state.value.conversations)
     }
 
-    @Test fun backgroundWithLiveSocketPollsEveryFiveMinutesWithoutMetadata() {
+    @Test fun backgroundWithLiveSocketPollsEveryMinuteWithoutMetadata() {
         background()
         startWorker()
         awaitMetadata()
         assertTrue("Friends/emoticons only feed the UI", requests.none { it == "/api/friends" || it == "/api/emoticons" })
-        scheduler.advanceTimeBy(5 * 60_000 - 1); scheduler.runCurrent()
-        assertEquals(1, syncCalls)
+        scheduler.advanceTimeBy(60_000 - 1); scheduler.runCurrent()
+        assertEquals("The 30s deadline re-check alone must not poll", 1, syncCalls)
         scheduler.advanceTimeBy(1); scheduler.runCurrent()
         assertEquals(2, syncCalls)
         setField("foreground", true)

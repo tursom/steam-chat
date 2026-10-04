@@ -931,6 +931,6 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     private companion object {
         const val SYNC_WAKE_MS = 60_000L // Covers status + sync round trips within the 45s call timeout.
         const val CONNECT_WAKE_MS = 30_000L // Config request plus the 20s handshake deadline.
-        const val BACKGROUND_POLL_MS = 5 * 60_000L
+        const val BACKGROUND_POLL_MS = 60_000L
     }
 }
