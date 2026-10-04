@@ -18,7 +18,9 @@ data class AppState(
     val error: String = "", val conversations: List<Conversation> = emptyList(), val friends: List<Friend> = emptyList(),
     val messages: List<Message> = emptyList(), val emoticons: List<String> = emptyList(), val stickers: List<String> = emptyList(),
     val stickerInventory: List<Sticker> = emptyList(),
-    val selectedPeer: String = "", val selectedName: String = "", val backgroundEnabled: Boolean = true,
+    val selectedPeer: String = "", val selectedName: String = "",
+    // Distinguish repeated explicit selections when StateFlow coalesces the cleared state.
+    val selectionRequest: Long = 0L, val backgroundEnabled: Boolean = true,
     val notificationPreview: Boolean = false, val notificationsEnabled: Boolean = true
 ) {
     val canSend: Boolean get() = loggedIn && accessAllowed && steamOnline

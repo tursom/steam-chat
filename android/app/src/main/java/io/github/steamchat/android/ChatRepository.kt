@@ -32,6 +32,7 @@ import java.io.IOException
 import java.time.Instant
 import java.util.UUID
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.random.Random
 
 class ChatRepository(private val context: Context, private val socketFactory: WebSocket.Factory? = null,
@@ -51,6 +52,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     @Volatile private var cookie = ""
     @Volatile private var expires = 0L
     @Volatile private var generation = 0L
+    private val navigationVersion = AtomicLong()
     @Volatile private var sessionEnding = false
     @Volatile private var foreground = false
     private var userId = ""
@@ -217,6 +219,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         mutable.update { it.copy(server = "") }
     }
     fun logout() {
+        navigationVersion.incrementAndGet()
         val oldBase = base
         val oldCookie = cookie
         sessionEnding = true
@@ -233,6 +236,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         }
     }
     private fun endSession(error: String) {
+        navigationVersion.incrementAndGet()
         sessionEnding = true
         generation++
         cancelMetadata()
@@ -445,6 +449,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         when (val item = items.opt(it)) { is String -> item; is JSONObject -> item.optString("name", item.optString("type")).takeIf(String::isNotEmpty); else -> null }
     }
     private fun hideAccount(reason: String = "无 Steam 账户访问权限") {
+        navigationVersion.incrementAndGet()
         cancelMetadata()
         synchronized(connectionLock) { invalidateSocket(); reconnectAt = 0; attempts = 0 }
         cacheScope = ""; accountSteamId = ""; outgoing.clear()
@@ -625,20 +630,44 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         if (!state.value.loggedIn && cookie.isNotEmpty()) validateSession()
         if (state.value.loggedIn) { catchUp(); startWorker(); hints.trySend(Unit) }
     }
-    fun selectConversation(id: String, name: String) = launchAction {
-        if (!state.value.loggedIn) return@launchAction
-        mutable.update { it.copy(selectedPeer = id, selectedName = name) }
-        if (cacheScope.isNotEmpty() && state.value.accessAllowed) {
-            cache.read(cacheScope, id); ChatNotifications.clearPeer(context, id); publishCache()
+    fun selectConversation(id: String, name: String) {
+        val navigation = navigationVersion.incrementAndGet()
+        val account = cacheScope
+        val session = generation
+        fun current() = navigation == navigationVersion.get() && session == generation &&
+            account == cacheScope && !sessionEnding && state.value.loggedIn
+        launchAction {
+            if (!current()) return@launchAction
+            if (account.isNotEmpty() && state.value.accessAllowed) {
+                cache.read(account, id)
+                if (!current()) return@launchAction
+                ChatNotifications.clearPeer(context, id)
+                // Publish peer and its cached messages together; an intermediate empty
+                // list would clamp the peer's restored LazyListState to the first row.
+                publishCache(id, name, navigation, ::current)
+            } else {
+                mutable.update { if (current()) it.copy(selectedPeer = id, selectedName = name, selectionRequest = navigation, messages = emptyList()) else it }
+            }
         }
     }
-    fun leaveConversation() { mutable.update { it.copy(selectedPeer = "", selectedName = "", messages = emptyList()) } }
-    private fun publishCache() {
-        if (cacheScope.isEmpty() || !state.value.accessAllowed) return
-        outgoing.entries.removeAll { (_, item) -> item.scope == cacheScope && item.confirmedItem?.let { cache.containsConfirmed(cacheScope, it) } == true }
+    fun leaveConversation() {
+        val navigation = navigationVersion.incrementAndGet()
+        mutable.update { it.copy(selectedPeer = "", selectedName = "", selectionRequest = navigation, messages = emptyList()) }
+    }
+    private fun publishCache() = publishCache(null, null, null) { true }
+    private fun publishCache(selectedPeer: String?, selectedName: String?, selectionRequest: Long?, valid: () -> Boolean) {
+        val account = cacheScope
+        if (account.isEmpty() || !state.value.accessAllowed || !valid()) return
+        outgoing.entries.removeAll { (_, item) -> item.scope == account && item.confirmedItem?.let { cache.containsConfirmed(account, it) } == true }
+        val cachedConversations = cache.conversations(account)
         mutable.update { current ->
-            val conversations = cache.conversations(cacheScope).map { c -> current.friends.find { it.id == c.id }?.let { c.copy(name = it.name, avatar = it.avatar) } ?: c }
-            current.copy(conversations = conversations, messages = if (current.selectedPeer.isEmpty()) emptyList() else cache.messages(cacheScope, current.selectedPeer) + outgoing.values.filter { it.scope == cacheScope && it.message.peerId == current.selectedPeer }.map { it.message })
+            if (!valid() || account != cacheScope || sessionEnding || !current.accessAllowed) return@update current
+            val peer = selectedPeer ?: current.selectedPeer
+            val conversations = cachedConversations.map { c -> current.friends.find { it.id == c.id }?.let { c.copy(name = it.name, avatar = it.avatar) } ?: c }
+            val messages = if (peer.isEmpty()) emptyList() else cache.messages(account, peer) + outgoing.values.filter { it.scope == account && it.message.peerId == peer }.map { it.message }
+            if (!valid() || account != cacheScope || sessionEnding) current
+            else current.copy(selectedPeer = peer, selectedName = selectedName ?: current.selectedName,
+                selectionRequest = selectionRequest ?: current.selectionRequest, conversations = conversations, messages = messages)
         }
     }
     fun sendText(text: String) { if (text.isNotBlank()) queueSend(text, null, shareUrl = BilibiliShare.extract(text)) }

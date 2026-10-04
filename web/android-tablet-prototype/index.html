@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light">
+  <title>Steam Chat · 横屏平板原型</title>
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="preview-toolbar">
+    <div class="preview-title"><span class="eyebrow">STEAM CHAT / ANDROID</span><h1>给聊天多一点空间<span>平板交互原型</span></h1></div>
+    <div class="preview-controls">
+      <label class="device-picker"><i data-lucide="tablet"></i><select id="device-size" aria-label="预览尺寸"><option value="landscape">横屏 · 1280 × 800</option><option value="compact">小平板 · 1024 × 768</option><option value="portrait">竖屏 · 800 × 1024</option><option value="split">分屏 · 640 × 800</option><option value="phone">手机 · 390 × 844</option></select></label>
+      <button class="preview-button" id="fullscreen"><i data-lucide="maximize"></i><span>沉浸预览</span></button>
+    </div>
+  </header>
+
+  <main class="preview" id="preview" aria-label="Steam Chat 平板原型">
+    <div class="system-bar"><span>18:32</span><span class="system-right"><i data-lucide="wifi"></i><i data-lucide="battery-full"></i><small>86%</small></span></div>
+    <div class="app" id="app">
+      <nav class="rail" aria-label="主导航">
+        <div class="rail-brand" title="Steam Chat"><i data-lucide="gamepad-2"></i></div>
+        <div class="rail-main">
+          <button class="rail-item active" data-nav="messages" aria-label="消息" aria-current="page"><span><i data-lucide="messages-square"></i><b id="rail-badge">4</b></span><small>消息</small></button>
+          <button class="rail-item" data-nav="friends" aria-label="好友"><span><i data-lucide="users-round"></i></span><small>好友</small></button>
+        </div>
+        <div class="rail-bottom">
+          <button class="rail-item" data-nav="settings" aria-label="设置"><span><i data-lucide="settings-2"></i></span><small>设置</small></button>
+          <button class="my-avatar" data-action="account" aria-label="当前账号 orbit">o<span></span></button>
+        </div>
+      </nav>
+
+      <aside class="conversation-pane" aria-label="会话列表">
+        <header class="list-header">
+          <div class="app-brand">Steam Chat<button class="connection-indicator" data-action="connection" aria-label="查看连接状态" title="查看连接状态"><i data-lucide="circle-check"></i></button></div>
+          <div class="list-title"><h2 id="list-title">消息</h2><button class="icon-button" data-action="new-chat" aria-label="开始新聊天" title="开始新聊天"><i data-lucide="square-pen"></i></button></div>
+          <label class="search-box"><i data-lucide="search"></i><input id="contact-search" type="search" placeholder="搜索会话" autocomplete="off" aria-label="搜索会话或好友"></label>
+          <div class="filters" id="filters"><button class="active" data-filter="all" aria-pressed="true">全部消息 <span id="all-count">7</span></button><button data-filter="unread" aria-pressed="false">未读 <span id="unread-count">4</span></button></div>
+          <div class="friends-caption" id="friends-caption" hidden>4 位在线 · 7 位好友</div>
+        </header>
+        <div class="contact-list" id="contact-list"></div>
+        <div class="list-footer"><span class="status-dot"></span><span id="list-status">所有消息已同步</span><button class="icon-button" data-action="refresh" aria-label="刷新消息" title="刷新消息"><i data-lucide="refresh-cw"></i></button></div>
+      </aside>
+
+      <section class="chat-pane" id="chat-pane" aria-label="聊天内容">
+        <header class="chat-header">
+          <button class="icon-button back-button" data-action="back" aria-label="返回会话列表"><i data-lucide="arrow-left"></i></button>
+          <div id="chat-avatar"></div>
+          <div class="chat-person"><h2 id="chat-name">林间晚风</h2><p id="chat-presence"><span class="status-dot"></span>在线 · 正在玩 Stardew Valley</p></div>
+          <div class="chat-header-actions"><span class="connection-chip" id="connection-chip"><span class="status-dot"></span>实时连接</span><button class="icon-button" id="profile-toggle" data-action="profile" aria-label="打开好友资料" title="好友资料" aria-expanded="false"><i data-lucide="panel-right-open"></i></button></div>
+        </header>
+        <div class="offline-banner" id="offline-banner" hidden><i data-lucide="wifi-off"></i><span>网络已断开，已缓存的聊天仍可查看</span></div>
+        <div class="thread" id="thread" tabindex="0" aria-label="聊天记录"></div>
+        <button class="new-message-jump" id="new-message-jump" data-action="jump-bottom" hidden><i data-lucide="arrow-down"></i>有新消息</button>
+        <form class="composer" id="composer">
+          <div class="attachment" id="attachment" hidden></div>
+          <textarea id="message-input" rows="2" aria-label="输入消息" placeholder="发送消息给 林间晚风…"></textarea>
+          <div class="composer-toolbar">
+            <div class="composer-actions"><button type="button" class="icon-button" id="emoji-toggle" data-action="emoji" aria-label="表情与贴纸" title="表情与贴纸" aria-expanded="false"><i data-lucide="smile"></i></button><button type="button" class="icon-button" data-action="image" aria-label="添加图片" title="添加图片"><i data-lucide="image"></i></button><span class="composer-divider"></span><span class="keyboard-hint">Enter 发送<span> · Shift + Enter 换行</span></span></div>
+            <button class="send-button" type="submit" id="send-button" disabled><span>发送</span><i data-lucide="arrow-up"></i></button>
+          </div>
+          <div class="emoji-popover" id="emoji-popover" hidden><header><strong>表情与贴纸</strong><button type="button" class="icon-button" data-action="close-emoji" aria-label="关闭表情"><i data-lucide="x"></i></button></header><div class="emoji-tabs"><button type="button" class="active" data-emoji-tab="steam">Steam 表情</button><button type="button" data-emoji-tab="emoji">Emoji</button></div><div class="emoji-grid" id="emoji-grid"></div></div>
+        </form>
+      </section>
+
+      <button class="details-backdrop" id="details-backdrop" data-action="close-profile" aria-label="关闭好友资料" hidden></button>
+      <aside class="details-pane" id="details-pane" aria-label="好友资料" hidden></aside>
+      <section class="settings-pane" id="settings-pane" aria-label="设置" hidden></section>
+      <div class="status-popover" id="status-popover" hidden></div>
+      <div class="toast" id="toast" role="status" aria-live="polite" hidden></div>
+    </div>
+    <div class="virtual-keyboard" id="virtual-keyboard" aria-label="模拟屏幕键盘" hidden></div>
+    <div class="gesture-area"><span></span></div>
+  </main>
+
+  <footer class="preview-footer"><div><span class="prototype-dot"></span><span>交互原型 · 所有消息仅在本页演示</span><span class="layout-label" id="layout-label"></span></div><div class="scenario-tools"><button data-action="receive"><i data-lucide="message-circle-plus"></i>模拟来信</button><button data-action="network" id="network-demo"><i data-lucide="wifi-off"></i><span>断开网络</span></button><button data-action="keyboard" id="keyboard-demo" aria-pressed="false"><i data-lucide="keyboard"></i><span>屏幕键盘</span></button></div></footer>
+  <button class="exit-fullscreen" id="exit-fullscreen" aria-label="退出沉浸预览" hidden><i data-lucide="minimize"></i><span>退出预览</span></button>
+  <input type="file" accept="image/*" id="image-input" hidden>
+  <dialog id="image-dialog" class="image-dialog"><button class="icon-button" data-action="close-image" aria-label="关闭图片"><i data-lucide="x"></i></button><img id="full-image" alt="聊天图片大图"></dialog>
+  <script src="../prototype/assets/lucide.min.js"></script>
+  <script src="./app.js"></script>
+</body>
+</html>

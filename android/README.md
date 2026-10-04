@@ -1,6 +1,6 @@
 # Steam Chat Android
 
-原生 Android 客户端，使用 Kotlin、Jetpack Compose 和本地 SQLite 缓存。目标设备为荣耀 WIN RT（MagicOS 10 / Android 16），最低支持 Android 8。不是 WebView，也不包含原型中的模拟账户或通知。
+原生 Android 客户端，使用 Kotlin、Jetpack Compose 和本地 SQLite 缓存，支持手机、横屏平板和分屏窗口。手机目标设备为荣耀 WIN RT（MagicOS 10 / Android 16），最低支持 Android 8。不是 WebView，也不包含原型中的模拟账户或通知。
 
 ## 首次使用
 
@@ -15,6 +15,7 @@
 ## 功能与边界
 
 - 会话和好友列表、文字、图片选择与预览、图片放大、Steam 表情和贴纸。
+- 按可用窗口宽度适配手机、平板与分屏；宽屏可同时查看会话列表和聊天，好友资料支持侧栏与抽屉。
 - 签名 Cookie 登录；凭据以 Android Keystore 加密保存，不保存密码，登录过期需重新登录。
 - WebSocket 实时提示结合持久化增量同步，断线重连后补拉；本地消息和游标在同一事务中保存。
 - 首次同步先显示按聊天时间排序的最近 100 条消息，再逐页补齐更早历史；补历史期间优先同步新消息，进程重启后继续未完成的进度。
@@ -52,6 +53,27 @@
 发送完整的 `【标题-哔哩哔哩】 https://b23.tv/…` 分享文本时，App 提取短链接，解析跳转并将 BV 视频地址转换为 `https://www.bilibili.com/video/av数字` 后发送，去掉标题包装与分享跟踪参数。单独的 B站短链、BV/av 视频链接也会规范化；分P链接保留有效的 `p` 参数（第1P省略）。附有额外说明的普通文字保持原样。
 
 短链解析使用不携带聊天登录凭据的独立 HTTPS 请求，最多4次跳转、总超时10秒；解析时不占用消息同步/用户操作锁。成功后聊天预览与实际发送内容均为 av 链接。解析失败时不发送原文，保留失败消息供手动重试；退出登录或切换账户会丢弃过时结果。已完成解析、但发送结果不确定的消息，重试继续使用已解析的 av 地址，并保留重复发送提示。
+
+## 0.1.10 平板与多窗口布局
+
+原生 Compose 界面沿用 [平板原型](../web/android-tablet-prototype/NOTES.md) 的浅色绿色设计，使用可用窗口的 **dp 宽度**，而非设备型号或物理像素数判断布局：
+
+| 可用宽度 | 导航与聊天 | 好友资料 |
+| --- | --- | --- |
+| ≥ 1200dp | 左侧导航、会话列表、聊天并列 | 按需展开右侧资料栏 |
+| 840–1199dp | 左侧导航、会话列表、聊天并列 | 右侧模态抽屉 |
+| 600–839dp | 左侧导航，列表与聊天单栏切换 | 右侧模态抽屉 |
+| < 600dp | 列表页底部导航，聊天页显示返回按钮 | 右侧模态抽屉 |
+
+列表与聊天独立滚动，当前会话有选中态；尚未选择会话时宽屏展示引导空状态，不自动打开未读会话。消息阅读区限制最大宽度，设置和登录表单也限制宽度。好友资料仅展示实际头像、名称、在线/游戏状态和 Steam ID，不引入原型中的演示好友、图片或消息。
+
+宽度改变、旋转或暂时进入设置时保留文字草稿与阅读位置。待发送图片按会话保存在 Activity ViewModel 中，可跨会话与配置重建保留；URI 不写入磁盘，不保证进程被回收后继续可用。退出登录、账户/权限范围变化会清理旧会话的界面状态；恢复系统保存的导航时也会校验原账号范围。打开资料或切换主导航会收起软键盘。
+
+进入设置或窄屏会话列表时，暂时取消 repository 的可见会话，避免隐藏聊天继续抑制新消息未读与通知；回到宽屏聊天时恢复上次会话并按已有已读规则处理。排队中的会话选择校验最新导航请求与账号，离开后不会重新打开旧会话；连续切换页面与通知再次打开同一会话也按最后一次导航处理。选中会话与缓存消息一次性发布，避免过渡空列表影响恢复的阅读位置。
+
+原生输入区按剩余高度调整，表情库存不会挤占发送操作。矮窗口保留已启用搜索和“仅未读”筛选的退出入口。实际输入法、系统分屏与后台策略仍需真机体验。
+
+0.1.10 已通过默认 `./gradlew build`：debug/release 各 185 项测试，lint 0 错误。新增 17 项布局与状态回归覆盖断点、资料展示、草稿/阅读位置恢复、隐藏会话未读、排队导航、通知连续跳转、跨账号 Bundle 和短窗口操作。原生截图输出到 `app/build/screenshots/`，其中 `steam-chat-android-tablet-native.png` 使用离线测试数据，不发送真实聊天消息。
 
 ## 0.1.9 紧凑同步状态
 
@@ -148,7 +170,7 @@ export STEAM_CHAT_ANDROID_BUILD_DIR=/tmp/steam-chat-android-build
 
 外部输出为 `$STEAM_CHAT_ANDROID_BUILD_DIR/app/outputs/apk/debug/app-debug.apk`。Robolectric 还会下载 Android 测试运行时，默认写入 `~/.m2`；已准备好这些 JAR 的机器可设置 `STEAM_CHAT_ROBOLECTRIC_JARS` 指向离线 JAR 目录，避免重复下载到根盘。
 
-本次启动/REST 改动的离线验证环境可按以下命令复现（在仓库的 `android` 目录执行）：
+早期启动/REST 改动使用过以下离线验证命令（在 `android` 目录执行；保留为配置示例，路径需按实际机器调整）：
 
 ```sh
 export JAVA_HOME=/usr/lib/jvm/java-17-openjdk
@@ -161,7 +183,7 @@ export STEAM_CHAT_ANDROID_BUILD_DIR=/tmp/steam-chat-android-rest-build
   :app:testDebugUnitTest :app:assembleDebug :app:lintDebug
 ```
 
-APK 位于 `/tmp/steam-chat-android-rest-build/app/outputs/apk/debug/app-debug.apk`；连接测试设备后可自行执行 `adb install -r <APK路径>`。本次验证未安装到设备、未部署服务端、未提升版本号。
+上述 `/tmp` 路径是早期验证环境示例。常规构建无需加载它，直接执行 `./gradlew build`；debug APK 位于 `app/build/outputs/apk/debug/app-debug.apk`。连接测试设备后可执行 `adb install -r <APK路径>`。
 
 ## 数据与安全
 

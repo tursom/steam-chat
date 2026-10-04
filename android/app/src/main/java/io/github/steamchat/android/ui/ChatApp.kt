@@ -28,12 +28,18 @@ import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
+import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -41,6 +47,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
+import androidx.lifecycle.viewmodel.compose.viewModel
 import io.github.steamchat.android.*
 
 private val Green = Color(0xFF278773)
@@ -51,7 +58,8 @@ private val Palette = lightColorScheme(primary = Green, onPrimary = Color.White,
     primaryContainer = Color(0xFFE2F0E7), onPrimaryContainer = Ink,
     background = Color.White, surface = Color.White, onSurface = Ink,
     onBackground = Ink, surfaceVariant = Neutral, onSurfaceVariant = Muted,
-    secondary = Color(0xFF697E9C), error = Color(0xFFB44C48), outline = Color(0xFFBACBC0))
+    secondary = Color(0xFF697E9C), secondaryContainer = Color(0xFFDCEBE0), onSecondaryContainer = Ink,
+    error = Color(0xFFB44C48), outline = Color(0xFFBACBC0), outlineVariant = Color(0xFFE6ECE7))
 
 @Composable
 internal fun SteamChatTheme(content: @Composable () -> Unit) {
@@ -65,50 +73,127 @@ fun ChatApp(repository: ChatRepository, notificationsAllowed: Boolean, requestNo
     SteamChatTheme {
         val loader = remember(repository, state.loggedIn, state.server, state.activeAccountId, state.accessAllowed, state.stickerInventory) { UiImageLoader(repository) }
         DisposableEffect(loader) { onDispose { loader.clear() } }
-        var tab by rememberSaveable { mutableIntStateOf(0) }
+        val keyboard = LocalSoftwareKeyboardController.current
+        val focus = LocalFocusManager.current
         val snackbar = remember { SnackbarHostState() }
         val drafts = rememberSaveableStateHolder()
         // Track restored draft keys too, so logout cannot retain a previously visited peer's draft.
         var draftKeys by rememberSaveable { mutableStateOf<List<String>>(emptyList()) }
         val sessionScope = "${state.loggedIn}:${state.server}:${state.username}:${state.activeAccountId}:${state.accessAllowed}"
+        val navigation = rememberSaveable(sessionScope, saver = WorkspaceNavigation.saver(sessionScope)) {
+            WorkspaceNavigation(sessionScope, state.selectedPeer, state.selectedName)
+        }
+        var tab by navigation.tab
+        var lastPeer by navigation.lastPeer
+        var lastName by navigation.lastName
+        val profile = navigation.profile
+        val attachments: ConversationAttachments = viewModel()
+        attachments.useScope(sessionScope)
         var previousScope by rememberSaveable { mutableStateOf(sessionScope) }
         LaunchedEffect(sessionScope) {
             if (previousScope != sessionScope) {
-                draftKeys.forEach { drafts.removeState(it) }
-                draftKeys = emptyList()
+                draftKeys.filterNot { it.startsWith("$sessionScope:") }.forEach { drafts.removeState(it) }
+                draftKeys = draftKeys.filter { it.startsWith("$sessionScope:") }
                 previousScope = sessionScope
             }
         }
         LaunchedEffect(state.error) {
             if (state.error.isNotBlank()) { snackbar.showSnackbar(state.error); repository.clearError() }
         }
+        LaunchedEffect(state.selectedPeer, state.selectionRequest, sessionScope) {
+            val latest = repository.state.value
+            if (latest.selectionRequest != state.selectionRequest || latest.selectedPeer != state.selectedPeer) return@LaunchedEffect
+            if (state.selectedPeer.isNotBlank()) {
+                lastPeer = state.selectedPeer; lastName = state.selectedName
+                // Notification navigation may select a chat while settings are open.
+                if (tab == 2) tab = 0
+            }
+        }
         Surface(Modifier.fillMaxSize(), color = Color.White) {
-            Scaffold(modifier = Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).imePadding(),
-                contentWindowInsets = WindowInsets(0, 0, 0, 0),
-                snackbarHost = { SnackbarHost(snackbar) },
-                bottomBar = {
-                    if (state.loggedIn && state.selectedPeer.isBlank()) NavigationBar(containerColor = Color.White, windowInsets = WindowInsets(0, 0, 0, 0)) {
-                        listOf("消息" to Icons.AutoMirrored.Filled.Chat, "好友" to Icons.Default.People, "设置" to Icons.Default.Settings).forEachIndexed { index, (label, icon) ->
-                            NavigationBarItem(selected = tab == index, onClick = { tab = index }, icon = {
-                                if (index == 0 && state.conversations.any { it.unread > 0 }) BadgedBox(badge = { Badge { Text(state.conversations.sumOf { it.unread }.coerceAtMost(999).toString()) } }) { Icon(icon, label) }
-                                else Icon(icon, label)
-                            }, label = { Text(label) })
+            BoxWithConstraints(Modifier.fillMaxSize().windowInsetsPadding(WindowInsets.safeDrawing).imePadding()) {
+                val wide = maxWidth >= 840.dp
+                val rail = maxWidth >= 600.dp
+                val inlineProfile = maxWidth >= 1200.dp
+                val ready = state.loggedIn && state.restoration == SessionRestoration.NONE
+                fun leaveChat() {
+                    if (state.selectedPeer.isNotBlank()) { lastPeer = state.selectedPeer; lastName = state.selectedName }
+                    profile.value = false
+                    keyboard?.hide(); focus.clearFocus()
+                    repository.leaveConversation()
+                }
+                fun selectTab(index: Int) {
+                    profile.value = false
+                    keyboard?.hide(); focus.clearFocus()
+                    if (index == 2 || !wide) leaveChat()
+                    tab = index
+                }
+                // selectedPeer continues to mean a visible conversation in the
+                // repository: hidden chats retain their unread/notification behavior.
+                LaunchedEffect(wide, tab, sessionScope) {
+                    if (wide && ready && state.accessAllowed && tab != 2 && state.selectedPeer.isBlank() && lastPeer.isNotBlank())
+                        repository.selectConversation(lastPeer, lastName)
+                }
+                BackHandler(ready && state.selectedPeer.isBlank() && tab != 0) { selectTab(0) }
+                Scaffold(modifier = Modifier.fillMaxSize(), contentWindowInsets = WindowInsets(0, 0, 0, 0),
+                    snackbarHost = { SnackbarHost(snackbar) }, bottomBar = {
+                        if (ready && !rail && state.selectedPeer.isBlank()) NavigationBar(Modifier.testTag("bottom-navigation"), containerColor = Color.White, windowInsets = WindowInsets(0, 0, 0, 0)) {
+                            listOf("消息" to Icons.AutoMirrored.Filled.Chat, "好友" to Icons.Default.People, "设置" to Icons.Default.Settings).forEachIndexed { index, (label, icon) ->
+                                NavigationBarItem(selected = tab == index, onClick = { selectTab(index) },
+                                    modifier = Modifier.testTag("nav-${listOf("messages", "friends", "settings")[index]}"), icon = {
+                                        if (index == 0 && state.conversations.any { it.unread > 0 }) BadgedBox(badge = { Badge { Text(state.conversations.sumOf { it.unread }.coerceAtMost(999).toString()) } }) { Icon(icon, label) }
+                                        else Icon(icon, label)
+                                    }, label = { Text(label) })
+                            }
                         }
-                    }
-                }) { padding ->
-                Box(Modifier.padding(padding).fillMaxSize()) {
-                    when {
-                        state.restoration != SessionRestoration.NONE -> RestorationScreen(state, repository)
-                        !state.loggedIn -> LoginScreen(state, repository)
-                        state.selectedPeer.isNotBlank() -> {
-                            val draftKey = "$sessionScope:${state.selectedPeer}"
-                            SideEffect { if (draftKey !in draftKeys) draftKeys = draftKeys + draftKey }
-                            drafts.SaveableStateProvider(draftKey) { ChatScreen(state, repository, loader) }
+                    }) { padding ->
+                    Box(Modifier.padding(padding).fillMaxSize()) {
+                        when {
+                            !ready -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.TopCenter) {
+                                Box(Modifier.widthIn(max = 520.dp).fillMaxSize()) {
+                                    if (state.restoration != SessionRestoration.NONE) RestorationScreen(state, repository)
+                                    else LoginScreen(state, repository)
+                                }
+                            }
+                            else -> Row(Modifier.fillMaxSize().testTag("adaptive-workspace")) {
+                                if (rail) TabletNavigation(state, tab, if (inlineProfile) 74.dp else 68.dp, ::selectTab)
+                                if (tab == 2) {
+                                    Box(Modifier.weight(1f).fillMaxHeight().background(Neutral).testTag("settings-pane"), contentAlignment = Alignment.TopCenter) {
+                                        Box(Modifier.widthIn(max = 840.dp).fillMaxSize()) {
+                                            SettingsScreen(state, repository, loader, notificationsAllowed, requestNotifications, openNotificationSettings)
+                                        }
+                                    }
+                                } else {
+                                    if (wide || state.selectedPeer.isBlank()) {
+                                        Box((if (wide) Modifier.width(if (inlineProfile) 306.dp else 280.dp) else Modifier.weight(1f))
+                                            .fillMaxHeight().background(if (wide) Color(0xFFFAFBF9) else Color.White).testTag("conversation-pane")) {
+                                            ContactScreen(state, repository, loader, tab == 1, { selectTab(1) }, { selectTab(2) },
+                                                selectedPeer = if (wide) state.selectedPeer else lastPeer, compact = wide)
+                                        }
+                                        if (wide) VerticalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
+                                    }
+                                    if (state.selectedPeer.isNotBlank()) {
+                                        val draftKey = "$sessionScope:${state.selectedPeer}"
+                                        SideEffect { if (draftKey !in draftKeys) draftKeys = draftKeys + draftKey }
+                                        Box(Modifier.weight(1f).fillMaxHeight().testTag("chat-pane")) {
+                                            drafts.SaveableStateProvider(draftKey) {
+                                                ChatScreen(state, repository, loader, showBack = !wide, onBack = ::leaveChat,
+                                                    inlineProfile = inlineProfile, profileState = profile,
+                                                    attachmentState = attachments.forPeer(state.selectedPeer))
+                                            }
+                                        }
+                                    } else if (wide) {
+                                        Column(Modifier.weight(1f).fillMaxHeight().testTag("chat-empty"), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+                                            Icon(Icons.AutoMirrored.Filled.Chat, null, Modifier.size(48.dp), tint = Color(0xFFB5CEBE))
+                                            Spacer(Modifier.height(20.dp))
+                                            Text("选择一个会话", style = MaterialTheme.typography.titleLarge)
+                                            Text("从左侧选择好友，开始聊天", style = MaterialTheme.typography.bodyMedium, color = Muted, modifier = Modifier.padding(12.dp))
+                                        }
+                                    }
+                                }
+                            }
                         }
-                        tab == 2 -> SettingsScreen(state, repository, loader, notificationsAllowed, requestNotifications, openNotificationSettings)
-                        else -> ContactScreen(state, repository, loader, tab == 1, { tab = 1 }, { tab = 2 })
+                        if (state.loading) LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter))
                     }
-                    if (state.loading) LinearProgressIndicator(Modifier.fillMaxWidth().align(Alignment.TopCenter))
                 }
             }
         }
@@ -224,51 +309,67 @@ internal fun SyncStatusIndicator(state: AppState, settings: () -> Unit) {
 
 @Composable
 internal fun ContactScreen(state: AppState, repository: ChatRepository, loader: UiImageLoader, friends: Boolean,
-                          newChat: () -> Unit, settings: () -> Unit) {
+                          newChat: () -> Unit, settings: () -> Unit, selectedPeer: String = "", compact: Boolean = false) {
     var query by rememberSaveable(friends) { mutableStateOf("") }
     var unread by rememberSaveable { mutableStateOf(false) }
+    var expandedSearch by rememberSaveable(friends) { mutableStateOf(false) }
+    var requestSearchFocus by remember { mutableStateOf(false) }
+    val searchFocus = remember { FocusRequester() }
+    LaunchedEffect(requestSearchFocus) {
+        if (requestSearchFocus) { searchFocus.requestFocus(); requestSearchFocus = false }
+    }
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+    val short = maxHeight < 400.dp
     Column(Modifier.fillMaxSize()) {
         Column(Modifier.padding(horizontal = 20.dp)) {
-            Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                Icon(Icons.Default.SportsEsports, null, tint = Green); Spacer(Modifier.width(8.dp))
-                Text("Steam Chat", style = MaterialTheme.typography.titleSmall)
+            if (!short) Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                if (!compact) { Icon(Icons.Default.SportsEsports, null, tint = Green); Spacer(Modifier.width(8.dp)) }
+                Text("Steam Chat", style = MaterialTheme.typography.titleSmall, modifier = Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
                 SyncStatusIndicator(state, settings)
-                Spacer(Modifier.weight(1f))
                 ToolButton(Icons.Default.Refresh, "刷新", !state.loading) { repository.refresh() }
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(if (friends) "好友" else "消息", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.weight(1f))
+                if (short && !expandedSearch && query.isEmpty()) ToolButton(Icons.Default.Search, "搜索好友") { expandedSearch = true; requestSearchFocus = true }
                 ToolButton(Icons.Default.Edit, "新建会话", onClick = newChat)
             }
-            OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(top = 8.dp), placeholder = { Text("搜索好友") }, singleLine = true,
+            if (!short || expandedSearch || query.isNotEmpty()) OutlinedTextField(query, { query = it }, Modifier.fillMaxWidth().padding(top = 8.dp)
+                .focusRequester(searchFocus).onFocusChanged { if (it.isFocused) expandedSearch = true }, placeholder = { Text("搜索好友") }, singleLine = true,
                 leadingIcon = { Icon(Icons.Default.Search, null) }, trailingIcon = { if (query.isNotEmpty()) ToolButton(Icons.Default.Close, "清除搜索") { query = "" } })
             if (!state.accessAllowed) Text("此账号尚无聊天访问权限", color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(vertical = 8.dp))
-            if (!friends) TabRow(selectedTabIndex = if (unread) 1 else 0) {
+            if (!short && !friends) TabRow(selectedTabIndex = if (unread) 1 else 0) {
                 Tab(!unread, { unread = false }, text = { Text("全部消息") })
                 Tab(unread, { unread = true }, text = { Text("未读") })
-            } else Text("${state.friends.count { it.online }} 位在线 · ${state.friends.size} 位好友", color = Muted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(vertical = 12.dp))
+            } else if (!short && friends) Text("${state.friends.count { it.online }} 位在线 · ${state.friends.size} 位好友", color = Muted, style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(vertical = 12.dp))
+            if (short && !friends && unread) AssistChip(onClick = { unread = false }, label = { Text("仅未读") },
+                trailingIcon = { Icon(Icons.Default.Close, "显示全部消息", Modifier.size(16.dp)) }, modifier = Modifier.testTag("clear-unread-filter"))
         }
-        LazyColumn(Modifier.weight(1f), contentPadding = PaddingValues(vertical = 8.dp)) {
+        LazyColumn(Modifier.weight(1f).testTag("contact-list"), contentPadding = PaddingValues(vertical = 8.dp)) {
             if (friends) {
                 val contacts = state.friends.filter { it.name.contains(query, true) || it.id.contains(query) }.sortedByDescending { it.online }
                 if (contacts.isEmpty()) item { EmptyState(if (state.loading) "正在加载好友…" else "没有匹配的好友") }
-                items(contacts, key = { it.id }) { friend -> ContactRow(friend.name, friend.avatar, if (friend.gameName.isNotBlank()) "正在玩 ${friend.gameName}" else if (friend.online) "在线" else "离线", "", 0, friend.online, loader) { repository.selectConversation(friend.id, friend.name) } }
+                items(contacts, key = { it.id }) { friend -> ContactRow(friend.id, friend.name, friend.avatar, if (friend.gameName.isNotBlank()) "正在玩 ${friend.gameName}" else if (friend.online) "在线" else "离线", "", 0, friend.online, loader, friend.id == selectedPeer, compact) { repository.selectConversation(friend.id, friend.name) } }
             } else {
                 val conversations = state.conversations.filter { (!unread || it.unread > 0) && (it.name.contains(query, true) || it.id.contains(query)) }
                 if (conversations.isEmpty()) item { EmptyState(if (state.loading) "正在加载会话…" else if (unread) "暂无未读消息" else "暂无会话") }
-                items(conversations, key = { it.id }) { c -> ContactRow(c.name, c.avatar, c.preview, c.updatedAt, c.unread, state.friends.any { it.id == c.id && it.online }, loader) { repository.selectConversation(c.id, c.name) } }
+                items(conversations, key = { it.id }) { c -> ContactRow(c.id, c.name, c.avatar, c.preview, c.updatedAt, c.unread, state.friends.any { it.id == c.id && it.online }, loader, c.id == selectedPeer, compact) { repository.selectConversation(c.id, c.name) } }
             }
         }
+    }
     }
 }
 
 @Composable
-private fun ContactRow(name: String, avatar: String, preview: String, time: String, unread: Int, online: Boolean, loader: UiImageLoader, select: () -> Unit) {
-    Row(Modifier.fillMaxWidth().clickable(onClick = select).padding(horizontal = 22.dp, vertical = 16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+private fun ContactRow(id: String, name: String, avatar: String, preview: String, time: String, unread: Int, online: Boolean, loader: UiImageLoader,
+                       isSelected: Boolean, compact: Boolean, select: () -> Unit) {
+    Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 2.dp).clip(RoundedCornerShape(8.dp))
+        .background(if (isSelected) Color(0xFFE5EFE5) else Color.Transparent).testTag("contact-$id").semantics { selected = isSelected }
+        .clickable(onClick = select).padding(horizontal = 14.dp, vertical = 14.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
         Avatar(name, avatar, loader, online)
         Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(7.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(name, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
+                Text(name, Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium,
+                    style = if (compact) MaterialTheme.typography.titleSmall else MaterialTheme.typography.bodyLarge)
                 if (time.isNotBlank()) Text(displayTime(time), style = MaterialTheme.typography.labelSmall, color = Muted, modifier = Modifier.padding(start = 6.dp))
             }
             Row(verticalAlignment = Alignment.CenterVertically) {
