@@ -12,6 +12,7 @@ services:
       STEAM_CHAT_HOST: 0.0.0.0
       STEAM_CHAT_PORT: 3000
       STEAM_CHAT_WS_PATH: /ws
+      STEAM_CHAT_WS_HEARTBEAT_MS: ${STEAM_CHAT_WS_HEARTBEAT_MS:-}
       STEAM_CHAT_DEPLOY_WEBHOOK_URL: ${STEAM_CHAT_DEPLOY_WEBHOOK_URL:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"

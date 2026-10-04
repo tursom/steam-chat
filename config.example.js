@@ -9,6 +9,8 @@ module.exports = {
     host: '0.0.0.0',
     port: 3000,
     wsPath: '/ws',
+    // Server WebSocket ping interval (ms); keep below reverse-proxy idle timeouts. 0 disables.
+    wsHeartbeatMs: 45000,
     auth: {
       username: '',
       password: '',

@@ -31,6 +31,8 @@ export type ChatConfig = {
   host: string;
   port: number;
   wsPath: string;
+  /** Server-initiated WebSocket ping interval; 0 disables. Must stay below proxy/NAT idle timeouts. */
+  wsHeartbeatMs: number;
   auth: AuthConfig;
 };
 

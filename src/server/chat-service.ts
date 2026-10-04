@@ -233,6 +233,7 @@ const DEFAULT_CHAT_CONFIG: ChatConfig = {
   host: '0.0.0.0',
   port: 3000,
   wsPath: '/ws',
+  wsHeartbeatMs: 45_000,
   auth: {
     username: '',
     password: '',
@@ -253,6 +254,11 @@ function stringProp(record: UnknownRecord, key: string, fallback: string): strin
 function numberProp(record: UnknownRecord, key: string, fallback: number): number {
   const value = record[key];
   return typeof value === 'number' ? value : fallback;
+}
+
+function heartbeatProp(value: unknown): number {
+  if (value === 0) return 0;
+  return typeof value === 'number' && Number.isInteger(value) && value > 0 ? value : DEFAULT_CHAT_CONFIG.wsHeartbeatMs;
 }
 
 function arrayFromUnknown(value: unknown): unknown[] {
@@ -288,6 +294,7 @@ function normalizeChatConfig(config: unknown): ChatConfig {
     host: stringProp(config, 'host', DEFAULT_CHAT_CONFIG.host),
     port: numberProp(config, 'port', DEFAULT_CHAT_CONFIG.port),
     wsPath: stringProp(config, 'wsPath', DEFAULT_CHAT_CONFIG.wsPath),
+    wsHeartbeatMs: heartbeatProp(config.wsHeartbeatMs),
     auth
   };
 }
@@ -488,6 +495,7 @@ function createChatService(options: ChatServiceOptions = {}) {
   const legacyAuth = createAuthChecker(config.auth);
   const clients = new Set<WsConnection>();
   const wsRequests = new Map<WsConnection, IncomingMessage>();
+  const unansweredPings = new Set<WsConnection>();
   const recentSentText = new Map<string, number>();
   let disposeSteamEvents = () => {};
 
@@ -1545,16 +1553,38 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
     clients.add(ws);
     sendWs(ws, { type: 'ready', wsPath: config.wsPath });
-    ws.on('message', (raw: RawData) => { if (!stopping) void track(handleWsMessage(ws, raw)); });
+    ws.on('pong', () => unansweredPings.delete(ws));
+    ws.on('message', (raw: RawData) => {
+      unansweredPings.delete(ws);
+      if (!stopping) void track(handleWsMessage(ws, raw));
+    });
     ws.on('close', () => {
       clients.delete(ws);
       wsRequests.delete(ws);
+      unansweredPings.delete(ws);
     });
     ws.on('error', () => {
       clients.delete(ws);
       wsRequests.delete(ws);
+      unansweredPings.delete(ws);
     });
   });
+
+  // Server pings keep proxy/NAT mappings alive while a sleeping phone cannot run its own ping timer,
+  // and drop half-open sockets that missed a whole interval so they stop absorbing sync hints.
+  const heartbeat = config.wsHeartbeatMs > 0 ? setInterval(() => {
+    for (const ws of clients) {
+      if (unansweredPings.has(ws)) {
+        unansweredPings.delete(ws);
+        ws.terminate();
+        continue;
+      }
+      if (ws.readyState !== WebSocket.OPEN) continue;
+      unansweredPings.add(ws);
+      ws.ping();
+    }
+  }, config.wsHeartbeatMs) : null;
+  heartbeat?.unref?.();
 
   const disposeStorageMessages = historyStorage?.onMessage((item) => {
     for (const ws of clients) {
@@ -1603,6 +1633,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     },
     async stop() {
       stopping = true;
+      if (heartbeat) clearInterval(heartbeat);
       disposeSteamEvents();
       for (const ws of clients) ws.terminate();
       wss.close();

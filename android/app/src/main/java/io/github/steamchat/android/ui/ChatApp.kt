@@ -4,7 +4,6 @@ package io.github.steamchat.android.ui
 import android.content.Intent
 import androidx.core.net.toUri
 import android.os.Build
-import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
@@ -390,8 +389,10 @@ internal fun SettingsScreen(state: AppState, repository: ChatRepository, loader:
     var logout by remember { mutableStateOf(false) }
     var battery by remember { mutableStateOf(false) }
     var channelSummary by remember { mutableStateOf(ChatNotifications.settingsSummary(context)) }
+    var batteryExempt by remember { mutableStateOf(BackgroundWork.batteryExempt(context)) }
     androidx.lifecycle.compose.LifecycleEventEffect(androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
         channelSummary = ChatNotifications.settingsSummary(context)
+        batteryExempt = BackgroundWork.batteryExempt(context)
     }
     Column(Modifier.fillMaxSize().verticalScroll(rememberScrollState()).background(Color(0xFFF8FAF9))) {
         Text("设置", style = MaterialTheme.typography.headlineMedium, modifier = Modifier.fillMaxWidth().background(Color.White).padding(22.dp))
@@ -413,7 +414,7 @@ internal fun SettingsScreen(state: AppState, repository: ChatRepository, loader:
         SectionLabel("连接与设备")
         SettingAction("后端地址", state.server) { logout = true }
         SettingAction("连接状态", "${state.restSyncText} · ${state.connectionText} · Steam ${if (state.steamOnline) "在线" else "离线"} · ${if (state.accessAllowed) "有访问权限" else "无访问权限"}") { repository.refresh() }
-        SettingAction("后台运行设置", "电池优化与后台活动") { battery = true }
+        SettingAction("后台运行设置", if (batteryExempt) "已忽略电池优化；厂商后台管理仍需单独允许" else "受电池优化限制，点击申请忽略") { battery = true }
         SettingAction("系统通知设置", "通知类别、锁屏显示与提示音", openNotificationSettings)
         Text("${Build.MANUFACTURER} ${Build.MODEL} · Android ${Build.VERSION.RELEASE}", style = MaterialTheme.typography.bodySmall, color = Muted, modifier = Modifier.padding(22.dp))
         TextButton(onClick = { logout = true }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp)) { Text("退出登录", color = MaterialTheme.colorScheme.error) }
@@ -421,8 +422,15 @@ internal fun SettingsScreen(state: AppState, repository: ChatRepository, loader:
     if (logout) AlertDialog(onDismissRequest = { logout = false }, title = { Text("退出并重新配置？") }, text = { Text("将退出当前后台账号，清除本地会话缓存、图片缓存和草稿。之后可修改后端地址。") },
         confirmButton = { TextButton(onClick = { loader.clear(); repository.logout(); logout = false }) { Text("退出登录") } }, dismissButton = { TextButton(onClick = { logout = false }) { Text("取消") } })
     if (battery) AlertDialog(onDismissRequest = { battery = false }, title = { Text("后台运行设置") },
-        text = { Text("可在系统电池设置中检查 Steam Chat 的优化限制，厂商系统可能还需允许后台活动或自启动。前台服务不能保证在休眠、断网或强行停止后继续接收消息。") },
-        confirmButton = { TextButton(onClick = { battery = false; launchSystem(context, Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS)) }) { Text("打开电池设置") } }, dismissButton = { TextButton(onClick = { battery = false }) { Text("取消") } })
+        text = { Text((if (batteryExempt) "Steam Chat 已忽略电池优化，可在后台恢复连接服务。" else "允许忽略电池优化后，系统休眠时对后台连接的限制更少，App 也能在后台自行恢复连接服务。") +
+            "\n\n荣耀等厂商系统还需在应用详情的耗电或启动管理中允许后台活动和自启动。前台服务不能保证在强行停止、断网或重启后未恢复时继续接收消息。") },
+        confirmButton = { TextButton(onClick = {
+            battery = false
+            if (batteryExempt) launchSystem(context, BackgroundWork.batterySettings())
+            // Some vendor builds hide the one-tap request; fall back to the full list.
+            else runCatching { context.startActivity(BackgroundWork.exemptionRequest(context)) }.onFailure { launchSystem(context, BackgroundWork.batterySettings()) }
+        }) { Text(if (batteryExempt) "电池优化设置" else "申请忽略电池优化") } },
+        dismissButton = { TextButton(onClick = { battery = false; launchSystem(context, BackgroundWork.appDetails(context)) }) { Text("应用详情") } })
 }
 
 @Composable private fun SectionLabel(text: String) { Text(text, style = MaterialTheme.typography.labelMedium, color = Muted, modifier = Modifier.padding(start = 22.dp, top = 22.dp, bottom = 8.dp)) }

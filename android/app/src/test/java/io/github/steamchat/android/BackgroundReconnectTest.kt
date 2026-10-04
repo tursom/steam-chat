@@ -323,6 +323,107 @@ class BackgroundReconnectTest {
         assertEquals(1, count("/api/config"))
     }
 
+    @Test fun backgroundSyncHintHoldsWakeLockUntilCatchUpFinishes() {
+        fakeTransport(); syncCode = 200; background()
+        start(); drain(); open(sockets.single()); scheduler.runCurrent(); drain()
+        assertFalse("Idle background waits must not keep the CPU awake", wake("syncWake").isHeld)
+        var heldDuringSync = false
+        onSync = { heldDuringSync = wake("syncWake").isHeld }
+        val socket = sockets.single()
+        socket.second.onMessage(socket.first, """{"type":"sync_available","steamAccountId":"steam1"}""")
+        assertTrue("The frame's brief kernel wake must be extended before the worker runs", wake("syncWake").isHeld)
+        scheduler.runCurrent(); drain()
+        assertTrue(heldDuringSync)
+        assertFalse(wake("syncWake").isHeld)
+    }
+
+    @Test fun foregroundSyncHintDoesNotTakeWakeLock() {
+        fakeTransport(); syncCode = 200
+        start(); drain(); open(sockets.single()); scheduler.runCurrent(); drain()
+        val socket = sockets.single()
+        socket.second.onMessage(socket.first, """{"type":"sync_available","steamAccountId":"steam1"}""")
+        assertFalse(wake("syncWake").isHeld)
+    }
+
+    @Test fun backgroundNetworkRecoveryHoldsConnectWakeUntilOpenThenHandsOverToSync() {
+        fakeTransport(); syncCode = 200; background()
+        start(); drain(); open(sockets.single()); scheduler.runCurrent(); drain()
+        networkCallback.onAvailable(network(101))
+        assertTrue(wake("connectWake").isHeld)
+        scheduler.runCurrent(); drain()
+        assertEquals(2, sockets.size)
+        assertTrue("Handshake is still pending", wake("connectWake").isHeld)
+        open(sockets.last())
+        assertFalse(wake("connectWake").isHeld)
+        assertTrue(wake("syncWake").isHeld)
+        scheduler.runCurrent(); drain()
+        assertFalse(wake("syncWake").isHeld)
+    }
+
+    @Test fun backgroundSocketFailureReleasesConnectWakeInsteadOfHoldingThroughBackoff() {
+        fakeTransport(); background()
+        start(); drain(); open(sockets.single())
+        networkCallback.onAvailable(network(101)); scheduler.runCurrent(); drain()
+        val replacement = sockets.last()
+        replacement.second.onFailure(replacement.first, java.io.IOException("offline"), null)
+        assertFalse(wake("connectWake").isHeld)
+    }
+
+    @Test fun watchdogRevivesServiceAndSocketAndRunsOneCatchUp() {
+        fakeTransport(); syncCode = 200; background()
+        val app = shadowOf(RuntimeEnvironment.getApplication())
+        app.clearStartedServices()
+        runBlocking { repository.backgroundCheck() }
+        assertEquals(ConnectionService::class.java.name, app.nextStartedService?.component?.className)
+        assertEquals(1, count("/api/messages/sync"))
+        scheduler.runCurrent(); drain()
+        assertEquals("The socket worker reconnects a missing socket immediately", 1, sockets.size)
+    }
+
+    @Test fun watchdogDoesNothingWhenBackgroundReceivingIsDisabled() {
+        fakeTransport(); syncCode = 200
+        set("foreground", false)
+        runBlocking { repository.backgroundCheck() }
+        scheduler.runCurrent(); drain()
+        assertTrue(requests.isEmpty())
+        assertTrue(sockets.isEmpty())
+    }
+
+    @Test fun pendingSessionValidationKeepsServiceInsteadOfStoppingIt() {
+        background()
+        field<MutableStateFlow<AppState>>("mutable").value = repository.state.value.copy(loggedIn = false, restoration = SessionRestoration.RETRY)
+        val app = shadowOf(RuntimeEnvironment.getApplication())
+        app.clearStartedServices()
+        ChatRepository::class.java.getDeclaredMethod("updateService").apply { isAccessible = true }.invoke(repository)
+        assertEquals(ConnectionService::class.java.name, app.nextStartedService?.component?.className)
+        assertNull(app.nextStoppedService)
+    }
+
+    @Test fun systemStartRequiresSavedSessionAndBackgroundSetting() {
+        val context = RuntimeEnvironment.getApplication()
+        val app = shadowOf(context)
+        val session = File(context.noBackupFilesDir, "session.enc")
+        app.clearStartedServices()
+        background()
+        repository.onSystemStart()
+        assertNull("No saved session: nothing to restore after boot", app.nextStartedService)
+        session.writeBytes(ByteArray(16))
+        try {
+            field<MutableStateFlow<AppState>>("mutable").value = repository.state.value.copy(backgroundEnabled = false)
+            repository.onSystemStart()
+            assertNull(app.nextStartedService)
+            background()
+            repository.onSystemStart()
+            assertEquals(ConnectionService::class.java.name, app.nextStartedService?.component?.className)
+        } finally { session.delete() }
+    }
+
+    private fun background() {
+        set("foreground", false)
+        field<MutableStateFlow<AppState>>("mutable").value = repository.state.value.copy(backgroundEnabled = true)
+    }
+    private fun wake(name: String) = field<android.os.PowerManager.WakeLock?>(name)!!
+
     private class FakeSocket(private val request: Request) : WebSocket {
         var canceled = false
         override fun request() = request

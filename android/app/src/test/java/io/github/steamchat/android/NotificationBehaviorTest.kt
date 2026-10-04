@@ -63,6 +63,14 @@ class NotificationBehaviorTest {
         assertEquals(ChatNotifications.SERVICE_ID, manager.activeNotifications.single().id)
     }
 
+    @Test fun serviceNoticeDistinguishesPendingRestoreFromLoggedOut() {
+        ChatNotifications.channels(context)
+        fun text(state: AppState) = ChatNotifications.connection(context, state).extras.getString(Notification.EXTRA_TEXT)
+        assertEquals("正在恢复已保存的会话", text(AppState(restoration = SessionRestoration.RETRY)))
+        assertEquals("未登录", text(AppState()))
+        assertEquals("实时通道已连接", text(state.copy(connectionText = "实时通道已连接")))
+    }
+
     @Test fun logoutDeniedAccessMutedAndOwnMessagesCannotNotify() {
         ChatNotifications.channels(context)
         ChatNotifications.message(context, state.copy(loggedIn = false), message("peer"))

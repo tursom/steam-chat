@@ -20,7 +20,8 @@ function loadConfig(): UnknownRecord {
     ...chatInput,
     host: process.env.STEAM_CHAT_HOST || chatInput.host || '0.0.0.0',
     port: Number.parseInt(String(process.env.STEAM_CHAT_PORT || chatInput.port || 3000), 10),
-    wsPath: process.env.STEAM_CHAT_WS_PATH || chatInput.wsPath || '/ws'
+    wsPath: process.env.STEAM_CHAT_WS_PATH || chatInput.wsPath || '/ws',
+    wsHeartbeatMs: process.env.STEAM_CHAT_WS_HEARTBEAT_MS ? Number(process.env.STEAM_CHAT_WS_HEARTBEAT_MS) : chatInput.wsHeartbeatMs
   };
 
   return {

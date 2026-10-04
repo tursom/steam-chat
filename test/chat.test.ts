@@ -121,6 +121,39 @@ test('normalizeChatConfig accepts boolean shorthand', () => {
   assert.equal(normalizeChatConfig({ port: 3100 }).port, 3100);
 });
 
+test('normalizeChatConfig validates the WebSocket heartbeat interval', () => {
+  assert.equal(normalizeChatConfig(true).wsHeartbeatMs, 45_000);
+  assert.equal(normalizeChatConfig({ wsHeartbeatMs: 20_000 }).wsHeartbeatMs, 20_000);
+  assert.equal(normalizeChatConfig({ wsHeartbeatMs: 0 }).wsHeartbeatMs, 0);
+  for (const invalid of [-1, 1.5, '30000', Number.NaN]) {
+    assert.equal(normalizeChatConfig({ wsHeartbeatMs: invalid }).wsHeartbeatMs, 45_000);
+  }
+});
+
+test('WebSocket heartbeat pings live clients and terminates sockets that never answer', async (t: TestContext) => {
+  const service = createChatService({
+    config: { host: '127.0.0.1', port: 0, wsPath: '/ws', wsHeartbeatMs: 40 },
+    logPath: path.join(await fs.mkdtemp(path.join(os.tmpdir(), 'steam-chat-heartbeat-')), 'chat.jsonl'),
+    logger: { info() {}, warn() {}, error() {} }
+  }) as ChatServiceRuntime & { clients: Set<WsConnection> };
+  t.after(() => service.stop().catch(() => {}));
+  const port = await listen(service.server);
+  const live = await wsOpen(`ws://127.0.0.1:${port}/ws`);
+  const silent = new (WebSocket as new (url: string, options: { autoPong: boolean }) => WsConnection)(
+    `ws://127.0.0.1:${port}/ws`, { autoPong: false });
+  t.after(() => { live.ws.terminate(); silent.terminate(); });
+  let livePings = 0;
+  live.ws.on('ping', () => { livePings += 1; });
+  const silentClosed = new Promise<void>((resolve) => silent.once('close', () => resolve()));
+  await new Promise<void>((resolve, reject) => { silent.once('open', () => resolve()); silent.once('error', reject); });
+
+  await silentClosed;
+  await new Promise((resolve) => setTimeout(resolve, 150));
+  assert.ok(livePings >= 2, `expected repeated pings, got ${livePings}`);
+  assert.equal(live.ws.readyState, WebSocket.OPEN);
+  assert.equal(service.clients.size, 1);
+});
+
 test('image proxy URL guard rejects local and private targets', () => {
   assert.equal(isAllowedRemoteImageUrl('https://example.com/a.png'), true);
   assert.equal(isAllowedRemoteImageUrl('ftp://example.com/a.png'), false);

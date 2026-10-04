@@ -18,9 +18,15 @@ import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.collectLatest
 
 class ConnectionService : Service() {
+    companion object {
+        /** Lets the repository skip redundant starts, which Android may reject from the background. */
+        @Volatile var running = false
+            private set
+    }
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
     override fun onCreate() {
         super.onCreate()
+        running = true
         ChatNotifications.channels(this)
         val repository = (application as ChatApplication).repository
         val notification = ChatNotifications.connection(this, repository.state.value)
@@ -37,7 +43,7 @@ class ConnectionService : Service() {
         (application as ChatApplication).repository.onServiceStarted()
         return START_STICKY
     }
-    override fun onDestroy() { scope.cancel(); super.onDestroy() }
+    override fun onDestroy() { running = false; scope.cancel(); super.onDestroy() }
     override fun onBind(intent: Intent?): IBinder? = null
 }
 
@@ -85,7 +91,11 @@ internal object ChatNotifications {
     }
     fun connection(context: Context, state: AppState): Notification = NotificationCompat.Builder(context, CONNECTION)
         .setSmallIcon(android.R.drawable.stat_notify_chat).setContentTitle("Steam Chat")
-        .setContentText(if (!state.loggedIn) "未登录" else state.connectionText)
+        .setContentText(when {
+            state.loggedIn -> state.connectionText
+            state.restoration != SessionRestoration.NONE -> "正在恢复已保存的会话"
+            else -> "未登录"
+        })
         .setOngoing(true).setOnlyAlertOnce(true).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
         .setContentIntent(intent(context)).setCategory(NotificationCompat.CATEGORY_SERVICE).build()
     fun message(context: Context, state: AppState, message: Message) {

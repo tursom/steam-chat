@@ -37,4 +37,6 @@ class SessionVault(context: Context) {
         try { stream.write(bytes); file.finishWrite(stream) } catch (e: Exception) { file.failWrite(stream); throw e }
     }
     @Synchronized fun clear() = file.delete()
+    /** Cheap presence check that needs no Keystore access; [load] still decides whether the session is usable. */
+    @Synchronized fun exists() = file.baseFile.exists()
 }

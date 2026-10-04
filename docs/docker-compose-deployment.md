@@ -33,6 +33,7 @@ services:
       STEAM_CHAT_HOST: 0.0.0.0
       STEAM_CHAT_PORT: 3000
       STEAM_CHAT_WS_PATH: /ws
+      STEAM_CHAT_WS_HEARTBEAT_MS: ${STEAM_CHAT_WS_HEARTBEAT_MS:-}
       STEAM_CHAT_DEPLOY_WEBHOOK_URL: ${STEAM_CHAT_DEPLOY_WEBHOOK_URL:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
@@ -154,6 +155,21 @@ curl -fsS http://127.0.0.1:3000/healthz
 ## 公网访问
 
 公网部署应配置 HTTPS 反向代理。Android App 只接受有效 HTTPS 地址。反代需要支持 `/ws` 的 WebSocket Upgrade，正确转发协议及必要的客户端信息。
+
+服务端默认每 45 秒向每条 WebSocket 发送一次 ping，下一次检查时仍未收到 pong 的连接会被断开。锁屏休眠的手机无法按时发出自己的心跳，服务端 ping 用来保持反代和运营商 NAT 的连接映射，并清理半开连接。反代的空闲超时必须大于该间隔；nginx 的 `proxy_read_timeout` 和 `proxy_send_timeout` 默认 60 秒，配合默认间隔可直接使用，调大间隔时需同步调整，例如：
+
+```nginx
+location /ws {
+    proxy_pass http://127.0.0.1:3000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_read_timeout 300s;
+    proxy_send_timeout 300s;
+}
+```
+
+间隔可通过 `.env` 中的 `STEAM_CHAT_WS_HEARTBEAT_MS` 或 `config.js` 的 `chat.wsHeartbeatMs` 调整，`0` 关闭。间隔越短，连接越不容易被中途回收，但每次 ping 都会唤醒手机网络，耗电越高；移动网络 NAT 超时因运营商而异，应以真机锁屏到达率和耗电为准调整。
 
 若只有本机反代需要访问服务端口，可在 `.env` 设置：
 

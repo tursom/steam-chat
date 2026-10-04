@@ -11,8 +11,8 @@ android {
         applicationId = "io.github.steamchat.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 11
-        versionName = "0.1.10"
+        versionCode = 12
+        versionName = "0.1.11"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildTypes {
@@ -58,6 +58,7 @@ dependencies {
     implementation("com.github.penfeizhou.android.animation:gif:3.0.5")
     implementation("com.github.penfeizhou.android.animation:awebp:3.0.5")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("androidx.work:work-runtime:2.10.5")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation(platform("androidx.compose:compose-bom:2025.05.01"))
     testImplementation("androidx.compose.ui:ui-test-junit4")

@@ -5,6 +5,7 @@ import android.content.Intent
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.Uri
+import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Base64
 import androidx.core.content.ContextCompat
@@ -81,6 +82,10 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     private var metadataVersion = 0L
     private var worker: Job? = null
     private val hints = Channel<Unit>(Channel.CONFLATED)
+    // A socket frame or network change only wakes the CPU briefly; hold these while the follow-up
+    // HTTP round trips run in the background so the notification is not deferred to the next wake.
+    private val syncWake = wakeLock("SteamChat:sync")
+    private val connectWake = wakeLock("SteamChat:connect")
     private val outgoing = linkedMapOf<String, Outgoing>()
     private data class Outgoing(val message: Message, val scope: String, val uri: Uri? = null, val confirmedItem: JSONObject? = null,
                                 val wireText: String = message.text, val shareUrl: HttpUrl? = null)
@@ -131,6 +136,13 @@ class ChatRepository(private val context: Context, private val socketFactory: We
             })
         }
     }
+
+    private fun wakeLock(tag: String) = runCatching {
+        context.getSystemService(PowerManager::class.java)?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, tag)?.apply { setReferenceCounted(false) }
+    }.getOrNull()
+    // Re-acquiring extends the timeout; the timeout bounds battery cost if a release path is missed.
+    private fun PowerManager.WakeLock?.hold(timeout: Long) { if (!foreground) runCatching { this?.acquire(timeout) } }
+    private fun PowerManager.WakeLock?.drop() { runCatching { if (this?.isHeld == true) release() } }
 
     private fun launchAction(block: suspend () -> Unit) {
         val version = generation
@@ -254,6 +266,8 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         cacheScope = ""; accountSteamId = ""; userId = ""; outgoing.clear()
         mutable.update { AppState(server = it.server, error = error, backgroundEnabled = it.backgroundEnabled, notificationPreview = it.notificationPreview, notificationsEnabled = it.notificationsEnabled) }
         context.stopService(Intent(context, ConnectionService::class.java))
+        BackgroundWork.cancel(context)
+        syncWake.drop(); connectWake.drop()
         ChatNotifications.clearMessages(context)
     }
     private fun allowed() = !sessionEnding && (state.value.loggedIn || cookie.isNotEmpty()) && (foreground || state.value.backgroundEnabled)
@@ -263,11 +277,12 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         if (worker?.isActive == true) return
         worker = scope.launch {
             var syncRequested = true
-            while (isActive && allowed()) {
+            try { while (isActive && allowed()) {
                 val wait = gate.withLock {
                     try {
                         if (cookie.isNotEmpty()) {
                             if ((syncRequested || now() >= syncAt || (httpRetryAt > 0 && now() >= httpRetryAt)) && now() >= httpRetryAt) {
+                                syncWake.hold(SYNC_WAKE_MS)
                                 if (!state.value.loggedIn) validateSession()
                                 val pending = state.value.loggedIn && catchUp()
                                 httpRetryAt = 0
@@ -281,10 +296,11 @@ class ChatRepository(private val context: Context, private val socketFactory: We
                     }
                     connectionHints.trySend(Unit)
                     val next = if (httpRetryAt > 0) httpRetryAt else if (syncRequested) now() else syncAt
-                    (next - now()).coerceAtLeast(1)
+                    // Keep the CPU only across back-to-back batches; idle waits may sleep until the next wake.
+                    (next - now()).coerceAtLeast(1).also { if (it > 1_000) syncWake.drop() }
                 }
                 syncRequested = withTimeoutOrNull(wait) { hints.receive(); true } ?: false
-            }
+            } } finally { syncWake.drop() }
         }
         updateService()
     }
@@ -468,6 +484,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     }
     private fun recoverConnection() = synchronized(connectionLock) {
         if (!allowed()) return@synchronized
+        connectWake.hold(CONNECT_WAKE_MS)
         invalidateSocket()
         // Coalesce flapping network/lifecycle signals into at most one attempt per second.
         val timestamp = now()
@@ -511,6 +528,8 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         }
     }
     private fun scheduleSocketRetry() {
+        // Backoff timers do not run while the CPU sleeps; the next network event or watchdog run retries instead.
+        connectWake.drop()
         attempts = (attempts + 1).coerceAtMost(6)
         reconnectAt = now() + Random.nextLong(1000, (1000L shl attempts).coerceAtMost(60_000))
         mutable.update { if (it.accessAllowed) it.copy(connected = false, connectionText = "实时通道断开，正在重试") else it }
@@ -552,6 +571,9 @@ class ChatRepository(private val context: Context, private val socketFactory: We
                         socketDeadline = Long.MAX_VALUE
                         attempts = 0
                         mutable.update { it.copy(connected = true, connectionText = connectionText(true, it.steamOnline)) }
+                        // Hand the wake over to the catch-up sync that the open triggers.
+                        syncWake.hold(SYNC_WAKE_MS)
+                        connectWake.drop()
                         hints.trySend(Unit)
                         connectionHints.trySend(Unit)
                         Unit
@@ -559,7 +581,10 @@ class ChatRepository(private val context: Context, private val socketFactory: We
                     override fun onMessage(webSocket: WebSocket, text: String) = synchronized(connectionLock) {
                         if (!current() || socket !== webSocket) return@synchronized
                         val type = runCatching { JSONObject(text).optString("type") }.getOrNull()
-                        if (type in listOf("sync_available", "message", "ready", "steam_status", "status")) hints.trySend(Unit)
+                        if (type in listOf("sync_available", "message", "ready", "steam_status", "status")) {
+                            syncWake.hold(SYNC_WAKE_MS)
+                            hints.trySend(Unit)
+                        }
                         Unit
                     }
                     override fun onClosing(webSocket: WebSocket, code: Int, reason: String) {
@@ -823,21 +848,62 @@ class ChatRepository(private val context: Context, private val socketFactory: We
                 invalidateSocket()
                 socketWorker?.cancel(); socketWorker = null
             }
+            syncWake.drop(); connectWake.drop()
             mutable.update { it.copy(connected = false, connectionText = "后台连接已暂停") }
         }
         if (foreground && cacheScope.isNotEmpty() && state.value.selectedPeer.isNotEmpty()) { cache.read(cacheScope, state.value.selectedPeer); publishCache() }
         updateService()
     }
     private fun updateService() {
-        if (state.value.loggedIn && state.value.backgroundEnabled) {
-            // Android may disallow a background FGS start; next visible activity retries.
+        // A saved session that is still being validated (e.g. no network yet after boot) keeps the service.
+        if (!sessionEnding && (state.value.loggedIn || cookie.isNotEmpty()) && state.value.backgroundEnabled) {
+            BackgroundWork.schedule(context)
+            if (ConnectionService.running) return
+            // Android may disallow a background FGS start unless battery-exempt; next visible activity retries.
             runCatching { ContextCompat.startForegroundService(context, Intent(context, ConnectionService::class.java)) }
-                .onFailure { mutable.update { it.copy(error = "系统未允许后台服务，请打开应用以恢复后台连接") } }
-        } else context.stopService(Intent(context, ConnectionService::class.java))
+                .onFailure { mutable.update { it.copy(error = "系统未允许后台服务，可在设置中允许忽略电池优化，或打开应用以恢复后台连接") } }
+        } else {
+            context.stopService(Intent(context, ConnectionService::class.java))
+            BackgroundWork.cancel(context)
+        }
     }
     fun onServiceStarted() = launchAction {
         if (allowed()) startWorker()
         else if (cookie.isEmpty()) context.stopService(Intent(context, ConnectionService::class.java))
+    }
+    /** Boot/package-replaced broadcast: start the service synchronously while the broadcast still permits it. */
+    fun onSystemStart() {
+        if (!state.value.backgroundEnabled || !vault.exists()) return
+        // The service's start command reconciles once session restore finishes and stops itself if it fails.
+        runCatching { ContextCompat.startForegroundService(context, Intent(context, ConnectionService::class.java)) }
+    }
+    /** WorkManager fallback: revive the service and socket, then hold the worker's wake for one bounded catch-up. */
+    suspend fun backgroundCheck() {
+        val version = generation
+        withTimeoutOrNull(SYNC_WAKE_MS) {
+            gate.withLock {
+                if (version != generation || !allowed() || cookie.isEmpty()) return@withLock
+                updateService()
+                synchronized(connectionLock) {
+                    if (socket == null && socketConnect?.isActive != true) {
+                        connectWake.hold(CONNECT_WAKE_MS)
+                        reconnectAt = now()
+                        connectionHints.trySend(Unit)
+                    }
+                }
+                try {
+                    if (!state.value.loggedIn) validateSession()
+                    if (state.value.loggedIn) {
+                        val pending = catchUp()
+                        syncAt = now() + if (pending) 250 else 30_000
+                    }
+                    httpRetryAt = 0
+                } catch (e: CancellationException) { throw e } catch (e: Exception) {
+                    handleFailure(e)
+                }
+                startWorker()
+            }
+        }
     }
     private fun bounded(input: java.io.InputStream, max: Int): ByteArray {
         val output = ByteArrayOutputStream()
@@ -849,5 +915,9 @@ class ChatRepository(private val context: Context, private val socketFactory: We
             output.write(buffer, 0, count)
         }
         return output.toByteArray()
+    }
+    private companion object {
+        const val SYNC_WAKE_MS = 60_000L // Covers status + sync round trips within the 45s call timeout.
+        const val CONNECT_WAKE_MS = 30_000L // Config request plus the 20s handshake deadline.
     }
 }
