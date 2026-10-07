@@ -124,7 +124,7 @@ type OpenGraphPreview = {
   description: string;
 };
 
-const supportedBbcodeTags = ['og', 'url', 'img', 'emoticon', 'sticker', 'roomeffect'] as const;
+const supportedBbcodeTags = ['og', 'url', 'img', 'video', 'emoticon', 'sticker', 'roomeffect'] as const;
 type SupportedBbcodeTag = (typeof supportedBbcodeTags)[number];
 const supportedBbcodeTagSet = new Set<string>(supportedBbcodeTags);
 const supportedBbcodePattern = new RegExp(`\\[(${supportedBbcodeTags.join('|')})(?=[\\s=\\]])`, 'gi');
@@ -362,6 +362,7 @@ function chatIconButton(name: ChatIconName, label: string, className = 'icon-btn
 }
 
 function clear(node: HTMLElement) {
+  destroyVideoPlayers(node);
   node.replaceChildren();
 }
 
@@ -2890,7 +2891,10 @@ function renderHistory(items: MessageItem[]) {
   // Detaching an iframe resets its browsing context, even if the same node is reused.
   // Keep retained history connected; only remove obsolete rows and insert new ones.
   const retained = new Set(desired);
-  for (const child of Array.from(messages.children)) if (!retained.has(child)) child.remove();
+  for (const child of Array.from(messages.children)) if (!retained.has(child)) {
+    destroyVideoPlayers(child);
+    child.remove();
+  }
   let position = 0;
   for (const row of desired) {
     const cursor = messages.children[position];
@@ -3207,6 +3211,13 @@ function appendSupportedBbcode(
     return true;
   }
 
+  if (tag === 'video') {
+    const source = parseSteamVideoSource(attributes, body);
+    if (!source) return false;
+    container.append(steamVideoNode(source));
+    return true;
+  }
+
   const preview = parseSteamImagePreview(attributes, body);
   if (!preview) return false;
   container.append(steamImageNode(preview));
@@ -3297,6 +3308,141 @@ function parseSteamImagePreview(attributes: string, body: string): SteamImagePre
     width: positiveInteger(values.width),
     height: positiveInteger(values.height)
   };
+}
+
+function parseSteamVideoSource(attributes: string, body: string): string {
+  const values = parseBbcodeAttributes(attributes, new Set(['src', 'type', 'steamvideo']));
+  if (!values || values.type !== 'video/mp4' || values.steamvideo !== 'true') return '';
+  const source = httpUrl(values.src);
+  if (!source || body.trim() !== source) return '';
+  const url = new URL(source);
+  if (url.protocol !== 'https:' || url.username || url.password || url.port || url.search || url.hash
+    || !['cdn.steamusercontent.com', 'images.steamusercontent.com'].includes(url.hostname)
+    || !/^\/ugc\/\d+\/[a-f0-9]{40}\/?$/i.test(url.pathname)) return '';
+  return source;
+}
+
+type VideoPlayer = import('artplayer').default;
+let artPlayerModule: Promise<typeof import('artplayer').default> | undefined;
+const videoPlayers = new Map<HTMLElement, VideoPlayer>();
+
+function loadArtPlayer() {
+  if (!artPlayerModule) {
+    const moduleUrl = '/vendor/artplayer-5.4.0.mjs';
+    artPlayerModule = import(moduleUrl).then(module => {
+      const ArtPlayer = module.default as typeof import('artplayer').default;
+      ArtPlayer.FULLSCREEN_WEB_IN_BODY = false;
+      ArtPlayer.RECONNECT_TIME_MAX = 0;
+      ArtPlayer.LOG_VERSION = false;
+      return ArtPlayer;
+    }).catch(error => { artPlayerModule = undefined; throw error; });
+  }
+  return artPlayerModule;
+}
+
+function destroyVideoPlayers(root: Element) {
+  for (const [container, player] of videoPlayers) {
+    if (!root.contains(container)) continue;
+    if (player.fullscreenWeb) player.fullscreenWeb = false;
+    player.pause();
+    player.destroy();
+    videoPlayers.delete(container);
+  }
+}
+
+function steamVideoNode(source: string) {
+  const shell = create('div', 'steam-video');
+  const load = create('button', 'steam-video-load', '▶ 播放视频');
+  load.type = 'button';
+  const fallback = externalLink('steam-video-link', source, '打开原视频');
+  const status = create('p', 'steam-video-status', '');
+  status.setAttribute('role', 'status');
+  status.hidden = true;
+  load.addEventListener('click', async () => {
+    if (load.disabled || shell.querySelector('video')) return;
+    load.disabled = true;
+    load.textContent = '正在加载播放器…';
+    status.hidden = true;
+    const context = chatContext();
+    const container = create('div', 'steam-video-player');
+    let player: VideoPlayer;
+    try {
+      const ArtPlayer = await loadArtPlayer();
+      if (!shell.isConnected || context !== chatContext()) return;
+      shell.insertBefore(container, fallback);
+      player = new ArtPlayer({
+        container, url: source, type: 'mp4', lang: 'zh-cn', theme: '#fb7299',
+        autoplay: false, playsInline: true, hotkey: true, setting: true,
+        playbackRate: true, fullscreenWeb: true, fullscreen: true, miniProgressBar: true,
+        gesture: true, mutex: true, moreVideoAttr: { preload: 'none', crossOrigin: 'anonymous' },
+        cssVar: { '--art-border-radius': '8px', '--art-progress-height': '3px', '--art-control-height': '38px' }
+      });
+      videoPlayers.set(container, player);
+      // The built-in menu rounds 0.75/1.25 to one decimal; keep the actual rate visible.
+      for (const rate of ArtPlayer.PLAYBACK_RATE) {
+        player.setting.update({ name: `playback-rate-${rate}`, html: rate === 1 ? '正常 (1x)' : `${rate}x` });
+      }
+      player.video.setAttribute('aria-label', 'Steam 视频播放器');
+      player.on('destroy', () => {
+        container.remove();
+        load.hidden = false;
+        load.disabled = false;
+        load.textContent = '▶ 播放视频';
+        status.hidden = true;
+      });
+      let scrollTop = 0;
+      let followBottom = false;
+      player.proxy(container, 'click', event => {
+        if (player.fullscreenWeb || !(event.target as Element).closest('.art-control-fullscreenWeb')) return;
+        const messages = document.querySelector<HTMLElement>('#messages');
+        if (messages) {
+          scrollTop = messages.scrollTop;
+          followBottom = messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48;
+          watchHistoryLayout(messages, false);
+        }
+      }, { capture: true });
+      player.on('fullscreenWeb', active => {
+        const messages = document.querySelector<HTMLElement>('#messages');
+        if (active) {
+          for (const other of videoPlayers.values()) if (other !== player && other.fullscreenWeb) other.fullscreenWeb = false;
+        }
+        document.documentElement.classList.toggle('video-web-fullscreen', active);
+        if (!active && messages) {
+          requestAnimationFrame(() => {
+            if (!messages.isConnected) return;
+            messages.scrollTop = scrollTop;
+            watchHistoryLayout(messages, followBottom);
+          });
+        }
+      });
+      // Escape also exits on touch devices, where ArtPlayer disables desktop hotkeys.
+      player.proxy(document, 'keydown', event => {
+        if ((event as KeyboardEvent).key === 'Escape' && player.fullscreenWeb) player.fullscreenWeb = false;
+      });
+      player.on('video:error', () => {
+        status.textContent = '视频无法播放，请打开原视频链接。';
+        status.hidden = false;
+      });
+      player.on('video:playing', () => { status.hidden = true; });
+      load.hidden = true;
+      // Loading the local module may consume the original click activation in some browsers.
+      await player.play().catch(() => {
+        if (player.isDestroy || player.video.error) return;
+        status.textContent = '请点击播放器中的播放按钮开始播放。';
+        status.hidden = false;
+      });
+    } catch {
+      if (player) destroyVideoPlayers(container);
+      container.remove();
+      if (!shell.isConnected || context !== chatContext()) return;
+      load.disabled = false;
+      load.textContent = '重试加载播放器';
+      status.textContent = '播放器加载失败，请重试或打开原视频。';
+      status.hidden = false;
+    }
+  });
+  shell.append(load, fallback, status);
+  return shell;
 }
 
 function imageBodyMatchesSource(body: string, sourceUrl: string): boolean {

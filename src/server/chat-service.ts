@@ -371,6 +371,8 @@ function contentTypeForPath(filePath: string) {
     '.css': 'text/css; charset=utf-8',
     '.html': 'text/html; charset=utf-8',
     '.js': 'text/javascript; charset=utf-8',
+    '.mjs': 'text/javascript; charset=utf-8',
+    '.txt': 'text/plain; charset=utf-8',
     '.json': 'application/json; charset=utf-8',
     '.m4a': 'audio/mp4',
     '.png': 'image/png',
@@ -397,6 +399,8 @@ function isStaticRequest(pathname: string) {
     || pathname === '/index.html'
     || pathname === '/style.css'
     || pathname === '/app.js'
+    || pathname === '/vendor/artplayer-5.4.0.mjs'
+    || pathname === '/vendor/artplayer-LICENSE.txt'
     || pathname === '/sw.js'
     || pathname === '/manifest.webmanifest'
     || pathname.startsWith('/sounds/')

@@ -286,6 +286,51 @@ test('web chat renders Steam OpenGraph messages as preview cards', async () => {
   assert.match(card.textContent, new RegExp(title));
 });
 
+test('Steam MP4 BBCode renders a click-to-load player with its original link', () => {
+  const { renderMessage } = loadWebTestApi();
+  const source = 'https://cdn.steamusercontent.com/ugc/12345678901234567890/0123456789ABCDEF0123456789ABCDEF01234567/';
+  for (const attributes of [
+    `src=${source} type=video/mp4 steamvideo=true`,
+    `src="${source}" type="video/mp4" steamvideo="true"`,
+    `steamvideo='true' type='video/mp4' src='${source}'`
+  ]) {
+    const row = renderMessage({ id: 'peer', message: `Before [video ${attributes}]${source}[/video] After` });
+    const player = row.findByClass('steam-video');
+    assert.ok(player);
+    assert.equal(player.findByTag('video'), null, 'History does not load a media source');
+    assert.match(player.findByTag('button')!.textContent, /播放视频/);
+    assert.equal(player.findByTag('a')!.href, source);
+    assert.equal(player.findByTag('a')!.rel, 'noopener noreferrer');
+    assert.match(row.textContent, /^.*Before /);
+    assert.match(row.textContent, / After/);
+    assert.doesNotMatch(row.textContent, /\[\/?video\b/);
+  }
+});
+
+test('unsupported, unsafe and malformed video BBCode remains readable literal text', () => {
+  const { renderMessage } = loadWebTestApi();
+  const source = 'https://cdn.steamusercontent.com/ugc/123/0123456789ABCDEF0123456789ABCDEF01234567/';
+  const attributes = `src=${source} type=video/mp4 steamvideo=true`;
+  for (const message of [
+    `[video src=https://cdn.steamusercontent.com.evil.test/ugc/123/0123456789ABCDEF0123456789ABCDEF01234567/ type=video/mp4 steamvideo=true]https://cdn.steamusercontent.com.evil.test/ugc/123/0123456789ABCDEF0123456789ABCDEF01234567/[/video]`,
+    `[video ${attributes.replace('https:', 'http:')}]${source.replace('https:', 'http:')}[/video]`,
+    `[video ${attributes.replace('type=video/mp4', 'type=text/html')}]${source}[/video]`,
+    `[video ${attributes.replace('steamvideo=true', 'steamvideo=false')}]${source}[/video]`,
+    `[video ${attributes} onerror=alert(1)]${source}[/video]`,
+    `[video ${attributes} src=${source}]${source}[/video]`,
+    `[video ${attributes}]https://example.com/different.mp4[/video]`,
+    `[video ${attributes}]caption ${source}[/video]`,
+    `[video ${attributes}]${source}`,
+    `\\[video ${attributes}]${source}\\[/video]`,
+    `[video src="javascript:alert(1)" type=video/mp4 steamvideo=true]javascript:alert(1)[/video]`
+  ]) {
+    const row = renderMessage({ id: 'peer', message });
+    assert.equal(row.findByClass('steam-video'), null, message);
+    assert.equal(row.findByTag('video'), null, message);
+    assert.match(row.textContent, /\[video/);
+  }
+});
+
 test('web chat preserves text around multiple OpenGraph cards', () => {
   const { renderMessage } = loadWebTestApi();
   const message = [

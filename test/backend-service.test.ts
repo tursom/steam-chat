@@ -137,6 +137,14 @@ test('backend auth gates chat HTTP APIs and reports Steam offline as 503', async
   assert.equal((await fetch(`http://127.0.0.1:${port}/healthz`)).status, 200);
   assert.equal((await fetch(`http://127.0.0.1:${port}/history`)).status, 401);
 
+  const playerModule = await fetch(`http://127.0.0.1:${port}/vendor/artplayer-5.4.0.mjs`);
+  assert.equal(playerModule.status, 200, 'The click-loaded player is a public local static asset');
+  assert.match(playerModule.headers.get('content-type'), /text\/javascript/);
+  assert.match(await playerModule.text(), /artplayer\.js v5\.4\.0/);
+  const playerLicense = await fetch(`http://127.0.0.1:${port}/vendor/artplayer-LICENSE.txt`);
+  assert.equal(playerLicense.status, 200);
+  assert.match(await playerLicense.text(), /MIT License/);
+
   const configResponse = await fetch(`http://127.0.0.1:${port}/api/config`, {
     headers: { Cookie: cookie }
   });
