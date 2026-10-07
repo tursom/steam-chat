@@ -1,6 +1,6 @@
 # Steam Chat Android
 
-原生 Android 客户端，使用 Kotlin、Jetpack Compose 和本地 SQLite 缓存，支持手机、横屏平板和分屏窗口。手机目标设备为荣耀 WIN RT（MagicOS 10 / Android 16），最低支持 Android 8。不是 WebView，也不包含原型中的模拟账户或通知。
+原生 Android 客户端，主界面使用 Kotlin、Jetpack Compose 和本地 SQLite 缓存，支持手机、横屏平板和分屏窗口。手机目标设备为荣耀 WIN RT（MagicOS 10 / Android 16），最低支持 Android 8。视频解析按需使用系统网页组件，实际播放使用原生 Media3 播放器。
 
 ## 首次使用
 
@@ -53,6 +53,36 @@
 发送完整的 `【标题-哔哩哔哩】 https://b23.tv/…` 分享文本时，App 提取短链接，解析跳转并将 BV 视频地址转换为 `https://www.bilibili.com/video/av数字` 后发送，去掉标题包装与分享跟踪参数。单独的 B站短链、BV/av 视频链接也会规范化；分P链接保留有效的 `p` 参数（第1P省略）。附有额外说明的普通文字保持原样。
 
 短链解析使用不携带聊天登录凭据的独立 HTTPS 请求，最多4次跳转、总超时10秒；解析时不占用消息同步/用户操作锁。成功后聊天预览与实际发送内容均为 av 链接。解析失败时不发送原文，保留失败消息供手动重试；退出登录或切换账户会丢弃过时结果。已完成解析、但发送结果不确定的消息，重试继续使用已解析的 av 地址，并保留重复发送提示。
+
+## 0.2.3 抖音官网解析接续
+
+静态分享页没有视频信息时，播放弹层继续从原始 `www.douyin.com/video/<ID>` 官网入口访问。系统 WebView 正常加载官网脚本后，仅读取网页已提供、且与当前链接 ID 匹配的视频元数据；得到地址即销毁网页，交给 Media3 原生播放器。解析只在点击播放后进行，浏览器阶段限时 20 秒；关闭、离开会话或超时后清理网页，后台暂停。
+
+网页导航限制在同一视频的官方地址，屏蔽网页自动唤起其他 App 的尝试。禁用本地文件/内容访问、混合 HTTP 内容、页面缓存和自动播放，不注入 Android JavaScript 接口，不读取网页 Cookie 或聊天凭据。只使用官网正常公开访问流程，不处理登录或验证码；网站仍不提供视频信息时保留明确失败、重试和打开原链接。
+
+示例 `7687575973616905914` 已在全新的无登录 Chromium 上下文中用 App 的实际元数据读取脚本验证，并用原生播放器相同的请求头取得 `206 video/mp4`；流检测为 H.264/AAC、720×1280。Android WebView 的真实设备兼容性仍需安装验证。链接相同、显示时间相同到分钟的两条消息仍保留各自身份，不能据此推断重复同步或删除其中一条。
+
+默认 `./gradlew build` 已通过：debug/release 各 242 项测试，lint 0 错误；release APK 约 3.75MiB，沿用原签名并通过对齐校验。新增官网接续测试覆盖元数据匹配、受限导航、自动唤起 App 的屏蔽、关闭后的迟到回调、生命周期暂停和超时。
+
+## 0.2.2 安装包精简
+
+个人安装改为导出 release 包，启用 R8 代码精简和资源精简，去掉未使用的图标、开发工具和依赖代码，减少安装时需处理的 DEX。debug 包继续用于开发和调试。此次不改变聊天数据格式或后台接收策略。
+
+0.2.2 构建结果：APK 约 3.75MiB、DEX 约 3.97MiB、4,460 个类、1 个 DEX；此前 0.2.1 debug 包分别为 23.03MiB、65.22MiB、32,555 个类、7 个 DEX。默认 `./gradlew build` 已通过，debug/release 各 232 项测试，lint 0 错误；签名、ZIP/原生库对齐和 JNI/Worker 类名保留已核验。尚未测量实际设备的安装耗时。
+
+为与此前的个人侧载版本直接覆盖兼容，release 沿用本机既有 debug 签名证书，但关闭可调试标志；换构建类型不会清空登录和缓存。分发前核验 APK 证书与旧版相同，持续升级需保留此证书。这个选择面向当前个人安装流程，独立的正式发布密钥应另行配置。
+
+精简可以减少安装处理量，但无法单凭包体确认某台设备的安装停滞原因。如果仍卡住，需区分系统“正在安装”、厂商安全检测和安装后首次打开，并记录设备/系统版本；有 ADB 时采集安装结果及 PackageInstaller/PackageManager 日志。不要用卸载清数据来代替覆盖安装诊断。
+
+如果等待发生在 Google Play Protect 扫描界面，应排查 Google Play 服务的联网和扫描流程。Google 对非 Play 来源、此前未扫描过的应用可能请求上传应用信息进行代码级评估；精简包和有效签名不能使应用免检，也不能保证缩短云端评估等待。普通 App 无法设置该扫描的超时时间。先确认 Google Play 商店和服务正常联网且已更新；仅凭扫描耗时不能判定 APK 签名错误或 App 启动阻塞。参见 [Google Play Protect 官方说明](https://support.google.com/googleplay/answer/2812853?hl=zh-Hans)及[非 Play 安装的实时保护](https://developers.google.com/android/play-protect/client-protections)。
+
+## 0.2.1 抖音视频播放
+
+聊天中的抖音视频地址（`www.douyin.com/video/<ID>`、官方分享页、`v.douyin.com` 短链接）显示“播放抖音视频”。点击后才解析官方公开分享页，并使用 Media3 原生播放器在 App 内播放，支持暂停、进度拖动和关闭。普通分享文案里的链接及 Steam `[url]` / `[og]` 链接也使用此入口；消息原文与发送内容保持不变。
+
+离开播放界面取消解析并释放播放器，进入后台暂停播放。播放地址只驻内存，重新打开或重试时重新解析，不把可能过期的 CDN 地址写入消息或数据库。公开解析和媒体播放使用独立的 HTTPS 客户端，不携带聊天 Cookie 或 Authorization；校验官方域名、跳转次数、时间及分享页大小。
+
+仅支持公开分享页实际提供播放信息的视频。抖音可能要求在其 App 内观看，或因权限、下架、平台限制而不提供视频地址；此时明确提示解析失败，可重试或打开原链接。无需抖音账号，也不接入第三方解析服务；不修改官方返回的播放地址以去除水印。
 
 ## 0.2.0 界面重设计
 
@@ -193,7 +223,7 @@ export ANDROID_HOME=/path/to/android-sdk
 ./gradlew :app:assembleDebug :app:testDebugUnitTest :app:lintDebug
 ```
 
-输出为 `app/build/outputs/apk/debug/steam-chat-<版本>-debug.apk`，例如 `steam-chat-0.1.11-debug.apk`；release 构建为 `app/build/outputs/apk/release/steam-chat-<版本>-release-unsigned.apk`。这是供个人测试安装的 debug 签名包。持续升级必须保留同一签名；正式长期使用应另行配置私有 release 签名，不能把签名密钥或密码提交到仓库。
+开发包位于 `app/build/outputs/apk/debug/steam-chat-<版本>-debug.apk`；个人安装优先使用已精简、签名的 `app/build/outputs/apk/release/steam-chat-<版本>-release.apk`。两者沿用本机既有 debug 签名证书，可相互覆盖；release 不含调试工具并关闭可调试标志。持续升级必须保留同一签名；正式长期发布应另行配置私有 release 签名，不能把签名密钥或密码提交到仓库。
 
 磁盘较小时可把 Gradle 缓存和输出移到外部目录：
 

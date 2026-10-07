@@ -4,6 +4,20 @@ import org.junit.Assert.*
 import org.junit.Test
 
 class SteamMessageParserTest {
+    @Test fun douyinShareTextKeepsItsProseAndProvidesAPlayableLink() {
+        val url = "https://v.douyin.com/abc123/"
+        val parts = SteamMessageParser.parse("看看这个视频 $url 复制此链接打开抖音")
+        assertEquals(listOf(MessagePart.Text("看看这个视频 "), MessagePart.Link(url, url), MessagePart.Text(" 复制此链接打开抖音")), parts)
+        assertTrue(io.github.steamchat.android.data.DouyinVideoResolver.supports((parts[1] as MessagePart.Link).url))
+    }
+    @Test fun douyinLinksInSteamMarkupReachTheSamePlaybackEntry() {
+        val url = "https://www.douyin.com/video/7687575973616905914"
+        for (markup in listOf("[url=$url]抖音视频[/url]", "[og url='$url' title='抖音视频']$url[/og]")) {
+            val link = SteamMessageParser.parse(markup).single() as MessagePart.Link
+            assertEquals(url, link.url)
+            assertTrue(io.github.steamchat.android.data.DouyinVideoResolver.supports(link.url))
+        }
+    }
     @Test fun rejectsDangerousLinksAndCredentialUrls() {
         listOf("javascript:alert(1)", "data:text/html,test", "file:///etc/passwd", "intent://host", "//evil.test/a", "https://user:pass@example.com/a", "https://example.com/\nattack", "https://example.com\\@evil.test").forEach { assertNull(it, safeWebUrl(it)) }
         assertEquals("https://example.com/a?q=1", safeWebUrl("https://example.com/a?q=1"))

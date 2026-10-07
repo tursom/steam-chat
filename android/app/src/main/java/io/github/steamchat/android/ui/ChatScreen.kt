@@ -51,6 +51,7 @@ import androidx.compose.ui.window.DialogProperties
 import io.github.steamchat.android.AppState
 import io.github.steamchat.android.ChatRepository
 import io.github.steamchat.android.Message
+import io.github.steamchat.android.data.DouyinVideoResolver
 import java.time.Duration
 import java.time.Instant
 
@@ -363,7 +364,8 @@ private fun MessageContent(part: MessagePart, loader: UiImageLoader, viewImage: 
         is MessagePart.Image -> MediaImage(part.source, loader, part.label,
             (if (part.small) Modifier.size(48.dp) else Modifier.widthIn(max = 280.dp).fillMaxWidth().height(180.dp))
                 .clip(RoundedCornerShape(if (part.small) 6.dp else 14.dp)).clickable { viewImage(part.source) })
-        is MessagePart.Link -> Column(Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(12.dp)).background(LocalContentColor.current.copy(alpha = .06f))) {
+        is MessagePart.Link -> if (DouyinVideoResolver.supports(part.url)) DouyinVideoCard(part, loader)
+        else Column(Modifier.widthIn(max = 300.dp).clip(RoundedCornerShape(12.dp)).background(LocalContentColor.current.copy(alpha = .06f))) {
             if (part.image.isNotBlank()) MediaImage(part.image, loader, "链接预览", Modifier.fillMaxWidth().height(140.dp).clickable { viewImage(part.image) })
             Column(Modifier.fillMaxWidth().clickable { openWeb(context, part.url) }.heightIn(min = 48.dp).padding(horizontal = 10.dp, vertical = 8.dp),
                 verticalArrangement = Arrangement.spacedBy(2.dp)) {

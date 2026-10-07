@@ -11,13 +11,16 @@ android {
         applicationId = "io.github.steamchat.android"
         minSdk = 26
         targetSdk = 36
-        versionCode = 15
-        versionName = "0.2.0"
+        versionCode = 18
+        versionName = "0.2.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
     buildTypes {
         release {
-            isMinifyEnabled = false
+            isMinifyEnabled = true
+            isShrinkResources = true
+            // Personal sideloads retain the existing certificate for in-place updates.
+            signingConfig = signingConfigs.getByName("debug")
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
         }
     }
@@ -41,7 +44,7 @@ android {
     lint { abortOnError = true }
 }
 
-// Recognizable APK names, e.g. steam-chat-0.1.11-debug.apk / steam-chat-0.1.11-release-unsigned.apk.
+// Recognizable APK names, e.g. steam-chat-0.2.2-debug.apk / steam-chat-0.2.2-release.apk.
 base { archivesName.set("steam-chat-${android.defaultConfig.versionName}") }
 
 dependencies {
@@ -61,6 +64,9 @@ dependencies {
     implementation("com.github.penfeizhou.android.animation:gif:3.0.5")
     implementation("com.github.penfeizhou.android.animation:awebp:3.0.5")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
+    implementation("androidx.media3:media3-exoplayer:1.6.1")
+    implementation("androidx.media3:media3-ui:1.6.1")
+    implementation("androidx.media3:media3-datasource-okhttp:1.6.1")
     implementation("androidx.work:work-runtime:2.10.5")
     debugImplementation("androidx.compose.ui:ui-tooling")
     testImplementation(platform("androidx.compose:compose-bom:2025.05.01"))
