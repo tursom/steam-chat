@@ -2816,7 +2816,6 @@ function renderMessage(item: MessageItem) {
   const sentAt = new Date(String(item.sentAt || item.date || '').replace(' ', 'T')).getTime();
   if (Number.isFinite(sentAt)) row.dataset.sentAt = String(sentAt);
   const bubble = create('div', 'bubble');
-  if (Number.isFinite(sentAt)) bubble.title = new Date(sentAt).toLocaleString('zh-CN');
   const meta = create('div', 'meta');
   meta.append(create('span', '', item.name || (item.echo ? '我' : item.id)), create('span', '', formatTime(item.sentAt || item.date)));
   if (item.eventId && item.echo) {

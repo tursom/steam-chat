@@ -1591,7 +1591,7 @@ dl.friend-facts {
   color: var(--out-meta);
 }
 
-/* Continued rows keep their meta for assistive tech; the bubble title shows the time. */
+/* Continued rows keep their meta for assistive tech; .msg-hover-time shows the time on hover. */
 .msg-row[data-continued]:not([data-send-state="unknown"]) .meta {
   position: absolute;
   width: 1px;
