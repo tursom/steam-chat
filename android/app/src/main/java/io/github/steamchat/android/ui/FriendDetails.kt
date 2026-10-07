@@ -24,7 +24,13 @@ import androidx.compose.ui.input.key.*
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.sp
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
@@ -36,30 +42,42 @@ internal fun FriendDetails(
     modifier: Modifier = Modifier, close: () -> Unit
 ) {
     val clipboard = LocalClipboardManager.current
-    Surface(modifier) {
+    val chat = chatColors
+    val playing = friend?.gameName?.isNotBlank() == true
+    Surface(modifier, color = chat.bg) {
         Column(Modifier.fillMaxSize()) {
-            Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
-                Text("好友资料", Modifier.weight(1f), style = MaterialTheme.typography.titleMedium)
+            Row(Modifier.fillMaxWidth().height(64.dp).padding(start = 20.dp, end = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("好友资料", Modifier.weight(1f), fontSize = 16.sp, fontWeight = FontWeight.Bold)
                 ToolButton(Icons.Default.Close, "关闭好友资料", onClick = close)
             }
-            HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
-            Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp),
-                verticalArrangement = Arrangement.spacedBy(16.dp)) {
-                Avatar(friend?.name ?: name, friend?.avatar?.takeIf { it.isNotBlank() } ?: avatar, loader, friend?.online == true, 64)
-                Text(friend?.name?.ifBlank { name } ?: name, style = MaterialTheme.typography.titleLarge)
-                Text(when (friend?.online) { true -> "在线"; false -> "离线"; null -> "状态未知" },
-                    color = MaterialTheme.colorScheme.onSurfaceVariant)
-                friend?.gameName?.takeIf { it.isNotBlank() }?.let { game ->
-                    Text("正在玩", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                    Text(game, style = MaterialTheme.typography.bodyLarge)
+            HorizontalDivider(color = chat.line)
+            Column(Modifier.weight(1f).fillMaxWidth().verticalScroll(rememberScrollState()).padding(vertical = 24.dp),
+                horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Avatar(friend?.name ?: name, friend?.avatar?.takeIf { it.isNotBlank() } ?: avatar, loader, friend?.online == true, 96, playing)
+                Spacer(Modifier.height(4.dp))
+                Text(friend?.name?.ifBlank { name } ?: name, fontSize = 20.sp, fontWeight = FontWeight.Bold, textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 20.dp))
+                val (status, fg, bg) = when {
+                    playing -> Triple("正在玩 ${friend?.gameName}", chat.game, chat.gameSoft)
+                    friend?.online == true -> Triple("在线", chat.accentText, chat.accentSoft)
+                    friend?.online == false -> Triple("离线", chat.muted, chat.input)
+                    else -> Triple("状态未知", chat.muted, chat.input)
                 }
-                HorizontalDivider(color = MaterialTheme.colorScheme.surfaceVariant)
-                Text("Steam ID", style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
-                SelectionContainer { Text(peer, style = MaterialTheme.typography.bodyMedium) }
-                TextButton(onClick = { clipboard.setText(AnnotatedString(peer)) }) {
-                    Icon(Icons.Default.ContentCopy, null, Modifier.size(18.dp))
-                    Spacer(Modifier.width(8.dp))
-                    Text("复制 Steam ID", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text(status, Modifier.padding(horizontal = 20.dp).clip(RoundedCornerShape(14.dp)).background(bg).padding(horizontal = 12.dp, vertical = 5.dp),
+                    color = fg, fontSize = 13.sp, fontWeight = FontWeight.Medium, textAlign = TextAlign.Center)
+                Spacer(Modifier.height(12.dp))
+                Column(Modifier.padding(horizontal = 16.dp).fillMaxWidth().clip(RoundedCornerShape(16.dp)).background(chat.input).padding(horizontal = 16.dp, vertical = 4.dp)) {
+                    Column(Modifier.padding(vertical = 10.dp), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                        Text("Steam ID", fontSize = 12.sp, color = chat.muted)
+                        SelectionContainer { Text(peer, fontSize = 14.sp, fontFamily = FontFamily.Monospace) }
+                    }
+                    HorizontalDivider(color = chat.line)
+                    TextButton(onClick = { clipboard.setText(AnnotatedString(peer)) }, modifier = Modifier.fillMaxWidth().heightIn(min = 48.dp),
+                        contentPadding = PaddingValues(0.dp)) {
+                        Icon(Icons.Default.ContentCopy, null, Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("复制 Steam ID", Modifier.weight(1f), maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
                 }
             }
         }

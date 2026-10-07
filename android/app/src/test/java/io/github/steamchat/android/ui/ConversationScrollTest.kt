@@ -70,7 +70,7 @@ class ConversationScrollTest {
         val rows = messages().dropLast(1) + Message("long", "peer", "Friend", (0 until 100).joinToString("\n") { "Long line $it" }, false, time)
         show(mutableStateOf(state(rows = rows)))
         compose.onNodeWithTag("chat-end").assertIsDisplayed()
-        compose.onNodeWithText(displayTime(time)).assertIsDisplayed()
+        compose.onNodeWithText(bubbleTime(time)).assertIsDisplayed()
     }
 
     @Test fun sendingLocallyReturnsToNewestMessageFromHistory() {

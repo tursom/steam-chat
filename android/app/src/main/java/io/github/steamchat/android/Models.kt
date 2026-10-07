@@ -8,6 +8,8 @@ enum class SessionRestoration { NONE, LOADING, RETRY }
 
 enum class RestSyncStatus { IDLE, SYNCING, READY, FAILED }
 
+enum class ThemeMode { SYSTEM, LIGHT, DARK }
+
 data class AppState(
     val restoration: SessionRestoration = SessionRestoration.NONE,
     val restSyncText: String = "REST 等待同步",
@@ -21,7 +23,8 @@ data class AppState(
     val selectedPeer: String = "", val selectedName: String = "",
     // Distinguish repeated explicit selections when StateFlow coalesces the cleared state.
     val selectionRequest: Long = 0L, val backgroundEnabled: Boolean = true,
-    val notificationPreview: Boolean = false, val notificationsEnabled: Boolean = true
+    val notificationPreview: Boolean = false, val notificationsEnabled: Boolean = true,
+    val themeMode: ThemeMode = ThemeMode.SYSTEM
 ) {
     val canSend: Boolean get() = loggedIn && accessAllowed && steamOnline
 }

@@ -45,7 +45,8 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     private val cache = ChatCache(context)
     private val mediaCache = MediaDiskCache(java.io.File(context.cacheDir, "media-v1"))
     private val settings = context.getSharedPreferences("chat-settings", Context.MODE_PRIVATE)
-    private val mutable = MutableStateFlow(AppState(restoration = SessionRestoration.LOADING, server = settings.getString("server", "").orEmpty(), backgroundEnabled = settings.getBoolean("background", true), notificationPreview = settings.getBoolean("preview", false), notificationsEnabled = settings.getBoolean("notifications", true)))
+    private val mutable = MutableStateFlow(AppState(restoration = SessionRestoration.LOADING, server = settings.getString("server", "").orEmpty(), backgroundEnabled = settings.getBoolean("background", true), notificationPreview = settings.getBoolean("preview", false), notificationsEnabled = settings.getBoolean("notifications", true),
+        themeMode = runCatching { ThemeMode.valueOf(settings.getString("theme", null) ?: "SYSTEM") }.getOrDefault(ThemeMode.SYSTEM)))
     val state: StateFlow<AppState> = mutable.asStateFlow()
     private val client = httpClient ?: OkHttpClient.Builder().followRedirects(false).followSslRedirects(false).retryOnConnectionFailure(false)
         .connectTimeout(15, TimeUnit.SECONDS).readTimeout(30, TimeUnit.SECONDS).callTimeout(45, TimeUnit.SECONDS).pingInterval(30, TimeUnit.SECONDS).build()
@@ -238,7 +239,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         generation++
         client.dispatcher.cancelAll()
         bilibiliShare.cancel()
-        mutable.update { AppState(server = it.server, backgroundEnabled = it.backgroundEnabled, notificationPreview = it.notificationPreview, notificationsEnabled = it.notificationsEnabled) }
+        mutable.update { AppState(server = it.server, backgroundEnabled = it.backgroundEnabled, notificationPreview = it.notificationPreview, notificationsEnabled = it.notificationsEnabled, themeMode = it.themeMode) }
         scope.launch {
             gate.withLock { endSession("") }
             if (oldBase != null && oldCookie.isNotEmpty()) runCatching {
@@ -264,7 +265,7 @@ class ChatRepository(private val context: Context, private val socketFactory: We
         mediaCache.clear()
         cache.clearAll()
         cacheScope = ""; accountSteamId = ""; userId = ""; outgoing.clear()
-        mutable.update { AppState(server = it.server, error = error, backgroundEnabled = it.backgroundEnabled, notificationPreview = it.notificationPreview, notificationsEnabled = it.notificationsEnabled) }
+        mutable.update { AppState(server = it.server, error = error, backgroundEnabled = it.backgroundEnabled, notificationPreview = it.notificationPreview, notificationsEnabled = it.notificationsEnabled, themeMode = it.themeMode) }
         context.stopService(Intent(context, ConnectionService::class.java))
         BackgroundWork.cancel(context)
         syncWake.drop(); connectWake.drop()
@@ -845,6 +846,9 @@ class ChatRepository(private val context: Context, private val socketFactory: We
     fun setNotificationsEnabled(enabled: Boolean) {
         settings.edit().putBoolean("notifications", enabled).apply(); mutable.update { it.copy(notificationsEnabled = enabled) }
         if (!enabled) ChatNotifications.clearMessages(context)
+    }
+    fun setThemeMode(mode: ThemeMode) {
+        settings.edit().putString("theme", mode.name).apply(); mutable.update { it.copy(themeMode = mode) }
     }
     fun onForegroundChanged(value: Boolean) {
         val returning = value && !foreground

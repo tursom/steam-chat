@@ -78,7 +78,7 @@ class NativeScreenTest {
         screenshot("android-notification-settings")
     }
 
-    @Test fun syncStatusUsesOneHeaderIconAndDetailsStayCollapsed() {
+    @Test fun syncStatusUsesOneHeaderPillAndDetailsStayCollapsed() {
         val repository = ChatRepository(RuntimeEnvironment.getApplication())
         val loader = UiImageLoader(repository)
         val state = mutableStateOf(AppState(loggedIn = true, accessAllowed = true, connected = true,
@@ -87,15 +87,18 @@ class NativeScreenTest {
             conversations = listOf(Conversation("peer", "好友", preview = "最近一条消息"))))
         compose.setContent { SteamChatTheme { ContactScreen(state.value, repository, loader, false, {}, {}) } }
         compose.onNodeWithText("REST 同步完成").assertDoesNotExist()
-        compose.onNodeWithContentDescription("刷新").assertIsDisplayed()
-        val title = compose.onNodeWithText("Steam Chat").fetchSemanticsNode().boundsInRoot
-        val icon = compose.onNodeWithTag("sync-status").fetchSemanticsNode().boundsInRoot
-        org.junit.Assert.assertTrue(icon.left >= title.right)
-        org.junit.Assert.assertEquals(title.center.y, icon.center.y, 1f)
+        // The pill sits on the title row and replaces the old standalone refresh button.
+        val title = compose.onNodeWithText("消息").fetchSemanticsNode().boundsInRoot
+        val pill = compose.onNodeWithTag("sync-status").fetchSemanticsNode().boundsInRoot
+        org.junit.Assert.assertTrue(pill.left >= title.right)
+        org.junit.Assert.assertTrue(pill.top < title.bottom && pill.bottom > title.top)
+        compose.onNodeWithText("已连接").assertIsDisplayed()
+        compose.onNodeWithContentDescription("刷新").assertDoesNotExist()
         screenshot("android-header-sync")
         compose.onNodeWithTag("sync-status").performClick()
         compose.onNodeWithText("REST 同步完成").assertIsDisplayed()
         compose.onNodeWithText("实时通道已连接").assertIsDisplayed()
+        compose.onNodeWithText("刷新").assertIsDisplayed()
         compose.onNodeWithText("关闭").performClick()
         compose.runOnIdle { state.value = state.value.copy(connected = false) }
         compose.onNodeWithContentDescription("同步状态：已同步，使用 REST 接收消息").assertIsDisplayed()

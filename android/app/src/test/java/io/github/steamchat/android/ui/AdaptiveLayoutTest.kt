@@ -178,7 +178,7 @@ class AdaptiveLayoutTest {
         compose.onNodeWithTag("nav-friends").performClick()
         settle()
         compose.onNodeWithTag("nav-friends").assertIsSelected()
-        compose.onNodeWithText("2 位在线 · 2 位好友").assertIsDisplayed()
+        compose.onNodeWithText("2 人在线").assertIsDisplayed()
         select(first)
         compose.onNodeWithTag("conversation-pane").assertDoesNotExist()
         compose.onNodeWithTag("navigation-rail").assertIsDisplayed()
