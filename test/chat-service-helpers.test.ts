@@ -34,6 +34,30 @@ test('listFriends normalizes persona fields and sorts online friends by name', a
   assert.equal(friends[1].gameName, 'Playing Z');
 });
 
+test('listFriends exposes nickname, Steam game, rich presence and last online time', async () => {
+  const seen = new Date('2026-10-06T12:00:00.000Z');
+  const friends = await listFriends({
+    myFriends: { playing: 3, away: 3, unknown: 3 },
+    myNicknames: { playing: '老张', away: 42 },
+    users: {
+      playing: { player_name: 'Zhang', persona_state: 1, game_played_app_id: 730, rich_presence_string: 'Competitive - Dust II', last_seen_online: seen },
+      away: { player_name: 'Away', persona_state: 0, game_played_app_id: 0, last_seen_online: new Date(0), last_logoff: 1759752000 },
+      unknown: { player_name: 'Unknown', persona_state: 0 }
+    }
+  });
+  const byId = (id: string) => friends.find((friend: { id: string }) => friend.id === id);
+  assert.equal(byId('playing').nickname, '老张');
+  assert.equal(byId('playing').gameAppId, 730);
+  assert.equal(byId('playing').richPresence, 'Competitive - Dust II');
+  assert.equal(byId('playing').lastOnline, seen.toISOString());
+  // Non-string nicknames and Steam's zero timestamps are ignored; logoff seconds are the fallback.
+  assert.equal(byId('away').nickname, '');
+  assert.equal(byId('away').gameAppId, 0);
+  assert.equal(byId('away').lastOnline, new Date(1759752000 * 1000).toISOString());
+  assert.equal(byId('unknown').lastOnline, '');
+  assert.equal(byId('unknown').richPresence, '');
+});
+
 test('listGroups accepts array and object group shapes', async () => {
   const fromArray = await listGroups({
     myGroups: [

@@ -783,6 +783,50 @@ test('friend details follow conversation selection, clear on permission loss and
   assert.equal(view.findById('friendDetailsToggle')?.disabled, true);
 });
 
+test('friend details show nickname, Steam game art, in-game status and copy the SteamID', async () => {
+  const api = loadWebTestApi();
+  const id = '76561198000000001';
+  api.setChatAvailability(true, true, id);
+  api.setChatListState([{ id, name: 'AStar' }], [{ id, name: 'AStar', nickname: '阿星', online: true, personaState: 1,
+    gameName: '', gameAppId: 730, richPresence: 'Competitive - Dust II', avatar: 'https://example.com/a.png' }], [], 'recent', '', id);
+  const view = api.mountChatView();
+  api.setFriendDetailsOpen(true);
+  const details = view.findById('friendDetails')!;
+  assert.match(details.textContent, /好友资料/);
+  assert.equal(details.findByTag('h3')!.textContent, 'AStar');
+  assert.match(details.findByClass('friend-persona')!.textContent, /备注：阿星/);
+  assert.equal(details.findByClass('friend-profile')!.dataset.presence, 'game');
+  assert.match(details.findByClass('friend-status')!.textContent, /正在游戏中/);
+  // A Steam game without a reported name still gets its store art and link.
+  assert.equal(details.findByClass('friend-game-art')!.src,
+    `/proxy/image?url=${encodeURIComponent('https://cdn.cloudflare.steamstatic.com/steam/apps/730/header.jpg')}`);
+  assert.match(details.findByClass('friend-game')!.textContent, /Competitive - Dust II/);
+  assert.equal(details.findByClass('friend-game-store')!.href, 'https://store.steampowered.com/app/730/');
+  assert.equal(details.findByTag('a')!.href, `https://steamcommunity.com/profiles/${id}`);
+  await details.findByClass('friend-copy-btn')!.dispatch('click');
+  assert.deepEqual(api.clipboardWrites, [id]);
+});
+
+test('friend details show when an offline friend was last online, and groups link to the group page', () => {
+  const api = loadWebTestApi();
+  const id = '76561198000000001';
+  const group = '103582791429521412';
+  const lastOnline = new Date(Date.now() - 3 * 3600000).toISOString();
+  api.setChatAvailability(true, true, id);
+  api.setChatListState([], [{ id, name: 'Kevin', online: false, personaState: 0, lastOnline }], [{ id: group, name: 'Club' }], 'friends', '', id);
+  const view = api.mountChatView();
+  api.setFriendDetailsOpen(true);
+  const details = view.findById('friendDetails')!;
+  assert.equal(details.findByClass('friend-profile')!.dataset.presence, 'offline');
+  assert.equal(details.findByClass('friend-status')!.textContent, '3 小时前在线');
+  assert.match(details.textContent, /最后在线/);
+  assert.equal(details.findByClass('friend-game'), null);
+  api.openConversation(group, 'Club');
+  assert.match(details.textContent, /群组资料/);
+  assert.equal(details.findByTag('a')!.href, `https://steamcommunity.com/gid/${group}`);
+  assert.doesNotMatch(details.textContent, /最后在线/);
+});
+
 test('friend details omit profile links for invalid identifiers and close on returning to the list', () => {
   const api = loadWebTestApi();
   api.setChatAvailability(true, true, 'not-a-steamid');

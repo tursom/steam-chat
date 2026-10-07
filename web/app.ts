@@ -101,6 +101,10 @@ type ListEntry = Record<string, unknown> & {
   online?: boolean;
   clanId?: string;
   clanid?: string;
+  nickname?: string;
+  gameAppId?: number;
+  richPresence?: string;
+  lastOnline?: string;
 };
 
 type MessageItem = ListEntry & {
@@ -1824,6 +1828,7 @@ function friendStatusLabel(item: ListEntry | null) {
   if (!steamOnline()) return `Steam ${steamLabel()}`;
   if (!steamAccessAllowed()) return '无账户访问权限';
   if (item?.gameName) return `正在玩 ${item.gameName}`;
+  if (item?.gameAppId) return '正在游戏中';
   const personaLabels: Record<number, string> = { 0: '离线', 1: '在线', 2: '忙碌', 3: '离开', 4: '打盹', 5: '想交易', 6: '想玩游戏' };
   if (typeof item?.personaState === 'number' && personaLabels[item.personaState]) return personaLabels[item.personaState];
   if (typeof item?.online !== 'boolean') return '状态未知';
@@ -1854,10 +1859,47 @@ function syncFriendDetails() {
   if (toggle) toggle.setAttribute('aria-expanded', String(open));
 }
 
+type PresenceTone = 'game' | 'online' | 'away' | 'offline' | 'unknown';
+
+function friendPresenceTone(item: ListEntry | null): PresenceTone {
+  if (!steamOnline() || !item) return 'unknown';
+  if (item.gameName || item.gameAppId) return 'game';
+  // EPersonaState: 2 busy, 3 away, 4 snooze.
+  if (typeof item.personaState === 'number' && [2, 3, 4].includes(item.personaState)) return 'away';
+  if (typeof item.online !== 'boolean') return 'unknown';
+  return item.online ? 'online' : 'offline';
+}
+
+function relativeTime(value: unknown): string {
+  const time = Date.parse(String(value || ''));
+  if (!Number.isFinite(time)) return '';
+  const minutes = Math.floor((Date.now() - time) / 60000);
+  if (minutes < 1) return '刚刚';
+  if (minutes < 60) return `${minutes} 分钟前`;
+  if (minutes < 24 * 60) return `${Math.floor(minutes / 60)} 小时前`;
+  if (minutes < 30 * 24 * 60) return `${Math.floor(minutes / (24 * 60))} 天前`;
+  return new Date(time).toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
+}
+
+function copyButton(label: string, value: string) {
+  const button = chatIconButton('copy', label, 'friend-copy-btn');
+  button.addEventListener('click', async () => {
+    try {
+      await navigator.clipboard.writeText(value);
+      setFeedback(`已复制${label.replace(/^复制/, '')}`, 'ok');
+    } catch (_) {
+      setFeedback('复制失败，请手动选择文本复制', 'error');
+    }
+  });
+  return button;
+}
+
 function renderFriendDetails(container: HTMLElement) {
   clear(container);
+  const isGroup = Boolean(state.activeId) && state.groups.some((entry) => entry.id === state.activeId);
+  const isFriend = Boolean(state.activeId) && state.friends.some((entry) => entry.id === state.activeId);
   const head = create('header', 'friend-details-head');
-  head.append(create('h2', '', '会话资料'));
+  head.append(create('h2', '', isGroup ? '群组资料' : isFriend ? '好友资料' : '会话资料'));
   const close = chatIconButton('x', '关闭会话资料', 'icon-btn');
   close.id = 'friendDetailsClose';
   close.addEventListener('click', () => setFriendDetailsOpen(false));
@@ -1866,21 +1908,64 @@ function renderFriendDetails(container: HTMLElement) {
   if (!state.activeId || !steamAccessAllowed()) return;
   const item = activeChatEntry();
   const name = item?.name || state.activeName || state.activeId;
-  const isGroup = state.groups.some((entry) => entry.id === state.activeId);
-  const profile = create('div', 'friend-profile');
-  profile.append(renderAvatar(item, name, 'friend-avatar'), create('h3', '', name), create('p', 'muted', friendStatusLabel(item)));
-  const facts = create('dl', 'friend-facts');
-  const fact = (label: string, value: string) => facts.append(create('dt', '', label), create('dd', '', value));
-  fact('SteamID', state.activeId);
-  fact('关系', isGroup ? '群组' : state.friends.some((entry) => entry.id === state.activeId) ? 'Steam 好友' : '会话联系人');
-  if (item?.gameName && steamOnline()) fact('正在游戏', item.gameName);
-  if (state.steam.activeAccount) fact('当前账户', state.steam.activeAccount.label || state.steam.activeAccount.steamId);
-  container.append(profile, facts);
-  if (/^\d{17}$/.test(state.activeId)) {
-    const profileLink = externalLink('friend-profile-link', `https://steamcommunity.com/${isGroup ? 'gid' : 'profiles'}/${state.activeId}`, 'Steam 主页');
+  const nickname = !isGroup && item?.nickname && item.nickname !== name ? item.nickname : '';
+  const tone: PresenceTone = isGroup ? 'unknown' : friendPresenceTone(item);
+
+  // Identity: avatar with presence ring, the same name the list shows, the account's nickname and status.
+  const profile = create('section', 'friend-profile');
+  profile.dataset.presence = tone;
+  const avatar = renderAvatar(item, name, 'friend-avatar');
+  avatar.querySelector('.online-dot')?.remove();
+  profile.append(avatar, create('h3', '', name));
+  if (nickname) profile.append(create('p', 'friend-persona', `备注：${nickname}`));
+  let status = friendStatusLabel(item);
+  if (tone === 'offline' && item?.lastOnline) status = `${relativeTime(item.lastOnline)}在线`;
+  profile.append(create('span', 'friend-status', status));
+  if (/^\d{17,18}$/.test(state.activeId)) {
+    const profileLink = externalLink('friend-profile-link', `https://steamcommunity.com/${isGroup ? 'gid' : 'profiles'}/${state.activeId}`, isGroup ? '群组主页' : 'Steam 主页');
     profileLink.append(chatIcon('external-link'));
-    container.append(profileLink);
+    profile.append(profileLink);
   }
+  container.append(profile);
+
+  // Current game: Steam store art when the app is known, otherwise the reported name.
+  if (tone === 'game' && item) {
+    const game = create('section', 'friend-game');
+    if (item.gameAppId) {
+      const art = document.createElement('img');
+      art.className = 'friend-game-art';
+      art.alt = '';
+      art.loading = 'lazy';
+      art.src = proxiedImageUrl(`https://cdn.cloudflare.steamstatic.com/steam/apps/${item.gameAppId}/header.jpg`);
+      art.onerror = () => art.remove();
+      game.append(art);
+    }
+    const copy = create('div', 'friend-game-copy');
+    copy.append(create('span', 'friend-game-label', '正在玩'), create('strong', '', item.gameName || 'Steam 游戏'));
+    if (item.richPresence) copy.append(create('span', 'friend-game-presence', item.richPresence));
+    if (item.gameAppId) {
+      const store = externalLink('friend-game-store', `https://store.steampowered.com/app/${item.gameAppId}/`, '商店页面');
+      store.append(chatIcon('external-link'));
+      copy.append(store);
+    }
+    game.append(copy);
+    container.append(game);
+  }
+
+  const facts = create('dl', 'friend-facts');
+  const fact = (label: string, value: string, action?: HTMLElement) => {
+    const row = create('div', 'friend-fact');
+    const detail = create('dd', '', value);
+    row.append(create('dt', '', label), detail);
+    if (action) row.append(action);
+    facts.append(row);
+    return detail;
+  };
+  fact('SteamID', state.activeId, copyButton('复制 SteamID', state.activeId)).className = 'is-mono';
+  fact('关系', isGroup ? 'Steam 社区群组' : isFriend ? 'Steam 好友' : '会话联系人');
+  if (tone === 'offline' && item?.lastOnline) fact('最后在线', new Date(item.lastOnline).toLocaleString('zh-CN', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
+  if (state.steam.activeAccount) fact('当前账户', state.steam.activeAccount.label || state.steam.activeAccount.steamId);
+  container.append(facts);
 }
 
 function renderThreadHeader(container: HTMLElement) {

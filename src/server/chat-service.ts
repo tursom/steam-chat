@@ -80,6 +80,7 @@ type SteamUserLike = ReactionClient & {
   off?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
   removeListener?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
   myFriends?: UnknownRecord;
+  myNicknames?: UnknownRecord;
   users?: Record<string, Persona>;
   myGroups?: unknown;
   groups?: unknown;
@@ -220,7 +221,21 @@ type FriendSummary = {
   personaState: unknown;
   online: boolean;
   gameName: string;
+  /** Nickname the logged-in account set for this friend. */
+  nickname: string;
+  /** Steam app currently played; 0 when not in a Steam game. */
+  gameAppId: number;
+  /** In-game status text published by the game, e.g. map and score. */
+  richPresence: string;
+  /** ISO time the friend was last seen online, or '' when Steam has not reported it. */
+  lastOnline: string;
 };
+
+function personaDate(value: unknown): string {
+  const time = value instanceof Date ? value.getTime() : typeof value === 'number' ? value * 1000 : NaN;
+  // Steam reports 0 (1970) for unknown times.
+  return Number.isFinite(time) && time > 0 ? new Date(time).toISOString() : '';
+}
 
 type GroupSummary = {
   id: string;
@@ -1685,16 +1700,22 @@ async function listFriends(steamUser?: SteamUserLike): Promise<FriendSummary[]> 
   const friends = isRecord(steamUser.myFriends) ? steamUser.myFriends : {};
   const ids = Object.keys(friends);
   const users = steamUser.users || {};
+  const nicknames = isRecord(steamUser.myNicknames) ? steamUser.myNicknames : {};
   return ids.map((id) => {
     const persona = users[id] || {};
     const state = persona.persona_state ?? persona.personaState ?? friends[id];
+    const appId = Number(persona.game_played_app_id);
     return {
       id,
       name: persona.player_name || persona.personaName || persona.name || id,
       avatar: persona.avatar_url_full || persona.avatar_url_medium || persona.avatar_url_icon || persona.avatar || '',
       personaState: state,
       online: Number(state || 0) > 0,
-      gameName: persona.game_name || persona.gameName || ''
+      gameName: persona.game_name || persona.gameName || '',
+      nickname: typeof nicknames[id] === 'string' ? nicknames[id] as string : '',
+      gameAppId: Number.isSafeInteger(appId) && appId > 0 ? appId : 0,
+      richPresence: typeof persona.rich_presence_string === 'string' ? persona.rich_presence_string : '',
+      lastOnline: personaDate(persona.last_seen_online) || personaDate(persona.last_logoff)
     };
   }).sort((left, right) => Number(right.online) - Number(left.online) || left.name.localeCompare(right.name));
 }

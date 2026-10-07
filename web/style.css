@@ -17,6 +17,8 @@
   --brand-text: #0f5a46;
   --selected: #e7f3ec;
   --online: #1fa477;
+  --game: #2f6fd0;
+  --game-soft: #e3ecfa;
   --ok: #1a7a55;
   --ok-soft: #ddf1e7;
   --warn: #7a5a1e;
@@ -52,6 +54,8 @@
     --brand-text: #9fe8cc;
     --selected: #1b2a25;
     --online: #4fd1a5;
+    --game: #7db3ff;
+    --game-soft: #1d2b40;
     --ok: #6fdcb5;
     --ok-soft: #1e3a31;
     --warn: #e9c987;
@@ -841,7 +845,7 @@ nav button.is-active {
 }
 
 .chat-layout[data-details-open="true"] {
-  grid-template-columns: 300px minmax(0, 1fr) 252px;
+  grid-template-columns: 300px minmax(0, 1fr) 280px;
 }
 
 .chat-lists,
@@ -1252,30 +1256,37 @@ nav button.is-active {
 
 .friend-details-head h2 {
   margin: 0;
-  color: var(--muted);
-  font-size: 13px;
-  font-weight: 500;
+  color: var(--text);
+  font-size: 14px;
+  font-weight: 600;
 }
 
 .friend-profile {
+  --ring: var(--line-strong);
   display: grid;
   justify-items: center;
-  gap: 10px;
-  padding: 28px 18px;
+  gap: 6px;
+  padding: 24px 20px 20px;
   text-align: center;
   overflow-wrap: anywhere;
 }
 
+.friend-profile[data-presence="game"] { --ring: var(--game); }
+.friend-profile[data-presence="online"] { --ring: var(--online); }
+.friend-profile[data-presence="away"] { --ring: var(--warn); }
+
 .friend-profile .friend-avatar {
   position: relative;
   display: grid;
-  width: 66px;
-  height: 66px;
-  border-radius: 8px;
+  width: 88px;
+  height: 88px;
+  margin-bottom: 8px;
+  border-radius: 14px;
   background: var(--brand-soft);
-  color: var(--brand);
+  box-shadow: 0 0 0 3px var(--surface-muted), 0 0 0 5px var(--ring);
+  color: var(--brand-text);
   overflow: hidden;
-  font-size: 26px;
+  font-size: 32px;
   font-weight: 700;
   place-items: center;
 }
@@ -1288,58 +1299,173 @@ nav button.is-active {
 
 .friend-profile h3 {
   max-width: 100%;
-  margin: 4px 0 0;
+  margin: 0;
   font-size: 18px;
+  font-weight: 650;
+  line-height: 1.3;
 }
 
-.friend-profile p {
+.friend-persona {
   max-width: 100%;
   margin: 0;
   color: var(--muted);
   font-size: 12px;
 }
 
-.friend-facts {
-  border-top: 1px solid var(--line);
-  padding: 20px;
+.friend-status {
+  max-width: 100%;
+  border-radius: 999px;
+  background: var(--soft);
+  color: var(--muted);
+  padding: 3px 10px;
+  font-size: 12px;
+  font-weight: 500;
 }
 
-.friend-facts dl,
-dl.friend-facts {
+.friend-profile[data-presence="game"] .friend-status { background: var(--game-soft); color: var(--game); }
+.friend-profile[data-presence="online"] .friend-status { background: var(--brand-soft); color: var(--brand-text); }
+.friend-profile[data-presence="away"] .friend-status { background: var(--warn-soft); color: var(--warn); }
+
+.friend-profile-link {
+  display: inline-flex;
+  min-height: 32px;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--text);
+  padding: 0 12px;
+  font-size: 13px;
+  text-decoration: none;
+}
+
+.friend-profile-link:hover {
+  border-color: var(--line-strong);
+  background: var(--soft);
+}
+
+.friend-profile-link .ui-icon,
+.friend-game-store .ui-icon {
+  width: 14px;
+  height: 14px;
+  flex-basis: 14px;
+}
+
+.friend-game {
+  margin: 0 16px 16px;
+  border-radius: 12px;
+  background: var(--game-soft);
+  overflow: hidden;
+}
+
+.friend-game-art {
+  display: block;
+  width: 100%;
+  aspect-ratio: 460 / 215;
+  object-fit: cover;
+}
+
+.friend-game-copy {
   display: grid;
-  gap: 8px;
-  margin: 0;
+  gap: 2px;
+  padding: 10px 12px 12px;
+  overflow-wrap: anywhere;
 }
 
-.friend-facts dt {
+.friend-game-label {
+  color: var(--game);
+  font-size: 11px;
+  font-weight: 600;
+}
+
+.friend-game-copy strong {
+  font-size: 14px;
+}
+
+.friend-game-presence {
   color: var(--muted);
   font-size: 12px;
 }
 
-.friend-facts dd {
+.friend-game-store {
+  display: inline-flex;
+  justify-self: start;
+  align-items: center;
+  gap: 4px;
+  margin-top: 4px;
+  color: var(--game);
+  font-size: 12px;
+  text-decoration: none;
+}
+
+.friend-game-store:hover {
+  text-decoration: underline;
+}
+
+dl.friend-facts {
+  display: grid;
+  margin: 0 16px 20px;
+  border-radius: 12px;
+  background: var(--soft);
+  padding: 2px 6px 2px 14px;
+}
+
+.friend-fact {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  column-gap: 6px;
+  padding: 9px 0;
+}
+
+.friend-fact + .friend-fact {
+  border-top: 1px solid var(--line);
+}
+
+.friend-fact dt {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.friend-fact dd {
+  grid-column: 1;
   min-width: 0;
-  margin: 0 0 12px;
+  margin: 2px 0 0;
   overflow-wrap: anywhere;
   font-size: 13px;
 }
 
-.friend-profile-link {
-  display: flex;
-  min-height: 44px;
-  align-items: center;
-  justify-content: center;
-  gap: 8px;
-  margin: 0 20px 20px;
-  border-top: 1px solid var(--line);
-  color: var(--brand);
-  padding: 12px 0;
-  font-size: 12px;
-  text-decoration: none;
-  overflow-wrap: anywhere;
+.friend-fact dd.is-mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
 }
 
-.friend-profile-link:hover {
-  text-decoration: underline;
+.friend-fact > button {
+  grid-column: 2;
+  grid-row: 1 / 3;
+}
+
+.friend-copy-btn {
+  display: grid;
+  width: 32px;
+  height: 32px;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  padding: 0;
+  place-items: center;
+}
+
+.friend-copy-btn:hover {
+  background: var(--chip);
+  color: var(--text);
+}
+
+.friend-copy-btn .ui-icon {
+  width: 16px;
+  height: 16px;
 }
 
 .friend-details-backdrop {
@@ -2783,5 +2909,5 @@ dl.friend-facts {
   .chat-layout[data-list-collapsed="true"] .conversation-empty { min-height: 120px; padding: 0 6px; font-size: 11px; }
 }
 @media (min-width: 1101px) {
-  .chat-layout[data-list-collapsed="true"][data-details-open="true"] { grid-template-columns: 72px minmax(0, 1fr) 252px; }
+  .chat-layout[data-list-collapsed="true"][data-details-open="true"] { grid-template-columns: 72px minmax(0, 1fr) 280px; }
 }
