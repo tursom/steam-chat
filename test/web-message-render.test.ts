@@ -172,6 +172,7 @@ type WebTestApi = {
   setFriendDetailsOpen: (open: boolean) => void;
   updateSteamStatus: (status: Record<string, unknown>) => void;
   renderFriendDetails: (container: FakeElement) => void;
+  markMessageRuns: (container: FakeElement) => void;
 };
 
 function loadWebTestApi(): WebTestApi & {
@@ -246,7 +247,7 @@ function loadWebTestApi(): WebTestApi & {
     setInterval,
     clearInterval
   };
-  const testSource = `${appSource.slice(0, bootstrapIndex)}\n;globalThis.__webTest = { pageSubtitle: () => { state.view = 'chat'; return pageSubtitle(); }, renderSteamView, renderMessage, renderPicker, capturePickerSends: () => { const calls = []; state.me = {id: 1}; state.view = 'chat'; state.activeId = 'peer'; state.steam.status = 'online'; state.steam.accessAllowed = true; sendText = (text, preview) => { calls.push({text, preview}); return Promise.resolve(true); }; return calls; }, createElement: (tag) => document.createElement(tag), setMediaInventory: (emoticons, stickers, effects = []) => { state.emoticons = emoticons; state.stickers = stickers; state.effects = effects; }, filterChatEntries, openConversation, showChatList, getChatState: () => ({ activeId: state.activeId, activeName: state.activeName, chatPanel: state.chatPanel }), setChatAvailability: (online, accessAllowed, activeId) => { state.steam.status = online ? 'online' : 'logged_out'; state.steam.accessAllowed = accessAllowed; state.activeId = activeId; updateChatAvailability(); }, renderChatList: renderChatListSections, setChatListState: (recent, friends, groups, tab, query, activeId) => { state.conversations = recent; state.friends = friends; state.groups = groups; state.chatListTab = tab; state.chatQuery = query; state.activeId = activeId; }, renderChatView, mountChatView: () => { state.view = 'chat'; const view = renderChatView(); document.querySelector('#app').replaceChildren(view); return view; }, setFriendDetailsOpen, updateSteamStatus, renderFriendDetails };`;
+  const testSource = `${appSource.slice(0, bootstrapIndex)}\n;globalThis.__webTest = { pageSubtitle: () => { state.view = 'chat'; return pageSubtitle(); }, renderSteamView, renderMessage, renderPicker, capturePickerSends: () => { const calls = []; state.me = {id: 1}; state.view = 'chat'; state.activeId = 'peer'; state.steam.status = 'online'; state.steam.accessAllowed = true; sendText = (text, preview) => { calls.push({text, preview}); return Promise.resolve(true); }; return calls; }, createElement: (tag) => document.createElement(tag), setMediaInventory: (emoticons, stickers, effects = []) => { state.emoticons = emoticons; state.stickers = stickers; state.effects = effects; }, filterChatEntries, openConversation, showChatList, getChatState: () => ({ activeId: state.activeId, activeName: state.activeName, chatPanel: state.chatPanel }), setChatAvailability: (online, accessAllowed, activeId) => { state.steam.status = online ? 'online' : 'logged_out'; state.steam.accessAllowed = accessAllowed; state.activeId = activeId; updateChatAvailability(); }, renderChatList: renderChatListSections, setChatListState: (recent, friends, groups, tab, query, activeId) => { state.conversations = recent; state.friends = friends; state.groups = groups; state.chatListTab = tab; state.chatQuery = query; state.activeId = activeId; }, renderChatView, mountChatView: () => { state.view = 'chat'; const view = renderChatView(); document.querySelector('#app').replaceChildren(view); return view; }, setFriendDetailsOpen, updateSteamStatus, renderFriendDetails, markMessageRuns };`;
   vm.runInNewContext(testSource, sandbox);
   assert.ok(sandbox.__webTest);
   return { ...sandbox.__webTest, clipboardWrites, lightbox, lightboxImage, offlineNote, chatControls, dispatchDocument };
@@ -431,6 +432,31 @@ test('sticker picker uses inventory thumbnail but sends the internal type', asyn
   assert.equal(sent.length, 1);
   assert.equal(sent[0].text, '/sticker show love');
   assert.equal(sent[0].preview, '[sticker type="show love" limit="0"][/sticker]');
+});
+
+test('consecutive messages group by sender and time with day separators', () => {
+  const { renderMessage, markMessageRuns, createElement } = loadWebTestApi();
+  const at = (day: number, hour: number, minute: number) => new Date(2026, 9, day, hour, minute).toISOString();
+  const messages = createElement('div');
+  messages.append(
+    renderMessage({ id: 'peer', eventId: 'a', message: 'one', sentAt: at(5, 20, 0) }),
+    renderMessage({ id: 'peer', eventId: 'b', message: 'two', sentAt: at(5, 20, 2) }),
+    renderMessage({ id: 'peer', eventId: 'c', echo: true, message: 'mine', sentAt: at(5, 20, 3) }),
+    renderMessage({ id: 'peer', eventId: 'd', echo: true, message: 'later', sentAt: at(5, 20, 30) }),
+    renderMessage({ id: 'peer', eventId: 'e', echo: true, message: 'next day', sentAt: at(6, 8, 0) })
+  );
+  markMessageRuns(messages);
+  const rows = messages.children;
+  assert.deepEqual(rows.map(row => row.dataset.continued === 'true'), [false, true, false, false, false]);
+  assert.ok(rows[0].dataset.day);
+  assert.deepEqual(rows.slice(1, 4).map(row => row.dataset.day), [undefined, undefined, undefined]);
+  assert.ok(rows[4].dataset.day && rows[4].dataset.day !== rows[0].dataset.day);
+  // Re-marking retained rows clears stale flags when the run head disappears.
+  rows[0].remove();
+  markMessageRuns(messages);
+  assert.equal(messages.children[0].dataset.eventId, 'b');
+  assert.equal(messages.children[0].dataset.continued, undefined);
+  assert.equal(messages.children[0].dataset.day, rows[0].dataset.day);
 });
 
 test('historical unparsed sticker commands are not labelled as confirmed sends', () => {

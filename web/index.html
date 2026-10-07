@@ -4,7 +4,9 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
     <title>Steam Chat</title>
-    <meta name="theme-color" content="#347d70">
+    <meta name="color-scheme" content="light dark">
+    <meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+    <meta name="theme-color" content="#121615" media="(prefers-color-scheme: dark)">
     <meta name="apple-mobile-web-app-capable" content="yes">
     <meta name="apple-mobile-web-app-title" content="Steam Chat">
     <link rel="manifest" href="/manifest.webmanifest">
@@ -17,7 +19,7 @@
     <div id="app"></div>
     <div id="dropOverlay" class="drop-overlay">释放发送图片</div>
     <div id="lightbox" class="lightbox" hidden>
-      <button id="lightboxClose" class="icon-btn lightbox-close" type="button" title="关闭">x</button>
+      <button id="lightboxClose" class="icon-btn lightbox-close" type="button" title="关闭" aria-label="关闭"><span class="ui-icon icon-x" aria-hidden="true"></span></button>
       <img id="lightboxImage" alt="">
     </div>
     <script type="module" src="/app.js"></script>

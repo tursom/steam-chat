@@ -281,7 +281,7 @@ let imageTransferId = 0;
 let conversationsBefore = '';
 let conversationsBusy = false;
 const recentConversationUpdates = new Map<string, ListEntry>();
-let storageHealth: unknown = null;
+let storageHealth: unknown;
 
 function chatContext() {
   return `${chatEpoch}|${state.me?.id || ''}|${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}|${steamAccessAllowed()}`;
@@ -324,7 +324,7 @@ function invalidateChat() {
   imageTransfers.clear();
   outgoingMessages.clear();
   clearImageDrafts();
-  storageHealth = null;
+  storageHealth = undefined;
   resetHistory();
   updateStorageHealth();
 }
@@ -499,6 +499,8 @@ function updateSteamStatus(status: SteamStatus) {
   if (hint) hint.textContent = state.steam.error || (state.steam.steamId ? `SteamID ${state.steam.steamId}` : '后台服务已启动');
   const subtitle = document.querySelector<HTMLElement>('#pageSubtitle');
   if (subtitle) subtitle.textContent = pageSubtitle();
+  const accountName = document.querySelector<HTMLElement>('#chatAccountName');
+  if (accountName) accountName.textContent = chatAccountName();
   const accountStatus = document.querySelector<HTMLElement>('#chatAccountStatus');
   if (accountStatus) {
     accountStatus.textContent = chatAccountLabel();
@@ -1448,6 +1450,7 @@ function renderChatView() {
   const view = create('div', 'chat-layout');
   view.id = 'chatLayout';
   view.dataset.mobilePanel = state.chatPanel;
+  view.dataset.hasConversation = String(Boolean(state.activeId));
   const lists = create('aside', 'chat-lists');
   lists.setAttribute('aria-label', '会话列表');
 
@@ -1456,7 +1459,7 @@ function renderChatView() {
   account.type = 'button';
   account.title = 'Steam 连接';
   const accountCopy = create('span', 'chat-account-copy');
-  const accountName = create('strong', '', 'Steam Chat');
+  const accountName = create('strong', '', chatAccountName());
   accountName.id = 'chatAccountName';
   const accountStatus = create('span');
   accountStatus.id = 'chatAccountStatus';
@@ -1653,9 +1656,13 @@ function activeChatEntry(): ListEntry | null {
   return entry ? resolvedChatEntry(entry) : null;
 }
 
-function chatAccountLabel() {
+function chatAccountName() {
   const account = state.steam.activeAccount;
-  return `${account?.label || account?.steamId || 'Steam'} · ${steamLabel()}`;
+  return account?.label || account?.steamId || 'Steam Chat';
+}
+
+function chatAccountLabel() {
+  return state.steam.activeAccount ? steamLabel() : `Steam · ${steamLabel()}`;
 }
 
 function friendStatusLabel(item: ListEntry | null) {
@@ -2027,7 +2034,9 @@ function showChatList() {
 
 function syncChatPanel() {
   const layout = document.querySelector<HTMLElement>('#chatLayout');
-  if (layout) layout.dataset.mobilePanel = state.chatPanel;
+  if (!layout) return;
+  layout.dataset.mobilePanel = state.chatPanel;
+  layout.dataset.hasConversation = String(Boolean(state.activeId));
 }
 
 function pageCursor(payload: unknown, key = 'nextCursor'): string {
@@ -2146,10 +2155,20 @@ function storageHealthText(payload: unknown): string {
   }).join(' · ');
 }
 
+function storageHealthy(payload: unknown): boolean {
+  return isRecord(payload) && ['jsonl', 'rocksdb'].every((key) => {
+    const health = payload[key];
+    return isRecord(health) && health.state === 'healthy' && health.writable !== false && health.durable !== false
+      && !(typeof health.queued === 'number' && health.queued > 0) && !(typeof health.missed === 'number' && health.missed > 0);
+  });
+}
+
 function updateStorageHealth() {
   const node = document.querySelector<HTMLElement>('#storageHealth');
   const text = storageHealthText(storageHealth);
   if (node && node.textContent !== text) node.textContent = text;
+  // Only surface storage state when it needs attention.
+  if (node) node.hidden = storageHealth === undefined || storageHealthy(storageHealth);
 }
 
 async function loadStorageHealth() {
@@ -2305,7 +2324,7 @@ function notificationSoundControls() {
   const section = create('div', 'stack-form');
   const enabled = create('input'); enabled.type = 'checkbox';
   enabled.checked = localStorage.getItem('steam-chat.sound-enabled') !== 'false';
-  const label = create('label', '', '新消息提示音'); label.append(enabled);
+  const label = create('label', 'check-label'); label.append(enabled, create('span', '', '新消息提示音'));
   const selectLabel = create('label', '', '提示音');
   const select = create('select');
   for (const sound of notificationSounds) {
@@ -2425,6 +2444,7 @@ function receiveHistoryMessage(item: MessageItem) {
     : messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48;
   messages.querySelector('.thread-empty')?.remove();
   messages.append(renderMessage(item));
+  markMessageRuns(messages);
   if (atBottom) followHistoryBottom(messages);
   else watchHistoryLayout(messages, false);
 }
@@ -2564,7 +2584,8 @@ function renderHistory(items: MessageItem[]) {
   const historyRows = new Map<MessageItem, Element>();
   if (!items.length && !outgoing.length) {
     const empty = create('div', 'thread-empty');
-    empty.append(create('strong', '', state.activeId ? '暂无消息' : '未选择会话'));
+    if (state.activeId) empty.append(create('strong', '', '暂无消息'));
+    else empty.append(chatIcon('messages-square'), create('strong', '', '未选择会话'), create('span', 'muted', '从左侧选择一个会话，或新建会话开始聊天'));
     desired.push(empty);
   } else {
     for (const item of items) {
@@ -2629,8 +2650,52 @@ function renderHistory(items: MessageItem[]) {
     }
     position++;
   }
+  markMessageRuns(messages);
   if (historyDetached) watchHistoryLayout(messages, false);
   else followHistoryBottom(messages);
+}
+
+const messageRunGapMs = 5 * 60 * 1000;
+
+function messageDayLabel(time: number): string {
+  const date = new Date(time);
+  const today = new Date();
+  const dayStart = (value: Date) => new Date(value.getFullYear(), value.getMonth(), value.getDate()).getTime();
+  const days = Math.round((dayStart(today) - dayStart(date)) / 86400000);
+  if (days === 0) return '今天';
+  if (days === 1) return '昨天';
+  return date.toLocaleDateString('zh-CN', {
+    year: date.getFullYear() === today.getFullYear() ? undefined : 'numeric',
+    month: 'long',
+    day: 'numeric',
+    weekday: 'short'
+  });
+}
+
+// Group consecutive messages from one sender and mark day boundaries.
+// State lives on data attributes so retained rows never need re-rendering.
+function markMessageRuns(messages: HTMLElement) {
+  let previousSender = '';
+  let previousTime = NaN;
+  let previousDay = '';
+  for (const row of Array.from(messages.children) as HTMLElement[]) {
+    const sender = row.dataset.sender || '';
+    const time = Number(row.dataset.sentAt);
+    if (!sender) {
+      previousSender = '';
+      continue;
+    }
+    const day = Number.isFinite(time) ? new Date(time).toDateString() : previousDay;
+    if (day && day !== previousDay) row.dataset.day = messageDayLabel(time);
+    else delete row.dataset.day;
+    const continued = sender === previousSender && day === previousDay
+      && Number.isFinite(time) && Number.isFinite(previousTime) && time - previousTime < messageRunGapMs;
+    if (continued) row.dataset.continued = 'true';
+    else delete row.dataset.continued;
+    previousSender = sender;
+    previousTime = Number.isFinite(time) ? time : previousTime;
+    previousDay = day;
+  }
 }
 
 type MessageReaction = { type: number; name: string; users: string[] };
@@ -2747,7 +2812,11 @@ function renderReactionBar(bar: HTMLElement, item: MessageItem) {
 function renderMessage(item: MessageItem) {
   const row = create('article', `msg-row${item.echo ? ' is-self' : ''}`);
   if (item.eventId) row.dataset.eventId = item.eventId;
+  row.dataset.sender = item.echo ? 'self' : String(item.id || item.name || '');
+  const sentAt = new Date(String(item.sentAt || item.date || '').replace(' ', 'T')).getTime();
+  if (Number.isFinite(sentAt)) row.dataset.sentAt = String(sentAt);
   const bubble = create('div', 'bubble');
+  if (Number.isFinite(sentAt)) bubble.title = new Date(sentAt).toLocaleString('zh-CN');
   const meta = create('div', 'meta');
   meta.append(create('span', '', item.name || (item.echo ? '我' : item.id)), create('span', '', formatTime(item.sentAt || item.date)));
   if (item.eventId && item.echo) {
