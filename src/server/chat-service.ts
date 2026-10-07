@@ -81,6 +81,7 @@ type SteamUserLike = ReactionClient & {
   removeListener?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
   myFriends?: UnknownRecord;
   myNicknames?: UnknownRecord;
+  getProductInfo?: CallbackStyleFunction;
   users?: Record<string, Persona>;
   myGroups?: unknown;
   groups?: unknown;
@@ -1695,13 +1696,64 @@ async function defaultGetEmoticons({ steamUser, steamCommunity, waitForLogin, wa
   return { emoticons, stickers, effects };
 }
 
+// Steam reports names only for non-Steam games; Steam apps are resolved from PICS app info.
+// Names practically never change, so hits are kept for the process lifetime and misses retried later.
+const APP_NAME_WAIT_MS = 3000;
+const APP_NAME_RETRY_MS = 10 * 60 * 1000;
+const appNames = new Map<number, string>();
+const appNameRetryAt = new Map<number, number>();
+const appNameLookups = new Map<number, Promise<void>>();
+
+function appNameFromInfo(appinfo: unknown): string {
+  const common = isRecord(appinfo) && isRecord(appinfo.common) ? appinfo.common : null;
+  if (!common) return '';
+  const localized = isRecord(common.name_localized) ? common.name_localized : {};
+  const name = [localized.schinese, localized.tchinese, common.name].find((value) => typeof value === 'string' && value.trim());
+  return typeof name === 'string' ? name.trim() : '';
+}
+
+async function resolveAppNames(steamUser: SteamUserLike, appIds: number[]): Promise<void> {
+  const wanted = [...new Set(appIds)];
+  const now = Date.now();
+  const missing = wanted.filter((id) => !appNames.has(id) && !appNameLookups.has(id) && (appNameRetryAt.get(id) || 0) <= now);
+  if (missing.length && typeof steamUser.getProductInfo === 'function') {
+    const lookup = callMaybeCallback(steamUser.getProductInfo, steamUser, [missing, [], false]).then((result) => {
+      const apps = isRecord(result) && isRecord(result.apps) ? result.apps : {};
+      for (const id of missing) {
+        const entry = apps[String(id)];
+        const name = appNameFromInfo(isRecord(entry) ? entry.appinfo : null);
+        if (name) {
+          appNames.set(id, name);
+          appNameRetryAt.delete(id);
+        } else {
+          appNameRetryAt.set(id, Date.now() + APP_NAME_RETRY_MS);
+        }
+      }
+    }, () => {
+      for (const id of missing) appNameRetryAt.set(id, Date.now() + APP_NAME_RETRY_MS);
+    }).finally(() => {
+      for (const id of missing) appNameLookups.delete(id);
+    });
+    for (const id of missing) appNameLookups.set(id, lookup);
+  }
+  const pending = [...new Set(wanted.map((id) => appNameLookups.get(id)).filter((lookup): lookup is Promise<void> => Boolean(lookup)))];
+  if (!pending.length) return;
+  // A slow lookup must not hold up the friend list; late names still fill the cache for the next request.
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  await Promise.race([
+    Promise.all(pending),
+    new Promise<void>((resolve) => { timer = setTimeout(resolve, APP_NAME_WAIT_MS); })
+  ]);
+  clearTimeout(timer);
+}
+
 async function listFriends(steamUser?: SteamUserLike): Promise<FriendSummary[]> {
   if (!steamUser) return [];
   const friends = isRecord(steamUser.myFriends) ? steamUser.myFriends : {};
   const ids = Object.keys(friends);
   const users = steamUser.users || {};
   const nicknames = isRecord(steamUser.myNicknames) ? steamUser.myNicknames : {};
-  return ids.map((id) => {
+  const summaries = ids.map((id): FriendSummary => {
     const persona = users[id] || {};
     const state = persona.persona_state ?? persona.personaState ?? friends[id];
     const appId = Number(persona.game_played_app_id);
@@ -1717,7 +1769,13 @@ async function listFriends(steamUser?: SteamUserLike): Promise<FriendSummary[]> 
       richPresence: typeof persona.rich_presence_string === 'string' ? persona.rich_presence_string : '',
       lastOnline: personaDate(persona.last_seen_online) || personaDate(persona.last_logoff)
     };
-  }).sort((left, right) => Number(right.online) - Number(left.online) || left.name.localeCompare(right.name));
+  });
+  const unnamed = summaries.filter((friend) => friend.gameAppId && !friend.gameName);
+  if (unnamed.length) {
+    await resolveAppNames(steamUser, unnamed.map((friend) => friend.gameAppId));
+    for (const friend of unnamed) friend.gameName = appNames.get(friend.gameAppId) || '';
+  }
+  return summaries.sort((left, right) => Number(right.online) - Number(left.online) || left.name.localeCompare(right.name));
 }
 
 function groupFromUnknown(group: unknown, fallbackId = ''): GroupSummary {

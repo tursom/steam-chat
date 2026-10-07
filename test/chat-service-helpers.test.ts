@@ -58,6 +58,64 @@ test('listFriends exposes nickname, Steam game, rich presence and last online ti
   assert.equal(byId('unknown').richPresence, '');
 });
 
+test('listFriends names Steam games from cached app info and prefers Chinese names', async () => {
+  const calls: unknown[][] = [];
+  const steamUser = {
+    myFriends: { a: 3, b: 3, c: 3, d: 3 },
+    users: {
+      a: { player_name: 'A', persona_state: 1, game_played_app_id: 9100001 },
+      b: { player_name: 'B', persona_state: 1, game_played_app_id: 9100002 },
+      c: { player_name: 'C', persona_state: 1, game_played_app_id: 9100001 },
+      d: { player_name: 'D', persona_state: 1, game_played_app_id: 9100003, game_name: 'Reported by Steam' }
+    },
+    getProductInfo(apps: number[], packages: number[], inclTokens: boolean, callback: (error: unknown, result: unknown) => void) {
+      calls.push([apps, packages, inclTokens]);
+      callback(null, { apps: {
+        9100001: { appinfo: { common: { name: 'Counter-Strike 2', name_localized: { schinese: '反恐精英 2' } } } },
+        9100002: { appinfo: { common: { name: 'Dota 2' } } }
+      } });
+    }
+  };
+  const byId = (friends: Array<{ id: string; gameName: string }>, id: string) => friends.find((friend) => friend.id === id)!.gameName;
+  const friends = await listFriends(steamUser);
+  assert.equal(byId(friends, 'a'), '反恐精英 2');
+  assert.equal(byId(friends, 'b'), 'Dota 2');
+  assert.equal(byId(friends, 'c'), '反恐精英 2');
+  assert.equal(byId(friends, 'd'), 'Reported by Steam');
+  // One batched lookup for the unnamed apps only; later requests use the cache.
+  assert.deepEqual(calls, [[[9100001, 9100002], [], false]]);
+  await listFriends(steamUser);
+  assert.equal(calls.length, 1);
+});
+
+test('listFriends leaves unknown games unnamed and does not retry failed lookups immediately', async () => {
+  let calls = 0;
+  const steamUser = {
+    myFriends: { a: 3 },
+    users: { a: { player_name: 'A', persona_state: 1, game_played_app_id: 9200001 } },
+    getProductInfo(_apps: number[], _packages: number[], _incl: boolean, callback: (error: unknown) => void) {
+      calls++;
+      callback(new Error('PICS unavailable'));
+    }
+  };
+  assert.equal((await listFriends(steamUser))[0].gameName, '');
+  assert.equal((await listFriends(steamUser))[0].gameName, '');
+  assert.equal(calls, 1);
+});
+
+test('listFriends does not wait indefinitely for a stalled app lookup', async () => {
+  const steamUser = {
+    myFriends: { a: 3 },
+    users: { a: { player_name: 'A', persona_state: 1, game_played_app_id: 9300001 } },
+    getProductInfo() { return new Promise(() => {}); }
+  };
+  const started = Date.now();
+  const friends = await listFriends(steamUser);
+  assert.equal(friends[0].gameName, '');
+  assert.equal(friends[0].gameAppId, 9300001);
+  assert.ok(Date.now() - started < 4500);
+});
+
 test('listGroups accepts array and object group shapes', async () => {
   const fromArray = await listGroups({
     myGroups: [
