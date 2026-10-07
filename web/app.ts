@@ -2836,6 +2836,13 @@ function renderMessage(item: MessageItem) {
   const reactions = create('div', 'message-reactions');
   bubble.append(reactions);
   renderReactionBar(reactions, item);
+  if (Number.isFinite(sentAt)) {
+    // Shown beside the bubble on hover; the meta line already carries the time for assistive tech.
+    const hoverTime = create('time', 'msg-hover-time', formatTime(new Date(sentAt).toISOString()));
+    hoverTime.dateTime = new Date(sentAt).toISOString();
+    hoverTime.setAttribute('aria-hidden', 'true');
+    bubble.append(hoverTime);
+  }
   row.append(bubble);
   return row;
 }

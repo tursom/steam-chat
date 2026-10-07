@@ -448,6 +448,8 @@ test('consecutive messages group by sender and time with day separators', () => 
   markMessageRuns(messages);
   const rows = messages.children;
   assert.deepEqual(rows.map(row => row.dataset.continued === 'true'), [false, true, false, false, false]);
+  // Merged rows hide their meta line, so each bubble carries its own hover time.
+  assert.equal(rows[1].findByClass('msg-hover-time')!.textContent, new Date(at(5, 20, 2)).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
   assert.ok(rows[0].dataset.day);
   assert.deepEqual(rows.slice(1, 4).map(row => row.dataset.day), [undefined, undefined, undefined]);
   assert.ok(rows[4].dataset.day && rows[4].dataset.day !== rows[0].dataset.day);

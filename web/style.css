@@ -2734,3 +2734,12 @@ dl.friend-facts {
 @media (hover: none) {
   .reaction-add { opacity: 0.6; }
 }
+
+/* Send time beside merged bubbles on hover; group heads already show it in .meta. */
+.msg-hover-time { position: absolute; bottom: 6px; left: calc(100% + 8px); color: var(--muted); font-size: 11px; line-height: 1; white-space: nowrap; opacity: 0; pointer-events: none; transition: opacity 120ms ease; }
+.msg-row.is-self .msg-hover-time { right: calc(100% + 8px); left: auto; }
+.bubble:has(> .message-reactions:not(:empty):not(:has(.reaction-chip, .reaction-picker))) > .msg-hover-time { left: calc(100% + 38px); }
+.msg-row.is-self .bubble:has(> .message-reactions:not(:empty):not(:has(.reaction-chip, .reaction-picker))) > .msg-hover-time { right: calc(100% + 38px); left: auto; }
+.msg-row:not([data-continued]) .msg-hover-time,
+.msg-row[data-send-state="unknown"] .msg-hover-time { display: none; }
+.msg-row:hover .msg-hover-time { opacity: 1; }
