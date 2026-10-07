@@ -1620,7 +1620,131 @@ function resolvedChatEntry(entry: ListEntry): ListEntry {
 function chatEntriesForActiveTab() {
   if (state.chatListTab === 'friends') return state.friends;
   if (state.chatListTab === 'groups') return state.groups;
-  return state.conversations.map(resolvedChatEntry);
+  const closed = readClosedConversations();
+  return state.conversations.filter((entry) => !isConversationClosed(entry, closed)).map(resolvedChatEntry);
+}
+
+// Closed recent conversations are a per-browser preference keyed by Steam account.
+// Each entry stores the conversation's last message time (server clock) when it was
+// closed, so any newer message brings the conversation back.
+const closedConversationsStorageKey = 'steam-chat.closed-conversations';
+
+function closedConversationKey(id: string) {
+  return `${state.steam.activeAccount?.steamId || state.steam.steamId || ''}|${id}`;
+}
+
+function readClosedConversations(): Record<string, number> {
+  try {
+    const value: unknown = JSON.parse(localStorage.getItem(closedConversationsStorageKey) || '{}');
+    return isRecord(value) ? value as Record<string, number> : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeClosedConversations(closed: Record<string, number>) {
+  const entries = Object.entries(closed).sort((left, right) => right[1] - left[1]).slice(0, 500);
+  localStorage.setItem(closedConversationsStorageKey, JSON.stringify(Object.fromEntries(entries)));
+}
+
+function isConversationClosed(entry: ListEntry, closed: Record<string, number>) {
+  const closedAt = closed[closedConversationKey(entry.id)];
+  return typeof closedAt === 'number' && conversationTimestamp(entry.updatedAt) <= closedAt;
+}
+
+function closeConversation(id: string) {
+  const entry = state.conversations.find((item) => item.id === id);
+  if (!entry) return;
+  const closed = readClosedConversations();
+  closed[closedConversationKey(id)] = conversationTimestamp(entry.updatedAt);
+  writeClosedConversations(closed);
+  if (id === state.activeId) deselectConversation();
+  updateChatLists();
+  setFeedback(`已关闭会话「${resolvedChatEntry(entry).name || id}」，有新消息时会重新出现。`, 'ok');
+}
+
+function reopenConversation(id: string) {
+  const closed = readClosedConversations();
+  const key = closedConversationKey(id);
+  if (!(key in closed)) return;
+  delete closed[key];
+  writeClosedConversations(closed);
+}
+
+function deselectConversation() {
+  state.activeId = '';
+  state.activeName = '';
+  state.friendDetailsOpen = false;
+  state.chatPanel = 'list';
+  localStorage.removeItem('steam-chat.target');
+  resetHistory();
+  syncChatPanel();
+  const head = document.querySelector<HTMLElement>('#threadHead');
+  if (head) renderThreadHeader(head);
+  syncFriendDetails();
+  updateChatAvailability();
+}
+
+let closeContextMenu: (() => void) | null = null;
+
+type ContextMenuAction = { label: string; danger?: boolean; run: () => void };
+
+function openContextMenu(event: MouseEvent, anchor: HTMLElement, actions: ContextMenuAction[]) {
+  closeContextMenu?.();
+  const menu = create('div', 'context-menu');
+  menu.setAttribute('role', 'menu');
+  const items = actions.map((action) => {
+    const item = create('button', `context-menu-item${action.danger ? ' is-danger' : ''}`, action.label);
+    item.type = 'button';
+    item.setAttribute('role', 'menuitem');
+    item.addEventListener('click', () => {
+      close();
+      action.run();
+    });
+    return item;
+  });
+  menu.append(...items);
+  document.body.append(menu);
+  // Menus opened from the keyboard report no pointer position; anchor them to the item.
+  const rect = anchor.getBoundingClientRect();
+  const fromKeyboard = event.clientX === 0 && event.clientY === 0;
+  const x = fromKeyboard ? rect.left + 16 : event.clientX;
+  const y = fromKeyboard ? rect.bottom - 8 : event.clientY;
+  menu.style.left = `${Math.max(8, Math.min(x, innerWidth - menu.offsetWidth - 8))}px`;
+  menu.style.top = `${Math.max(8, Math.min(y, innerHeight - menu.offsetHeight - 8))}px`;
+  const onPointerDown = (pointer: PointerEvent) => {
+    if (!(pointer.target instanceof Node && menu.contains(pointer.target))) close();
+  };
+  const onKeyDown = (key: KeyboardEvent) => {
+    if (key.key === 'Escape' || key.key === 'Tab') {
+      // Keep Escape from also closing panels such as the friend details drawer.
+      key.stopPropagation();
+      if (key.key === 'Escape') key.preventDefault();
+      close();
+      anchor.focus();
+    } else if (key.key === 'ArrowDown' || key.key === 'ArrowUp') {
+      key.preventDefault();
+      const index = items.indexOf(document.activeElement as HTMLButtonElement);
+      const step = key.key === 'ArrowDown' ? 1 : -1;
+      items[(index + step + items.length) % items.length]?.focus();
+    }
+  };
+  const close = () => {
+    menu.remove();
+    document.removeEventListener('pointerdown', onPointerDown, true);
+    document.removeEventListener('keydown', onKeyDown, true);
+    document.removeEventListener('scroll', close, true);
+    window.removeEventListener('resize', close);
+    window.removeEventListener('blur', close);
+    if (closeContextMenu === close) closeContextMenu = null;
+  };
+  document.addEventListener('pointerdown', onPointerDown, true);
+  document.addEventListener('keydown', onKeyDown, true);
+  document.addEventListener('scroll', close, true);
+  window.addEventListener('resize', close);
+  window.addEventListener('blur', close);
+  closeContextMenu = close;
+  items[0]?.focus({ preventScroll: true });
 }
 
 function updateChatTabs() {
@@ -1770,6 +1894,14 @@ function renderListItem(item: ListEntry) {
   body.append(title, create('span', 'item-preview', item.preview || item.gameName || item.clanId || item.clanid || item.id));
   button.append(renderAvatar(item, name), body);
   button.addEventListener('click', () => openConversation(item.id, item.name || item.id));
+  button.addEventListener('contextmenu', (event) => {
+    if (state.chatListTab !== 'recent') return;
+    event.preventDefault();
+    openContextMenu(event, button, [
+      { label: '打开会话', run: () => openConversation(item.id, item.name || item.id) },
+      { label: '关闭会话', danger: true, run: () => closeConversation(item.id) }
+    ]);
+  });
   return button;
 }
 
@@ -2002,6 +2134,7 @@ function openConversation(id: unknown, name = '') {
     return;
   }
   const alreadyActive = target === state.activeId;
+  reopenConversation(target);
   state.activeId = target;
   if (!alreadyActive) resetHistory();
   state.activeName = name || target;

@@ -2747,3 +2747,10 @@ dl.friend-facts {
   .msg-row.is-self .bubble:has(> .message-reactions:not(:empty):not(:has(.reaction-chip, .reaction-picker))) > .msg-hover-time { right: calc(100% + 38px); left: auto; }
   .msg-row:hover .msg-hover-time { opacity: 0.85; }
 }
+
+/* Custom right-click menu (openContextMenu). */
+.context-menu { position: fixed; z-index: 40; display: grid; min-width: 148px; gap: 2px; border: 1px solid var(--line); border-radius: 8px; background: var(--surface); box-shadow: var(--shadow); padding: 4px; }
+.context-menu-item { display: flex; min-height: 32px; align-items: center; border-radius: 6px; background: transparent; color: var(--text); padding: 0 10px; font-size: 13px; text-align: left; }
+.context-menu-item:hover, .context-menu-item:focus-visible { background: var(--soft); outline: none; }
+.context-menu-item.is-danger { color: var(--danger); }
+.context-menu-item.is-danger:hover, .context-menu-item.is-danger:focus-visible { background: var(--danger-soft); }
