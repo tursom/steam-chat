@@ -4,7 +4,7 @@ type Tone = 'muted' | 'ok' | 'warn' | 'error';
 type ChatListTab = 'recent' | 'friends' | 'groups';
 type ChatPanel = 'list' | 'thread';
 type ChatIconName = 'arrow-left' | 'image' | 'link' | 'paperclip' | 'plus' | 'search' | 'send' | 'smile' | 'x'
-  | 'panel-right' | 'messages-square' | 'gamepad-2' | 'users' | 'settings-2' | 'shield' | 'scroll-text' | 'log-out' | 'external-link' | 'copy';
+  | 'panel-right' | 'panel-left-close' | 'panel-left-open' | 'messages-square' | 'gamepad-2' | 'users' | 'settings-2' | 'shield' | 'scroll-text' | 'log-out' | 'external-link' | 'copy';
 type Permission =
   | 'user.manage'
   | 'session.manage'
@@ -185,6 +185,7 @@ type AppState = {
   chatQuery: string;
   chatPanel: ChatPanel;
   friendDetailsOpen: boolean;
+  chatListCollapsed: boolean;
   historyLimit: number;
   wsPath: string;
   ws: WebSocket | null;
@@ -238,6 +239,7 @@ const state: AppState = {
   chatQuery: '',
   chatPanel: 'list',
   friendDetailsOpen: false,
+  chatListCollapsed: localStorage.getItem('steam-chat.list-collapsed') === 'true',
   historyLimit: clampLimit(localStorage.getItem('steam-chat.history-limit') || 100),
   wsPath: '/ws',
   ws: null,
@@ -1476,8 +1478,14 @@ function renderChatView() {
   titleRow.append(create('h2', '', '消息'));
   const newConversation = create('button', 'new-chat-btn');
   newConversation.type = 'button';
+  newConversation.title = '新建会话';
   newConversation.append(chatIcon('plus'), create('span', '', '新建'));
-  titleRow.append(newConversation);
+  const collapseToggle = create('button', 'chat-list-toggle');
+  collapseToggle.id = 'chatListToggle';
+  collapseToggle.type = 'button';
+  collapseToggle.setAttribute('aria-controls', 'chatListSections');
+  collapseToggle.addEventListener('click', () => setChatListCollapsed(!state.chatListCollapsed));
+  titleRow.append(newConversation, collapseToggle);
 
   const search = create('label', 'chat-search');
   search.append(chatIcon('search'));
@@ -1571,6 +1579,7 @@ function renderChatView() {
   details.setAttribute('aria-label', '会话资料');
   details.hidden = true;
   view.append(lists, thread, detailsBackdrop, details);
+  syncChatListCollapsed(view);
   renderFriendDetails(details);
   view.dataset.detailsOpen = String(state.friendDetailsOpen && Boolean(state.activeId));
   details.hidden = !state.friendDetailsOpen || !state.activeId;
@@ -1747,6 +1756,27 @@ function openContextMenu(event: MouseEvent, anchor: HTMLElement, actions: Contex
   items[0]?.focus({ preventScroll: true });
 }
 
+function setChatListCollapsed(collapsed: boolean) {
+  state.chatListCollapsed = collapsed;
+  localStorage.setItem('steam-chat.list-collapsed', String(collapsed));
+  const layout = document.querySelector<HTMLElement>('#chatLayout');
+  if (layout) syncChatListCollapsed(layout);
+  updateChatLists();
+  document.querySelector<HTMLButtonElement>('#chatListToggle')?.focus();
+}
+
+// Collapsed mode narrows the list to an avatar column; names move to tooltips.
+function syncChatListCollapsed(layout: HTMLElement) {
+  layout.dataset.listCollapsed = String(state.chatListCollapsed);
+  const toggle = layout.querySelector<HTMLButtonElement>('#chatListToggle');
+  if (!toggle) return;
+  const label = state.chatListCollapsed ? '展开会话列表' : '收起会话列表';
+  toggle.replaceChildren(chatIcon(state.chatListCollapsed ? 'panel-left-open' : 'panel-left-close'));
+  toggle.title = label;
+  toggle.setAttribute('aria-label', label);
+  toggle.setAttribute('aria-expanded', String(!state.chatListCollapsed));
+}
+
 function updateChatTabs() {
   document.querySelectorAll<HTMLButtonElement>('[data-chat-tab]').forEach((button) => {
     const active = button.dataset.chatTab === state.chatListTab;
@@ -1893,6 +1923,8 @@ function renderListItem(item: ListEntry) {
   title.append(create('strong', '', name), create('time', '', formatConversationTime(item.updatedAt)));
   body.append(title, create('span', 'item-preview', item.preview || item.gameName || item.clanId || item.clanid || item.id));
   button.append(renderAvatar(item, name), body);
+  // The collapsed list shows avatars only; the body stays readable by assistive tech.
+  if (state.chatListCollapsed) button.title = name;
   button.addEventListener('click', () => openConversation(item.id, item.name || item.id));
   button.addEventListener('contextmenu', (event) => {
     if (state.chatListTab !== 'recent') return;
