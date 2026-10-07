@@ -3300,7 +3300,7 @@ function parseSteamImagePreview(attributes: string, body: string): SteamImagePre
   const values = parseBbcodeAttributes(attributes, new Set(['src', 'thumbnail_src', 'srcset', 'width', 'height']));
   if (!values) return null;
   const sourceUrl = httpUrl(values.src);
-  if (!sourceUrl || !imageBodyMatchesSource(body, sourceUrl)) return null;
+  if (!sourceUrl || !bbcodeLinkMatchesSource(body, sourceUrl)) return null;
   return {
     sourceUrl,
     displayUrl: httpUrl(values.thumbnail_src) || sourceUrl,
@@ -3314,7 +3314,7 @@ function parseSteamVideoSource(attributes: string, body: string): string {
   const values = parseBbcodeAttributes(attributes, new Set(['src', 'type', 'steamvideo']));
   if (!values || values.type !== 'video/mp4' || values.steamvideo !== 'true') return '';
   const source = httpUrl(values.src);
-  if (!source || body.trim() !== source) return '';
+  if (!source || (body.trim() !== source && !bbcodeLinkMatchesSource(body, source))) return '';
   const url = new URL(source);
   if (url.protocol !== 'https:' || url.username || url.password || url.port || url.search || url.hash
     || !['cdn.steamusercontent.com', 'images.steamusercontent.com'].includes(url.hostname)
@@ -3445,7 +3445,7 @@ function steamVideoNode(source: string) {
   return shell;
 }
 
-function imageBodyMatchesSource(body: string, sourceUrl: string): boolean {
+function bbcodeLinkMatchesSource(body: string, sourceUrl: string): boolean {
   const trimmed = body.trim();
   if (!/^\[url(?=[=\]])/i.test(trimmed)) return false;
   const openEnd = findBbcodeTagEnd(trimmed, 4);

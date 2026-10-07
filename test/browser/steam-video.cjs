@@ -12,7 +12,7 @@ const peer = '76561198000000001';
 const account = '76561198000000009';
 const source = `https://cdn.steamusercontent.com/ugc/123/${'A'.repeat(40)}/`;
 const brokenSource = `https://cdn.steamusercontent.com/ugc/124/${'B'.repeat(40)}/`;
-const markup = url => `[video src=${url} type=video/mp4 steamvideo=true]${url}[/video]`;
+const markup = url => `[video src=${url} type=video/mp4 steamvideo=true][url=${url}]${url}[/url][/video]`;
 const steam = { status: 'online', steamId: account, activeAccount: { id: 1, steamId: account }, accessAllowed: true };
 const friend = { id: peer, name: 'Video regression' };
 const other = { id: '76561198000000002', name: 'Other conversation' };

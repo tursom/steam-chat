@@ -293,8 +293,8 @@ test('Steam MP4 BBCode renders a click-to-load player with its original link', (
     `src=${source} type=video/mp4 steamvideo=true`,
     `src="${source}" type="video/mp4" steamvideo="true"`,
     `steamvideo='true' type='video/mp4' src='${source}'`
-  ]) {
-    const row = renderMessage({ id: 'peer', message: `Before [video ${attributes}]${source}[/video] After` });
+  ]) for (const body of [source, `[url=${source}]${source}[/url]`, `[URL="${source}"]${source}[/URL]`]) {
+    const row = renderMessage({ id: 'peer', message: `Before [video ${attributes}]${body}[/video] After` });
     const player = row.findByClass('steam-video');
     assert.ok(player);
     assert.equal(player.findByTag('video'), null, 'History does not load a media source');
@@ -303,7 +303,7 @@ test('Steam MP4 BBCode renders a click-to-load player with its original link', (
     assert.equal(player.findByTag('a')!.rel, 'noopener noreferrer');
     assert.match(row.textContent, /^.*Before /);
     assert.match(row.textContent, / After/);
-    assert.doesNotMatch(row.textContent, /\[\/?video\b/);
+    assert.doesNotMatch(row.textContent, /\[\/?(?:video|url)\b/i);
   }
 });
 
@@ -320,6 +320,12 @@ test('unsupported, unsafe and malformed video BBCode remains readable literal te
     `[video ${attributes} src=${source}]${source}[/video]`,
     `[video ${attributes}]https://example.com/different.mp4[/video]`,
     `[video ${attributes}]caption ${source}[/video]`,
+    `[video ${attributes}][url=https://example.com/different.mp4]${source}[/url][/video]`,
+    `[video ${attributes}][url=${source}]https://example.com/different.mp4[/url][/video]`,
+    `[video ${attributes}][url=${source}]${source}[/url] caption[/video]`,
+    `[video ${attributes}][url=${source}]${source}[/video]`,
+    `[video ${attributes}][url=${source}]${source}[/url][url=${source}]${source}[/url][/video]`,
+    `\\[video ${attributes}][url=${source}]${source}[/url]\\[/video]`,
     `[video ${attributes}]${source}`,
     `\\[video ${attributes}]${source}\\[/video]`,
     `[video src="javascript:alert(1)" type=video/mp4 steamvideo=true]javascript:alert(1)[/video]`
