@@ -37,8 +37,22 @@ class Element {
 }
 
 type Item = { id: string; eventId: string; message: string; echo?: boolean; name?: string; sentAt?: string; steamAccountId?: string; type?: string };
-type Pending = { url: URL; resolve: (value: unknown) => void; reject: (error: Error) => void };
-function harness(withLayout = false) {
+type Pending = { url: URL; signal?: AbortSignal; resolve: (value: unknown) => void; reject: (error: Error) => void };
+function harness(withLayout = false, withRealtime = false) {
+  let now = Date.now();
+  const timers = new Map<number, { delay: number; callback: () => unknown }>();
+  let timerId = 0;
+  const events = new Element();
+  const sockets: FakeSocket[] = [];
+  class FakeSocket extends Element {
+    static OPEN = 1;
+    readyState = 1;
+    sent: string[] = [];
+    closed = false;
+    constructor(_url: string) { super(); sockets.push(this); }
+    send(value: string) { this.sent.push(value); }
+    close() { this.closed = true; this.readyState = 3; this.dispatch('close'); }
+  }
   const frames = new Map<number, () => void>();
   let frameId = 0;
   const flushFrames = () => {
@@ -57,14 +71,22 @@ function harness(withLayout = false) {
   const nodes: Record<string, Element> = { '#app': new Element(), '#chatListSections': new Element(), '#messageInput': new Element(), '#messages': new Element(), '#historyOlder': new Element(), '#storageHealth': new Element() };
   const pending: Pending[] = [];
   const sandbox = {
-    document: { querySelector: (id: string) => nodes[id] || null, querySelectorAll: (): Element[] => [], addEventListener() {}, createElement: () => new Element() },
+    document: { querySelector: (id: string) => nodes[id] || null, querySelectorAll: (): Element[] => [],
+      visibilityState: 'visible', addEventListener: events.addEventListener.bind(events), createElement: () => new Element() },
+    window: { addEventListener: events.addEventListener.bind(events) },
+    location: { protocol: 'http:', host: 'test' }, WebSocket: FakeSocket, AbortController,
+    ...(withRealtime ? { Date: class Clock extends Date { static now() { return now; } } } : {}),
     localStorage: { getItem: (): null => null, setItem() {} },
     ...(withLayout ? { ResizeObserver: LayoutObserver,
       requestAnimationFrame: (callback: () => void) => { frames.set(++frameId, callback); return frameId; },
       cancelAnimationFrame: (id: number) => frames.delete(id) } : {}),
     URL, URLSearchParams, Headers, console,
-    setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
-    fetch: (url: string) => new Promise((resolve, reject) => pending.push({ url: new URL(url, 'http://test'), resolve: (payload) => resolve({ ok: true, json: async () => payload }), reject })),
+    setTimeout: (callback: () => unknown, delay: number) => { if (!withRealtime) return 0; timers.set(++timerId, { callback, delay }); return timerId; },
+    clearTimeout: (id: number) => timers.delete(id),
+    setInterval: (callback: () => unknown, delay: number) => { if (!withRealtime) return 0; timers.set(++timerId, { callback, delay }); return timerId; },
+    clearInterval: (id: number) => timers.delete(id),
+    fetch: (url: string, options: RequestInit = {}) => new Promise((resolve, reject) => pending.push({ url: new URL(url, 'http://test'),
+      signal: options.signal || undefined, resolve: (payload) => resolve({ ok: true, json: async () => payload }), reject })),
     __test: undefined as unknown
   };
   runInNewContext(`${source.slice(0, source.lastIndexOf('bootstrap().catch'))}
@@ -73,6 +95,8 @@ function harness(withLayout = false) {
     state.me = {id: 1}; state.activeId = 'peer'; state.steam.accessAllowed = true;
     resizeComposerInput = () => {};
     globalThis.__test = {refreshChatData, sendText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
+      requestDurableSync, ensureWebSocket, stopWebSocket, startStatusPolling, stopStatusPolling, setupRealtimeResume,
+      syncTask: () => durableSyncTask, syncCursor: () => durableSyncCursor, setSyncCursor: (cursor) => durableSyncCursor = cursor,
       resetHistory, invalidateChat, state, items: () => historyItems, outgoing: () => Array.from(outgoingMessages.values()),
       switchPeer: (id) => { state.activeId = id; resetHistory(); },
       detached: () => historyDetached, busy: () => historyBusy};`, sandbox);
@@ -94,8 +118,17 @@ function harness(withLayout = false) {
     items: () => Item[];
     detached: () => boolean;
     busy: () => boolean;
+    requestDurableSync: () => void;
+    ensureWebSocket: () => void;
+    stopWebSocket: () => void;
+    startStatusPolling: () => void;
+    stopStatusPolling: () => void;
+    setupRealtimeResume: () => void;
+    syncTask: () => Promise<void> | null;
+    syncCursor: () => string;
+    setSyncCursor: (cursor: string) => void;
   };
-  return { api, pending, messages: nodes['#messages'], nodes,
+  return { api, pending, messages: nodes['#messages'], nodes, sockets, timers, events, advance: (ms: number) => { now += ms; },
     flushFrames,
     resize: () => { for (const observer of [...observers]) if (observer.active) observer.callback(); flushFrames(); } };
 }
@@ -642,4 +675,175 @@ test('storage health uses fixed polite text and rejects stale account results', 
   pending[0].resolve(health);
   await request;
   assert.equal(nodes['#storageHealth'].textContent, api.storageHealthText(null));
+});
+
+async function microtasks(predicate: () => boolean) {
+  for (let n = 0; n < 100; n++) { if (predicate()) return; await Promise.resolve(); }
+  assert.fail('Expected async recovery to progress');
+}
+
+const recovered = (n: number, extra: Partial<Item> = {}): Item => ({ ...item(`recovered-${n}`), steamAccountId: 'account',
+  sentAt: new Date(1700000000000 + n * 1000).toISOString(), ...extra });
+
+test('web durable catch-up drains >500 arrivals, keeps identical sends distinct and sorts late history without notifications', async () => {
+  const { api, pending, messages } = harness();
+  api.state.steam.steamId = 'account'; api.state.view = 'chat';
+  api.setSyncCursor('before-sleep');
+  api.requestDurableSync();
+  for (let page = 0; page < 7; page++) {
+    await microtasks(() => pending.length > page);
+    assert.equal(pending[page].url.searchParams.get('cursor'), page ? `page-${page}` : 'before-sleep');
+    const items = Array.from({ length: page === 6 ? 21 : 100 }, (_, i) => recovered(page * 100 + i, { message: 'identical' }));
+    if (page === 6) items[20].sentAt = '2000-01-01T00:00:00.000Z';
+    pending[page].resolve({ steamAccountId: 'account', items, nextCursor: `page-${page + 1}`, hasMore: page < 6 });
+  }
+  await microtasks(() => !api.syncTask());
+  assert.equal(api.items().length, 621);
+  assert.equal(messages.children.length, 621);
+  assert.equal(new Set(api.items().map(i => i.eventId)).size, 621);
+  assert.equal(api.items()[0].eventId, 'recovered-620');
+  assert.equal(api.syncCursor(), 'page-7');
+  // A later WebSocket echo or overlapping replay must leave only one row.
+  api.receiveHistoryMessage({ ...recovered(100), echo: true });
+  api.requestDurableSync();
+  await microtasks(() => pending.length === 8);
+  pending[7].resolve({ steamAccountId: 'account', items: [recovered(100), recovered(999, { steamAccountId: 'other-account' })], nextCursor: 'page-8', hasMore: false });
+  await microtasks(() => !api.syncTask());
+  assert.equal(api.items().length, 621);
+});
+
+test('web catch-up retries a failed later page from its last processed cursor', async () => {
+  const { api, pending } = harness();
+  api.state.steam.steamId = 'account'; api.state.view = 'chat'; api.setSyncCursor('start');
+  api.requestDurableSync();
+  pending[0].resolve({ steamAccountId: 'account', items: [recovered(1)], nextCursor: 'first', hasMore: true });
+  await microtasks(() => pending.length === 2);
+  pending[1].reject(new Error('Network lost'));
+  await microtasks(() => !api.syncTask());
+  assert.equal(api.syncCursor(), 'first');
+  api.requestDurableSync();
+  assert.equal(pending[2].url.searchParams.get('cursor'), 'first');
+  pending[2].resolve({ steamAccountId: 'account', items: [recovered(1), recovered(2)], nextCursor: 'second', hasMore: false });
+  await microtasks(() => !api.syncTask());
+  assert.deepEqual(Array.from(api.items(), i => i.eventId), ['recovered-1', 'recovered-2']);
+});
+
+test('initial sync commits its boundary only after baseline succeeds and preserves existing rows and reading position', async () => {
+  const { api, pending, messages } = harness();
+  api.state.steam.steamId = 'account'; api.state.view = 'chat';
+  const loading = api.loadHistory();
+  pending[0].resolve({ items: Array.from({ length: 10 }, (_, n) => recovered(n)), nextCursor: 'older-page' }); await loading;
+  const original = messages.children[0]; messages.scrollTop = 17;
+  api.requestDurableSync();
+  pending[1].resolve({ steamAccountId: 'account', items: [recovered(11)], liveCursor: 'seed', hasMore: true });
+  await microtasks(() => pending.length === 3);
+  pending[2].reject(new Error('Unavailable conversations'));
+  await microtasks(() => !api.syncTask()); assert.equal(api.syncCursor(), '');
+  api.requestDurableSync();
+  assert.equal(pending[3].url.pathname, '/api/conversations', 'Retry retains the first snapshot instead of reseeding past new arrivals');
+  pending[3].resolve({ items: [{ id: 'peer', name: 'Recovered' }] });
+  await microtasks(() => pending.length === 5);
+  pending[4].resolve({ items: [recovered(10), recovered(11)] });
+  await microtasks(() => pending.length === 6);
+  assert.equal(pending[5].url.searchParams.get('cursor'), 'seed');
+  pending[5].resolve({ steamAccountId: 'account', items: [recovered(12)], nextCursor: 'end', hasMore: false });
+  await microtasks(() => !api.syncTask());
+  assert.equal(api.items().length, 13); assert.equal(messages.children[0], original); assert.equal(messages.scrollTop, 17);
+});
+
+test('invalidated durable cursor rebases once, while stale account and aborted responses cannot advance it', async () => {
+  const { api, pending, timers } = harness(false, true);
+  api.state.steam.steamId = 'account'; api.state.view = 'steam'; api.setSyncCursor('old-generation');
+  api.requestDurableSync(); pending[0].reject(Object.assign(new Error('Reset required'), { status: 409 }));
+  await microtasks(() => pending.length === 2);
+  assert.equal(pending[1].url.searchParams.get('mode'), 'history');
+  pending[1].resolve({ steamAccountId: 'account', items: [], liveCursor: 'fresh', hasMore: false });
+  await microtasks(() => pending.length === 3); pending[2].resolve({ items: [] });
+  await microtasks(() => pending.length === 4);
+  pending[3].resolve({ steamAccountId: 'account', items: [], nextCursor: 'fresh', hasMore: false });
+  await microtasks(() => !api.syncTask()); assert.equal(api.syncCursor(), 'fresh');
+  api.requestDurableSync();
+  const deadline = [...timers.values()].find(timer => timer.delay === 10000)!; deadline.callback();
+  assert.equal(pending[4].signal?.aborted, true);
+  pending[4].resolve({ steamAccountId: 'account', items: [recovered(8)], nextCursor: 'unprocessed', hasMore: false });
+  await microtasks(() => !api.syncTask()); assert.equal(api.syncCursor(), 'fresh');
+  api.requestDurableSync(); api.invalidateChat(); api.state.steam.steamId = 'other-account';
+  pending[5].resolve({ steamAccountId: 'account', items: [recovered(9)], nextCursor: 'secret', hasMore: false });
+  await microtasks(() => !api.syncTask()); assert.equal(api.items().length, 0); assert.equal(api.syncCursor(), '');
+});
+
+test('recovery respects date browsing while updating the recent conversation list', async () => {
+  const { api, pending, messages } = harness();
+  api.state.view = 'chat'; api.state.steam.steamId = 'account'; api.setSyncCursor('start');
+  const loading = api.loadHistory('date', '2023-01-01T00:00'); pending[0].resolve({ items: [recovered(0)] }); await loading;
+  const row = messages.children[0]; api.requestDurableSync();
+  pending[1].resolve({ steamAccountId: 'account', items: [recovered(1)], nextCursor: 'end', hasMore: false });
+  await microtasks(() => !api.syncTask());
+  assert.equal(api.detached(), true); assert.equal(api.items().length, 1); assert.equal(messages.children[0], row);
+  assert.equal(api.state.conversations[0].preview, 'recovered-1');
+  const latest = api.loadHistory(); pending[2].resolve({ items: [recovered(0), recovered(1)] }); await latest;
+  assert.equal(api.items().length, 2);
+});
+
+test('socket open and durable hints catch up, pong avoids reconnect, and missed pong replaces a half-open socket', async () => {
+  const { api, pending, sockets, timers, advance } = harness(false, true);
+  api.state.steam.steamId = 'account'; api.setSyncCursor('start'); api.ensureWebSocket();
+  const socket = sockets[0]; socket.dispatch('open');
+  pending[0].resolve({ steamAccountId: 'account', items: [], nextCursor: 'start', hasMore: false });
+  await microtasks(() => !api.syncTask());
+  const heartbeat = [...timers.values()].find(timer => timer.delay === 5000)!;
+  heartbeat.callback(); assert.deepEqual(socket.sent.map(value => JSON.parse(value)), [{ type: 'ping' }]);
+  socket.dispatch('message', { data: JSON.stringify({ type: 'pong' }) });
+  advance(11000); heartbeat.callback(); assert.equal(socket.closed, false);
+  socket.dispatch('message', { data: JSON.stringify({ type: 'sync_available', steamAccountId: 'wrong-account' }) });
+  assert.equal(pending.length, 1);
+  socket.dispatch('message', { data: JSON.stringify({ type: 'sync_available', steamAccountId: 'account' }) });
+  assert.equal(pending.length, 2);
+  pending[1].resolve({ steamAccountId: 'account', items: [recovered(1)], nextCursor: 'hint', hasMore: false });
+  await microtasks(() => !api.syncTask());
+  advance(11000); heartbeat.callback(); assert.equal(socket.closed, true); assert.equal(sockets.length, 2);
+  assert.equal(pending[2].url.searchParams.get('cursor'), 'hint');
+  api.stopWebSocket(); api.stopStatusPolling();
+});
+
+test('wake events and a timer gap replace old sockets and abort stuck status polling', async () => {
+  const { api, pending, sockets, timers, events, advance } = harness(false, true);
+  api.state.steam.steamId = 'account'; api.setSyncCursor('start'); api.ensureWebSocket(); api.startStatusPolling(); api.setupRealtimeResume();
+  const poll = [...timers.values()].find(timer => timer.delay === 3000)!;
+  void poll.callback(); assert.equal(pending[1].url.pathname, '/api/steam/status');
+  pending[0].resolve({ steamAccountId: 'account', items: [], nextCursor: 'start', hasMore: false });
+  await microtasks(() => !api.syncTask());
+  advance(60000); await poll.callback();
+  assert.equal(pending[1].signal?.aborted, true); assert.equal(sockets[0].closed, true); assert.equal(sockets.length, 2);
+  assert.equal(pending[2].url.searchParams.get('cursor'), 'start');
+  pending[2].resolve({ steamAccountId: 'account', items: [], nextCursor: 'start', hasMore: false });
+  await microtasks(() => !api.syncTask());
+  for (const event of ['visibilitychange', 'online', 'pageshow']) {
+    const prior: number = sockets.length; events.dispatch(event, { persisted: true });
+    assert.equal(sockets.length, prior + 1); assert.equal(sockets[prior - 1].closed, true);
+    const request = pending[pending.length - 1];
+    request.resolve({ steamAccountId: 'account', items: [], nextCursor: 'start', hasMore: false });
+    await microtasks(() => !api.syncTask());
+  }
+  api.stopWebSocket(); api.stopStatusPolling(); pending[1].reject(new Error('Aborted stale poll'));
+});
+
+test('periodic message sync continues when Steam status fails, and a timed-out health read releases polling', async () => {
+  const { api, pending, timers } = harness(false, true);
+  api.state.view = 'chat'; api.state.steam.steamId = 'account'; api.state.steam.status = 'online'; api.setSyncCursor('start');
+  api.startStatusPolling(); const poll = [...timers.values()].find(timer => timer.delay === 3000)!;
+  const first = poll.callback();
+  assert.equal(pending[0].url.pathname, '/api/messages/sync');
+  pending[1].reject(new Error('Status unavailable')); await first;
+  pending[0].resolve({ steamAccountId: 'account', items: [recovered(1)], nextCursor: 'end', hasMore: false });
+  await microtasks(() => !api.syncTask()); assert.equal(api.items().length, 1);
+  const second = poll.callback();
+  pending[2].resolve({ status: 'online', steamId: 'account', accessAllowed: true });
+  await microtasks(() => pending.length === 4);
+  assert.equal(pending[3].url.pathname, '/api/history/status');
+  [...timers.values()].find(timer => timer.delay === 10000)!.callback();
+  assert.equal(pending[3].signal?.aborted, true);
+  pending[3].reject(new Error('Health request aborted')); await second;
+  const third = poll.callback(); assert.equal(pending[4].url.pathname, '/api/steam/status');
+  pending[4].reject(new Error('End of test')); await third; api.stopStatusPolling();
 });

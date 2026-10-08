@@ -309,6 +309,7 @@ function resetHistory() {
 }
 
 function invalidateChat() {
+  resetDurableSync();
   closeDesktopNotifications();
   notificationAudio?.pause();
   lastNotificationSound = 0;
@@ -2295,7 +2296,7 @@ function pageCursor(payload: unknown, key = 'nextCursor'): string {
 }
 
 let conversationRequest = 0;
-async function loadConversations(more = false) {
+async function loadConversations(more = false, signal?: AbortSignal) {
   if (!state.me || !steamAccessAllowed() || (more && (conversationsBusy || !conversationsBefore))) return;
   const context = chatContext();
   const request = ++conversationRequest;
@@ -2304,8 +2305,8 @@ async function loadConversations(more = false) {
   conversationsBusy = true;
   updateChatLists();
   try {
-    const payload = await api(`/api/conversations?${params}`);
-    if (context !== chatContext() || request !== conversationRequest) return;
+    const payload = await api(`/api/conversations?${params}`, { signal });
+    if (signal?.aborted || context !== chatContext() || request !== conversationRequest) return;
     const items = asListEntries(isRecord(payload) ? payload.items : payload);
     const merged = new Map((more ? state.conversations : []).map((item) => [item.id, item]));
     for (const item of items) if (!more || !merged.has(item.id)) merged.set(item.id, item);
@@ -2322,8 +2323,9 @@ async function loadConversations(more = false) {
     }
     state.conversations = [...merged.values()].sort((left, right) => conversationTimestamp(right.updatedAt) - conversationTimestamp(left.updatedAt));
     conversationsBefore = pageCursor(payload);
+    return true;
   } catch (_) {
-    if (context === chatContext() && request === conversationRequest) setFeedback('会话列表暂时无法加载，请稍后重试。', 'warn');
+    if (!signal?.aborted && context === chatContext() && request === conversationRequest) setFeedback('会话列表暂时无法加载，请稍后重试。', 'warn');
   } finally {
     if (context === chatContext() && request === conversationRequest) {
       conversationsBusy = false;
@@ -2422,16 +2424,16 @@ function updateStorageHealth() {
   if (node) node.hidden = storageHealth === undefined || storageHealthy(storageHealth);
 }
 
-async function loadStorageHealth() {
+async function loadStorageHealth(signal?: AbortSignal) {
   if (!state.me || !steamAccessAllowed()) return;
   const context = chatContext();
   const request = ++healthRequest;
   try {
-    const payload = await api('/api/history/status');
-    if (context !== chatContext() || request !== healthRequest) return;
+    const payload = await api('/api/history/status', { signal });
+    if (signal?.aborted || context !== chatContext() || request !== healthRequest) return;
     storageHealth = payload;
   } catch (_) {
-    if (context !== chatContext() || request !== healthRequest) return;
+    if (signal?.aborted || context !== chatContext() || request !== healthRequest) return;
     storageHealth = null;
   }
   updateStorageHealth();
@@ -2447,7 +2449,7 @@ function uniqueMessages(items: MessageItem[]): MessageItem[] {
   });
 }
 
-async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest', date = '') {
+async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest', date = '', options: { signal?: AbortSignal; preserve?: boolean } = {}) {
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages || !state.activeId || !steamAccessAllowed()) return;
   if (isCommunityGroup()) {
@@ -2471,8 +2473,8 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
     if (mode === 'older') params.set('before', historyBefore);
     if (mode === 'newer') params.set('after', historyAfter);
     if (mode === 'date') params.set('at', String(new Date(date).getTime()));
-    const payload = await api(`/api/history?${params}`);
-    if (!current()) return;
+    const payload = await api(`/api/history?${params}`, { signal: options.signal });
+    if (options.signal?.aborted || !current()) return;
     const items = uniqueMessages(asMessages(isRecord(payload) ? payload.items : payload));
     const confirmed = new Set(items.map((item) => item.eventId).filter(Boolean));
     historyLive = historyLive.filter((item) => !item.eventId || !confirmed.has(item.eventId));
@@ -2495,22 +2497,23 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
       }
       watchHistoryLayout(messages, false);
     } else {
+      const top = messages.scrollTop;
+      const following = historyScroll?.following() ?? messages.scrollHeight - top - messages.clientHeight < 48;
       historyDetached = mode === 'date';
       historyAt = mode === 'date' ? date : '';
-      historyItems = uniqueMessages([...items, ...(historyDetached ? [] : historyLive)]).sort((left, right) => {
-        const difference = Date.parse(left.sentAt || left.date || '') - Date.parse(right.sentAt || right.date || '');
-        return (Number.isFinite(difference) ? difference : 0) || Number(left.ordinal || 0) - Number(right.ordinal || 0);
-      });
-      historyBefore = pageCursor(payload);
+      historyItems = sortHistoryItems([...(options.preserve ? historyItems : []), ...items, ...(historyDetached ? [] : historyLive)]);
+      if (!options.preserve || !historyBefore) historyBefore = pageCursor(payload);
       historyAfter = pageCursor(payload, 'previousCursor');
       renderHistory(historyItems);
+      if (options.preserve && !following) { messages.scrollTop = top; watchHistoryLayout(messages, false); }
       void loadReactionSnapshots(true);
       if (historyDetached) messages.scrollTop = 0;
       const input = document.querySelector<HTMLInputElement>('#historyDate');
       if (input) input.value = historyAt;
     }
+    return true;
   } catch (_) {
-    if (current()) setFeedback('历史消息暂时无法加载，请重试。', 'warn');
+    if (!options.signal?.aborted && current()) setFeedback('历史消息暂时无法加载，请重试。', 'warn');
   } finally {
     if (current()) {
       historyBusy = false;
@@ -2525,7 +2528,7 @@ function conversationTimestamp(value: unknown): number {
   return Number.isFinite(at) ? at : 0;
 }
 
-function updateRecentConversation(item: MessageItem) {
+function updateRecentConversation(item: MessageItem, render = true) {
   const previous = state.conversations.find((entry) => entry.id === item.id);
   const updatedAt = item.sentAt || item.date || new Date().toISOString();
   if (previous && conversationTimestamp(previous.updatedAt) > conversationTimestamp(updatedAt)) return;
@@ -2539,7 +2542,7 @@ function updateRecentConversation(item: MessageItem) {
   recentConversationUpdates.set(item.id, conversation);
   state.conversations = [conversation, ...state.conversations.filter((entry) => entry.id !== item.id)]
     .sort((left, right) => conversationTimestamp(right.updatedAt) - conversationTimestamp(left.updatedAt));
-  updateChatLists();
+  if (render) updateChatLists();
 }
 
 const desktopNotificationEvents = new Set<string>();
@@ -4300,12 +4303,165 @@ function renderPicker(container: HTMLElement) {
   fill(container.dataset.inventoryType === 'effects' ? 'effects' : container.dataset.inventoryType === 'custom' ? 'custom' : container.dataset.inventoryType === 'stickers' ? 'stickers' : 'emoticons');
 }
 
+let durableSyncCursor = '';
+let durableSyncSeed: Record<string, unknown> | null = null;
+let durableSyncTask: Promise<void> | null = null;
+let durableSyncAbort: AbortController | null = null;
+let durableSyncQueued = false;
+let durableSyncGeneration = 0;
+let durableSyncLastPoll = 0;
+let wsHeartbeat: ReturnType<typeof setInterval> | null = null;
+let statusPollGeneration = 0;
+let statusPollAbort: AbortController | null = null;
+let resumeSetup = false;
+
+function resetDurableSync() {
+  durableSyncGeneration++;
+  durableSyncAbort?.abort();
+  durableSyncAbort = null;
+  durableSyncTask = null;
+  durableSyncCursor = '';
+  durableSyncSeed = null;
+  durableSyncQueued = false;
+  durableSyncLastPoll = 0;
+}
+
+function sortHistoryItems(items: MessageItem[]) {
+  return uniqueMessages(items).sort((left, right) => {
+    const difference = Date.parse(left.sentAt || left.date || '') - Date.parse(right.sentAt || right.date || '');
+    return (Number.isFinite(difference) ? difference : 0) || Number(left.ordinal || 0) - Number(right.ordinal || 0);
+  });
+}
+
+function applyDurableMessages(items: MessageItem[]) {
+  const account = state.steam.activeAccount?.steamId || state.steam.steamId;
+  const accepted = items.filter(item => item.id && item.eventId && item.steamAccountId === account);
+  for (const item of accepted) updateRecentConversation(item, false);
+  if (accepted.length) updateChatLists();
+  const current = accepted.filter(item => item.id === state.activeId);
+  if (!current.length) return;
+  historyLive = sortHistoryItems([...historyLive, ...current]).slice(-500);
+  if (historyDetached || state.view !== 'chat') return;
+  const before = new Set(historyItems.map(item => item.eventId));
+  if (!current.some(item => !before.has(item.eventId))) return;
+  const messages = document.querySelector<HTMLElement>('#messages');
+  const top = messages?.scrollTop || 0;
+  const following = historyScroll?.following() ?? Boolean(messages && messages.scrollHeight - top - messages.clientHeight < 48);
+  historyItems = sortHistoryItems([...historyItems, ...current]);
+  renderHistory(historyItems);
+  if (messages && !following) { messages.scrollTop = top; watchHistoryLayout(messages, false); }
+}
+
+async function refreshDurableBaseline(context: string, signal: AbortSignal) {
+  if (!await loadConversations(false, signal) || signal.aborted || context !== chatContext()) return false;
+  if (!state.activeId || state.view !== 'chat' || historyDetached || historyBrowsingRequest || isCommunityGroup()) return true;
+  return Boolean(await loadHistory('latest', '', { signal, preserve: true }));
+}
+
+function requestDurableSync() {
+  const account = state.steam.activeAccount?.steamId || state.steam.steamId;
+  if (!state.me || !steamAccessAllowed() || !account) return;
+  durableSyncQueued = true;
+  if (durableSyncTask) return;
+  const context = chatContext(), generation = durableSyncGeneration;
+  const current = () => context === chatContext() && generation === durableSyncGeneration && Boolean(state.me) && steamAccessAllowed();
+  const task = (async () => {
+    let rebased = false;
+    while (durableSyncQueued && current()) {
+      durableSyncQueued = false;
+      let more = true;
+      while (more && current()) {
+        const initializing = !durableSyncCursor;
+        const params = new URLSearchParams({ steamAccountId: account, limit: initializing ? '1' : '100' });
+        if (initializing) params.set('mode', 'history');
+        else params.set('cursor', durableSyncCursor);
+        const controller = new AbortController();
+        durableSyncAbort = controller;
+        const deadline = setTimeout(() => controller.abort(), 10000);
+        try {
+          const page = initializing && durableSyncSeed ? durableSyncSeed : await api(`/api/messages/sync?${params}`, { signal: controller.signal });
+          if (!current() || controller.signal.aborted) return;
+          if (!isRecord(page) || page.steamAccountId !== account || !Array.isArray(page.items) || typeof page.hasMore !== 'boolean') {
+            throw new Error('Invalid durable message sync response');
+          }
+          const cursor = initializing ? page.liveCursor : page.nextCursor;
+          if (typeof cursor !== 'string' || !cursor || (!initializing && page.hasMore && cursor === durableSyncCursor)) {
+            throw new Error('Invalid durable message sync cursor');
+          }
+          if (initializing) {
+            // Retain the first snapshot while baseline reads retry; a later seed
+            // would skip arrivals committed between the two snapshots.
+            durableSyncSeed = page;
+            if (!await refreshDurableBaseline(context, controller.signal)) throw new Error('Message sync baseline unavailable');
+          }
+          if (!current() || controller.signal.aborted) return;
+          applyDurableMessages(asMessages(page.items));
+          durableSyncCursor = cursor;
+          durableSyncSeed = null;
+          durableSyncLastPoll = Date.now();
+          more = initializing || page.hasMore;
+        } catch (error) {
+          if (current() && isRecord(error) && error.status === 409 && !rebased) {
+            durableSyncCursor = ''; durableSyncSeed = null; rebased = true; continue;
+          }
+          throw error;
+        } finally {
+          clearTimeout(deadline);
+          if (durableSyncAbort === controller) durableSyncAbort = null;
+        }
+      }
+    }
+  })();
+  durableSyncTask = task;
+  void task.catch(() => {
+    // Keep the last committed cursor. A later hint, wake event or poll retries from it.
+  }).finally(() => {
+    if (durableSyncTask !== task) return;
+    durableSyncTask = null;
+    if (durableSyncQueued && current()) requestDurableSync();
+  });
+}
+
+function recoverRealtimeConnection() {
+  if (!state.me || !steamAccessAllowed()) return;
+  durableSyncAbort?.abort();
+  stopWebSocket();
+  stopStatusPolling();
+  ensureWebSocket();
+  startStatusPolling();
+  requestDurableSync();
+}
+
+function setupRealtimeResume() {
+  if (resumeSetup) return;
+  resumeSetup = true;
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') recoverRealtimeConnection();
+  });
+  window.addEventListener('online', recoverRealtimeConnection);
+  window.addEventListener('pageshow', event => { if (event.persisted) recoverRealtimeConnection(); });
+}
+
 function ensureWebSocket() {
   if (!state.me || !steamAccessAllowed() || state.ws || state.reconnectTimer) return;
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${protocol}//${location.host}${state.wsPath}`);
   state.ws = ws;
   const context = chatContext();
+  let pingSentAt = 0;
+  ws.addEventListener('open', () => {
+    if (state.ws !== ws || context !== chatContext()) return;
+    requestDurableSync();
+    if (wsHeartbeat) clearInterval(wsHeartbeat);
+    wsHeartbeat = setInterval(() => {
+      if (state.ws !== ws || context !== chatContext()) return;
+      if (pingSentAt && Date.now() - pingSentAt >= 10000) { recoverRealtimeConnection(); return; }
+      if (!pingSentAt && ws.readyState === WebSocket.OPEN) {
+        pingSentAt = Date.now();
+        ws.send(JSON.stringify({ type: 'ping' }));
+      }
+    }, 5000);
+  });
   ws.addEventListener('message', (event) => {
     if (state.ws !== ws || context !== chatContext()) return;
     let payload: WsPayload;
@@ -4313,6 +4469,11 @@ function ensureWebSocket() {
       const parsed: unknown = JSON.parse(String(event.data));
       payload = isRecord(parsed) ? parsed : {};
     } catch {
+      return;
+    }
+    if (payload.type === 'pong') { pingSentAt = 0; return; }
+    if (payload.type === 'sync_available') {
+      if (payload.steamAccountId === (state.steam.activeAccount?.steamId || state.steam.steamId)) requestDurableSync();
       return;
     }
     if (payload.type === 'storage_status') {
@@ -4337,6 +4498,8 @@ function ensureWebSocket() {
   });
   ws.addEventListener('close', () => {
     if (state.ws !== ws) return;
+    if (wsHeartbeat) clearInterval(wsHeartbeat);
+    wsHeartbeat = null;
     state.ws = null;
     if (state.me) {
       state.reconnectTimer = setTimeout(() => {
@@ -4348,6 +4511,8 @@ function ensureWebSocket() {
 }
 
 function stopWebSocket() {
+  if (wsHeartbeat) clearInterval(wsHeartbeat);
+  wsHeartbeat = null;
   if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
   state.reconnectTimer = null;
   const ws = state.ws;
@@ -4357,14 +4522,24 @@ function stopWebSocket() {
 
 function startStatusPolling() {
   if (state.statusTimer || !state.me) return;
+  const generation = ++statusPollGeneration;
+  let lastTick = Date.now();
   let polling = false;
   state.statusTimer = setInterval(async () => {
+    const now = Date.now();
+    const gap = now - lastTick;
+    lastTick = now;
+    if (document.visibilityState === 'visible' && gap > 15000) { recoverRealtimeConnection(); return; }
+    if (Date.now() - durableSyncLastPoll >= 15000) requestDurableSync();
     if (polling) return;
     polling = true;
     const context = chatContext();
+    const controller = new AbortController();
+    statusPollAbort = controller;
+    const deadline = setTimeout(() => controller.abort(), 10000);
     try {
-      const status = await api('/api/steam/status');
-      if (context !== chatContext() || !state.me) return;
+      const status = await api('/api/steam/status', { signal: controller.signal });
+      if (context !== chatContext() || !state.me || generation !== statusPollGeneration) return;
       const previousSignature = steamStatusSignature();
       const wasOnline = steamOnline();
       updateSteamStatus(status as SteamStatus);
@@ -4373,20 +4548,26 @@ function startStatusPolling() {
         return;
       }
       if (state.view === 'chat') {
-        await loadStorageHealth();
-        void loadReactionSnapshots();
+        await loadStorageHealth(controller.signal);
       }
+      if (controller.signal.aborted || context !== chatContext() || !state.me || generation !== statusPollGeneration) return;
+      if (state.view === 'chat') void loadReactionSnapshots();
       ensureWebSocket();
-      if (state.view === 'chat' && (steamOnline() !== wasOnline || steamStatusSignature() !== previousSignature)) await refreshChatData();
+      if (state.view === 'chat' && (steamOnline() !== wasOnline || steamStatusSignature() !== previousSignature)) void refreshChatData();
     } catch (_) {
       // Authentication errors are handled by api().
     } finally {
+      clearTimeout(deadline);
+      if (statusPollAbort === controller) statusPollAbort = null;
       polling = false;
     }
   }, 3000);
 }
 
 function stopStatusPolling() {
+  statusPollGeneration++;
+  statusPollAbort?.abort();
+  statusPollAbort = null;
   if (state.statusTimer) clearInterval(state.statusTimer);
   state.statusTimer = null;
 }
@@ -4401,6 +4582,7 @@ async function logoutApp() {
 }
 
 async function bootstrap() {
+  setupRealtimeResume();
   setupAppInstallation();
   const mePayload = await api('/api/auth/me') as MeResponse;
   state.needsSetup = Boolean(mePayload.needsSetup);

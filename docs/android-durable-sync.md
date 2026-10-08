@@ -3,6 +3,7 @@
 Backend contract for a direct-message Android client with images and Steam
 emotes, including recent-first initialization and progressive historical paging.
 Existing Web history/conversation endpoints keep their timestamp-oriented paging.
+The Web client also uses the arrival feed for [sleep/reconnect recovery](web-sleep-recovery.md).
 
 ## HTTP Contract
 
