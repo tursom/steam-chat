@@ -307,6 +307,25 @@ test('Steam MP4 BBCode renders a click-to-load player with its original link', (
   }
 });
 
+test('Bilibili full video and share links have one click-to-load player in plain text, BBCode and previews', () => {
+  const { renderMessage } = loadWebTestApi();
+  for (const url of ['https://www.bilibili.com/video/BV1xx411c7mD?p=2', 'https://m.bilibili.com/video/av170001', 'https://b23.tv/AbC123']) {
+    for (const message of [url, `[url=${url}]视频[/url]`, `[og url="${url}" title="视频预览"]${url}[/og]`,
+      `[og url="${url}" title="视频预览"][url=${url}]${url}[/url][/og]`]) {
+      const row = renderMessage({ id: 'peer', message });
+      assert.equal(row.findAllByClass('bilibili-player').length, 1);
+      assert.equal(row.findByTag('iframe'), null, 'Loading history does not load a third-party iframe');
+      assert.match(row.textContent, /播放 B 站视频/);
+      assert.equal(row.findByClass('bilibili-original')!.href, url);
+    }
+  }
+  for (const url of ['https://www.bilibili.com.evil.test/video/BV1xx411c7mD', 'https://live.bilibili.com/123',
+    'https://www.bilibili.com/video/BVbad', 'https://www.bilibili.com/video/av170001?p=-1', 'https://b23.tv/foo/bar',
+    'https://b23.tv.evil.test/AbC123', 'https://user:pass@www.bilibili.com/video/av170001']) {
+    assert.equal(renderMessage({ id: 'peer', message: url }).findByClass('bilibili-player'), null, url);
+  }
+});
+
 test('unsupported, unsafe and malformed video BBCode remains readable literal text', () => {
   const { renderMessage } = loadWebTestApi();
   const source = 'https://cdn.steamusercontent.com/ugc/123/0123456789ABCDEF0123456789ABCDEF01234567/';

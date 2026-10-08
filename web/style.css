@@ -2919,6 +2919,31 @@ html.video-web-fullscreen body {
 .netease-player p { font-size: 12px; margin: 0; }
 .netease-player button { justify-self: start; }
 
+.bilibili-player {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  width: 100%;
+  min-width: 0;
+  gap: 8px;
+  padding: 12px;
+  box-sizing: border-box;
+  white-space: normal;
+}
+
+.bilibili-player iframe {
+  width: 100%;
+  aspect-ratio: 16 / 9;
+  border: 0;
+  border-radius: 8px;
+  background: #000;
+}
+
+.bilibili-player p,
+.bilibili-original { font-size: 12px; margin: 0; }
+.bilibili-player button { justify-self: start; }
+.msg-row:has(.bilibili-player) { grid-template-columns: minmax(0, 1fr); }
+.bubble:has(.bilibili-player) { width: 584px; }
+
 .outgoing-error { display: block; margin-top: 4px; font-size: 12px; overflow-wrap: anywhere; }
 .outgoing-dismiss { display: block; margin-top: 6px; font-size: 12px; }
 .bubble > .outgoing-dismiss { min-height: 28px; margin: 0 12px 10px; }

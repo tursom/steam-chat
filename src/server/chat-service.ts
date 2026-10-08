@@ -3,6 +3,7 @@
 import { ImageEmoteStore } from '../storage/image-emotes';
 import { handleDeployWebhook } from './deploy-webhook';
 import { readMessageReactions, updateMessageReaction, type ReactionClient } from './message-reactions';
+import { resolveBilibiliLink } from './bilibili-links';
 import { resolveStickerAlias } from './sticker-inventory';
 import { settleMetadata } from '../steam/metadata';
 import { steamEventKey } from '../storage/history-message';
@@ -1239,6 +1240,16 @@ function createChatService(options: ChatServiceOptions = {}) {
       if (await handleSteamApi(req, res, url)) return;
       if (await handleUsersApi(req, res, url)) return;
       if (await handleAuditApi(req, res, url)) return;
+
+      if (url.pathname === '/api/bilibili/resolve') {
+        if (!sessionManager) throw Object.assign(new Error('Session authentication required'), { statusCode: 401 });
+        requirePermission(req, 'chat.use');
+        if (req.method !== 'GET') { jsonResponse(res, 405, { error: 'Method not allowed' }); return; }
+        const result = await resolveBilibiliLink(url.searchParams.get('url'), fetchImpl);
+        requirePermission(req, 'chat.use');
+        jsonResponse(res, 200, result, { 'Cache-Control': 'private, no-store' });
+        return;
+      }
 
       if (url.pathname === '/api/image-emotes' || url.pathname.startsWith('/api/image-emotes/file/')) {
         if (!sessionManager) throw Object.assign(new Error('Session authentication required'), { statusCode: 401 });

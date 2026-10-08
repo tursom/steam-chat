@@ -3175,7 +3175,7 @@ function appendSupportedBbcode(
     const preview = parseOpenGraphPreview(attributes);
     if (!preview) return false;
     container.append(openGraphNode(preview));
-    if (body.trim() !== preview.url) appendInlineMessageText(container, body);
+    if (body.trim() !== preview.url && !bbcodeLinkMatchesSource(body, preview.url)) appendInlineMessageText(container, body);
     return true;
   }
 
@@ -3183,7 +3183,7 @@ function appendSupportedBbcode(
     const url = parseUrlTarget(attributes, body);
     if (!url) return false;
     container.append(externalLink('', url, body.trim() ? body : url));
-    const player = neteasePlayer(url);
+    const player = externalMediaPlayer(url);
     if (player) container.append(player);
     return true;
   }
@@ -3545,6 +3545,80 @@ function neteasePlayer(url: string): HTMLElement | null {
   return shell;
 }
 
+type BilibiliVideo = { key: 'bvid' | 'aid'; id: string; page: number };
+
+function bilibiliLink(value: string): URL | null {
+  try {
+    const url = new URL(value);
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.port) return null;
+    return url;
+  } catch { return null; }
+}
+
+function bilibiliVideo(value: string): BilibiliVideo | null {
+  const url = bilibiliLink(value);
+  if (!url || !['bilibili.com', 'www.bilibili.com', 'm.bilibili.com'].includes(url.hostname)) return null;
+  const match = /^\/video\/(BV[A-Za-z0-9]{10}|av([1-9]\d{0,19}))\/?$/.exec(url.pathname);
+  if (!match) return null;
+  const page = url.searchParams.get('p') || '1';
+  if (!/^[1-9]\d{0,3}$/.test(page) || Number(page) > 1000) return null;
+  return { key: match[2] ? 'aid' : 'bvid', id: match[2] || match[1], page: Number(page) };
+}
+
+function bilibiliPlayer(url: string): HTMLElement | null {
+  const direct = bilibiliVideo(url);
+  const parsed = bilibiliLink(url);
+  const short = parsed && ['b23.tv', 'www.b23.tv'].includes(parsed.hostname) && /^\/[A-Za-z0-9]{1,32}\/?$/.test(parsed.pathname);
+  if (!direct && !short) return null;
+  const shell = create('div', 'bilibili-player');
+  const button = create('button', 'ghost-btn', '▶ 播放 B 站视频');
+  button.type = 'button';
+  const note = create('p', 'muted', '通过 B 站官方播放器播放；若无法播放，请打开原视频。');
+  note.setAttribute('role', 'status');
+  const original = externalLink('bilibili-original', url, '打开原视频');
+  button.addEventListener('click', async () => {
+    if (button.disabled || shell.querySelector('iframe')) return;
+    button.disabled = true;
+    const context = chatContext();
+    try {
+      let video = direct;
+      if (!video) {
+        note.textContent = '正在解析 B 站分享链接…';
+        const result = await api(`/api/bilibili/resolve?${new URLSearchParams({ url })}`);
+        video = isRecord(result) && typeof result.url === 'string' ? bilibiliVideo(result.url) : null;
+      }
+      if (!shell.isConnected || context !== chatContext()) return;
+      if (!video) throw new Error('分享链接未能解析为视频');
+      const frame = create('iframe');
+      const params = new URLSearchParams({ [video.key]: video.id, page: String(video.page), autoplay: '0' });
+      frame.src = `https://player.bilibili.com/player.html?${params}`;
+      frame.title = 'B 站视频播放器';
+      frame.allowFullscreen = true;
+      frame.setAttribute('allow', 'fullscreen; autoplay; picture-in-picture');
+      frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-presentation allow-popups allow-popups-to-escape-sandbox');
+      frame.referrerPolicy = 'no-referrer';
+      frame.addEventListener('error', () => { note.textContent = '播放器加载失败，请打开原视频。'; });
+      const close = create('button', 'ghost-btn', '关闭播放器'); close.type = 'button';
+      close.addEventListener('click', () => {
+        frame.remove(); close.remove(); button.hidden = false; button.disabled = false;
+      });
+      button.hidden = true;
+      note.textContent = '若视频需要登录或受到播放限制，请打开原视频。';
+      shell.append(frame, close);
+    } catch {
+      if (!shell.isConnected || context !== chatContext()) return;
+      button.disabled = false;
+      note.textContent = '视频链接解析失败，请稍后重试或打开原视频。';
+    }
+  });
+  shell.append(button, original, note);
+  return shell;
+}
+
+function externalMediaPlayer(url: string): HTMLElement | null {
+  return neteasePlayer(url) || bilibiliPlayer(url);
+}
+
 function openGraphNode(preview: OpenGraphPreview) {
   const card = create('section', 'og-card');
   const main = create('div', 'og-main');
@@ -3589,7 +3663,7 @@ function openGraphNode(preview: OpenGraphPreview) {
   });
   footer.append(domain, copyButton);
   card.append(main, footer);
-  const player = neteasePlayer(preview.url);
+  const player = externalMediaPlayer(preview.url);
   if (player) card.append(player);
   return card;
 }
@@ -3696,7 +3770,7 @@ function appendInlineMessageText(container: HTMLElement, text: string) {
       container.append(emoticonNode(match[1] || match[2]));
     } else if (match[3]) {
       container.append(externalLink('', match[3], match[3]));
-      const player = neteasePlayer(match[3]);
+      const player = externalMediaPlayer(match[3]);
       if (player) container.append(player);
     }
     lastIndex = match.index + match[0].length;
