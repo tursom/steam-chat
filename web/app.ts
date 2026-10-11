@@ -3104,6 +3104,11 @@ function renderMessage(item: MessageItem) {
 }
 
 function appendMessageText(container: HTMLElement, text: string) {
+  const imageUrl = steamUgcImageUrl(text.trim());
+  if (imageUrl) {
+    container.append(steamImageNode({ sourceUrl: imageUrl, displayUrl: imageUrl, sourceSet: '', width: 0, height: 0 }));
+    return;
+  }
   const lowerText = text.toLowerCase();
   let lastIndex = 0;
   while (lastIndex < text.length) {
@@ -3185,6 +3190,10 @@ function appendSupportedBbcode(
   if (tag === 'url') {
     const url = parseUrlTarget(attributes, body);
     if (!url) return false;
+    if (steamUgcImageUrl(url) && (!body.trim() || body.trim() === url)) {
+      container.append(steamImageNode({ sourceUrl: url, displayUrl: url, sourceSet: '', width: 0, height: 0 }));
+      return true;
+    }
     container.append(externalLink('', url, body.trim() ? body : url));
     const player = externalMediaPlayer(url);
     if (player) container.append(player);
@@ -3297,6 +3306,16 @@ function parseBbcodeAttributes(source: string, allowed: Set<string>, requireQuot
     values[name] = value;
   }
   return values;
+}
+
+function steamUgcImageUrl(value: string): string {
+  try {
+    const url = new URL(value);
+    if (url.href === value && url.protocol === 'https:' && !url.username && !url.password && !url.port
+      && url.hostname === 'images.steamusercontent.com' && !url.search && !url.hash
+      && /^\/ugc\/\d+\/[a-f0-9]{40}\/$/i.test(url.pathname)) return value;
+  } catch { /* Not a complete Steam image URL. */ }
+  return '';
 }
 
 function parseSteamImagePreview(attributes: string, body: string): SteamImagePreview | null {

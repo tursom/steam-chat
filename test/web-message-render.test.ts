@@ -584,6 +584,51 @@ for (const name of ['steamhappy', ':steamhappy:', '\u02d0steamhappy\u02d0']) {
   });
 }
 
+const bareSteamImages = [
+  'https://images.steamusercontent.com/ugc/13625097894513798381/0123456789ABCDEF0123456789ABCDEF01234567/',
+  'https://images.steamusercontent.com/ugc/13627318694928895524/FEDCBA9876543210FEDCBA9876543210FEDCBA98/'
+];
+
+for (const [index, url] of bareSteamImages.entries()) {
+  test(`bare Steam image ${index + 1} renders existing text records and opens the original in the lightbox`, async () => {
+    const { renderMessage, lightbox, lightboxImage } = loadWebTestApi();
+    for (const message of [url, ` \n${url}\n `, `[url]${url}[/url]`, `[url=${url}]${url}[/url]`]) {
+      for (const echo of [false, true]) {
+        const rendered = renderMessage({ id: '1', type: 'message', eventId: 'unchanged', echo, message });
+        const image = rendered.findByClass('bbcode-image');
+        assert.ok(image); assert.equal(rendered.dataset.eventId, 'unchanged');
+        assert.equal(image.src, `/proxy/image?url=${encodeURIComponent(url)}`);
+        assert.equal(rendered.findByClass('message-content')!.textContent, '');
+        await rendered.findByClass('bbcode-image-button')!.dispatch('click');
+        assert.equal(lightbox.hidden, false); assert.equal(lightboxImage.src, image.src);
+        await image.dispatch('error');
+        const fallback = rendered.findByClass('bbcode-image-fallback')!;
+        assert.equal(fallback.href, url); assert.equal(fallback.textContent, url);
+        assert.equal(rendered.findAllByTag('img').length, 0);
+      }
+    }
+  });
+}
+
+test('Steam image detection preserves ordinary URLs, descriptive links, malformed paths and escaped markup', () => {
+  const { renderMessage } = loadWebTestApi();
+  const url = bareSteamImages[0];
+  for (const message of [
+    'https://example.com/photo.png', url.replace('images.', 'cdn.'),
+    url.replace('images.steamusercontent.com', 'images.steamusercontent.com.evil.test'),
+    url.replace('https:', 'http:'), url.replace('https://', 'https://user:password@'),
+    url.replace('.com/', '.com:8443/'), `${url}?imw=512`, `${url}#fragment`, url.slice(0, -1),
+    url.replace('0123456789ABCDEF0123456789ABCDEF01234567', 'not-an-image'),
+    `看这个 ${url}`, `[url=${url}]原链接[/url]`,
+    `\\[img src=${url}]\\[url=${url}]${url}\\[/url]\\[/img]`, `\\[url=${url}]${url}\\[/url]`
+  ]) {
+    const rendered = renderMessage({ id: '1', type: 'message', message });
+    assert.equal(rendered.findAllByTag('img').length, 0, message);
+    assert.equal(rendered.findByClass('message-content')!.textContent,
+      message === `[url=${url}]原链接[/url]` ? '原链接' : message.replace(/\\([\\\[])/g, '$1'));
+  }
+});
+
 test('web chat renders HAR-style Steam image BBCode with proxying, aspect ratio, and lightbox', async () => {
   const { renderMessage, lightbox, lightboxImage } = loadWebTestApi();
   const fullUrl = 'https://images.example.com/ugc/full/image/';
