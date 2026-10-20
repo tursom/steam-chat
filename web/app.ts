@@ -192,6 +192,7 @@ type AppState = {
   chatListCollapsed: boolean;
   historyLimit: number;
   wsPath: string;
+  sendOperations: boolean;
   ws: WebSocket | null;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   statusTimer: ReturnType<typeof setInterval> | null;
@@ -246,6 +247,7 @@ const state: AppState = {
   chatListCollapsed: localStorage.getItem('steam-chat.list-collapsed') === 'true',
   historyLimit: clampLimit(localStorage.getItem('steam-chat.history-limit') || 100),
   wsPath: '/ws',
+  sendOperations: false,
   ws: null,
   reconnectTimer: null,
   statusTimer: null,
@@ -260,6 +262,10 @@ const state: AppState = {
 
 type OutgoingState = 'sending' | 'sent' | 'failed' | 'unknown';
 type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string };
+type ImageOperation = { id: string; peerId: string; steamAccountId: string; state: string; version: number;
+  attempts: number; maxAttempts: number; nextRetryAt: number; phase: string; error?: string; retryable: boolean; hasImage: boolean; item?: MessageItem; cooldownUntil?: number; replacementId?: string };
+type ImageOperationEntry = OutgoingMessage & { operation?: ImageOperation; imagePayload?: Record<string, string>; transfer?: ImageTransfer;
+  operationBusy?: boolean; operationQueryBusy?: boolean; operationQueryError?: boolean; lastOperationQuery?: number; operationMissing?: boolean; operationCreatingFailed?: boolean };
 const outgoingMessages = new Map<number, OutgoingMessage>();
 let outgoingId = 0;
 let chatEpoch = 0;
@@ -309,6 +315,7 @@ function resetHistory() {
 }
 
 function invalidateChat() {
+  stopImageOperationPolling();
   resetDurableSync();
   closeDesktopNotifications();
   notificationAudio?.pause();
@@ -525,6 +532,7 @@ function updateSteamStatus(status: SteamStatus) {
     void loadHistory();
     ensureWebSocket();
   }
+  if ((accountChanged || previousAccess !== steamAccessAllowed()) && state.sendOperations && state.me && steamAccessAllowed()) restoreImageOperations();
 }
 
 async function api(path: string, options: RequestInit = {}, onUploadProgress?: (percent: number | null) => void): Promise<unknown> {
@@ -2260,6 +2268,7 @@ function openConversation(id: unknown, name = '') {
   if (!alreadyActive) resetHistory();
   state.activeName = name || target;
   state.chatPanel = 'thread';
+  if (state.sendOperations) saveImageOperationMetadata();
   localStorage.setItem('steam-chat.target', state.activeId);
   if (state.view !== 'chat') return;
   const layout = document.querySelector<HTMLElement>('#chatLayout');
@@ -2282,6 +2291,7 @@ function openConversation(id: unknown, name = '') {
 
 function showChatList() {
   state.chatPanel = 'list';
+  if (state.sendOperations) saveImageOperationMetadata();
   setFriendDetailsOpen(false, false);
   syncChatPanel();
 }
@@ -2853,7 +2863,7 @@ function renderHistory(items: MessageItem[]) {
     }
   }
   for (const entry of outgoing) {
-    const localImage = entry.item.type === 'image' && (/^data:image\//i.test(entry.item.message || '') || (entry.item.message || '').startsWith('/api/image-emotes/file/'));
+    const localImage = entry.item.type === 'image' && (/^data:image\//i.test(entry.item.message || '') || (entry.item.message || '').startsWith('/api/image-emotes/file/') || (entry.item.message || '').startsWith('/api/send-operations/'));
     const row = renderMessage(localImage ? { ...entry.item, message: '[图片]' } : entry.item);
     row.dataset.outgoingId = String(entry.localId);
     row.dataset.sendState = entry.state;
@@ -2865,21 +2875,29 @@ function renderHistory(items: MessageItem[]) {
       content?.replaceChildren(image);
     }
     const labels: Record<OutgoingState, string> = { sending: '发送中…', sent: '已发送', failed: '发送失败', unknown: '结果未确认，请先检查聊天记录' };
-    const status = create('span', 'message-send-state', labels[entry.state]);
+    const operationEntry = entry as ImageOperationEntry;
+    if (operationEntry.operation) row.dataset.operationId = operationEntry.operation.id;
+    const status = create('span', 'message-send-state');
+    if (operationEntry.operation) status.append(create('span', 'outgoing-status-label', imageOperationLabel(operationEntry.operation)));
+    else status.textContent = labels[entry.state];
     status.setAttribute('role', 'status');
     if (entry.error) {
       status.title = entry.error;
       const reason = entry.error === 'RateLimitExceeded' ? 'Steam 发送频率受限，请稍后再试' : entry.error;
       status.append(create('span', 'outgoing-error', reason));
     }
+    if (operationEntry.operationQueryError) status.append(create('span', 'outgoing-error', '暂时无法查询发送结果，连接恢复后会继续核对。'));
     const bubble = row.querySelector('.bubble') || row;
     bubble.append(status);
+    if (operationEntry.operation || operationEntry.operationCreatingFailed) appendImageOperationActions(bubble as HTMLElement, operationEntry);
     if (entry.state === 'failed' || entry.state === 'unknown') {
       const dismiss = create('button', 'ghost-btn outgoing-dismiss', '移除此提示');
       dismiss.type = 'button';
       dismiss.title = '仅移除本地发送提示，不删除聊天记录，也不重发消息';
       dismiss.addEventListener('click', () => {
+        if (operationEntry.operation) void dismissImageOperation(operationEntry);
         outgoingMessages.delete(entry.localId);
+        saveImageOperationMetadata();
         refreshOutgoing();
       });
       bubble.append(dismiss);
@@ -3960,6 +3978,211 @@ function createImageTransfer(name: string, stage: ImageTransferStage): ImageTran
   return transfer;
 }
 
+let imageOperationTimer: ReturnType<typeof setInterval> | null = null;
+const imageOperationRequests = new Set<AbortController>();
+function imageOperationKey() { return `steam-chat.send-operations.${state.me?.id}.${state.steam.activeAccount?.steamId || state.steam.steamId}`; }
+function saveImageOperationMetadata() {
+  try {
+    sessionStorage.setItem(imageOperationKey(), JSON.stringify([...outgoingMessages.values()].map(item => item as ImageOperationEntry)
+      .filter(item => item.context === chatContext() && item.operation && item.state !== 'sent')
+      .slice(-100).map(item => ({ operationId: item.operation!.id, peerId: item.item.id, createdAt: item.item.sentAt,
+        thread: state.chatPanel === 'thread' && state.activeId === item.item.id }))));
+  } catch { /* Browser storage may be disabled. Current-page retry still works. */ }
+}
+function stopImageOperationPolling() {
+  if (imageOperationTimer) clearInterval(imageOperationTimer);
+  imageOperationTimer = null;
+  for (const controller of imageOperationRequests) controller.abort();
+  imageOperationRequests.clear();
+}
+function imageOperationLabel(op: ImageOperation) {
+  const count = `第 ${op.attempts}/${op.maxAttempts} 次`;
+  if (op.state === 'retry_wait') return `${Math.max(0, Math.ceil((op.nextRetryAt - Date.now()) / 1000))} 秒后重试 · ${count}`;
+  if (op.state === 'waiting_connection') return '等待 Steam 恢复连接…';
+  if (op.state === 'prepared') return '准备上传图片…';
+  if (op.state === 'queued') return '等待发送…';
+  if (op.state === 'sending') return `发送中… · ${count}`;
+  if (op.state === 'failed') return `发送失败 · 已尝试 ${op.attempts} 次`;
+  if (op.state === 'cancelled') return '已停止重试';
+  if (op.state === 'unknown') return '结果未确认，重发可能产生重复消息';
+  return '已发送';
+}
+function applyImageOperation(entry: ImageOperationEntry, value: unknown) {
+  if (entry.context !== chatContext() || !outgoingMessages.has(entry.localId) || !isRecord(value)
+    || typeof value.id !== 'string' || value.peerId !== entry.item.id || value.steamAccountId !== (state.steam.activeAccount?.steamId || state.steam.steamId)
+    || typeof value.version !== 'number' || (entry.operation && value.id !== entry.operation.id)
+    || (entry.operation && value.version <= entry.operation.version)) return;
+  entry.operation = value as ImageOperation;
+  const op = entry.operation;
+  if (!op.hasImage && ['failed', 'cancelled', 'unknown'].includes(op.state)) entry.imagePayload = undefined;
+  entry.operationMissing = false; entry.error = op.error;
+  if (op.state === 'prepared' && !entry.imagePayload) entry.error = '原图尚未上传。请先停止此任务，再重新选择图片。';
+  if (op.state === 'sent') {
+    if (entry.transfer) updateImageTransfer(entry.transfer, 'sent', 100);
+    finishOutgoing(entry, 'sent', { item: op.item });
+    entry.imagePayload = undefined;
+  } else {
+    entry.state = op.state === 'failed' || op.state === 'cancelled' ? 'failed' : op.state === 'unknown' ? 'unknown' : 'sending';
+    if (!entry.imagePayload) entry.item.message = op.hasImage ? `/api/send-operations/${op.id}/image` : '[图片]';
+    if (entry.transfer) updateImageTransfer(entry.transfer, entry.state === 'sending' ? 'processing' : entry.state, null, op.error);
+    refreshOutgoing();
+  }
+  saveImageOperationMetadata();
+}
+async function queryImageOperation(entry: ImageOperationEntry, force = false) {
+  if (!entry.operation || entry.operationQueryBusy || entry.operationBusy || entry.operationMissing || entry.context !== chatContext()) return;
+  const now = Date.now();
+  const interval = entry.state === 'sending' ? 2000 : 10000;
+  if (!force && now - (entry.lastOperationQuery || 0) < interval) return;
+  entry.lastOperationQuery = now; entry.operationQueryBusy = true;
+  const controller = new AbortController(); imageOperationRequests.add(controller);
+  const deadline = setTimeout(() => controller.abort(), 8000);
+  try {
+    const payload = await api(`/api/send-operations/${entry.operation.id}`, { signal: controller.signal });
+    const wasUnavailable = entry.operationQueryError; entry.operationQueryError = false;
+    applyImageOperation(entry, payload);
+    if (wasUnavailable && entry.context === chatContext() && outgoingMessages.has(entry.localId)) refreshOutgoing();
+  }
+  catch (error) {
+    if (entry.context !== chatContext() || !outgoingMessages.has(entry.localId)) return;
+    if (isRecord(error) && [403, 404, 410].includes(Number(error.status))) {
+      entry.operationMissing = true; entry.state = 'unknown'; entry.error = '原发送状态已失效，请检查聊天记录。';
+      entry.operation.state = 'unknown'; entry.operation.retryable = false; refreshOutgoing();
+    } else if (!entry.operationQueryError) {
+      entry.operationQueryError = true; refreshOutgoing();
+    }
+  } finally { clearTimeout(deadline); imageOperationRequests.delete(controller); entry.operationQueryBusy = false; }
+}
+function startImageOperationPolling() {
+  if (imageOperationTimer) return;
+  imageOperationTimer = setInterval(() => {
+    for (const item of outgoingMessages.values()) {
+      const entry = item as ImageOperationEntry;
+      if (!entry.operation || entry.context !== chatContext()) continue;
+      const label = document.querySelector<HTMLElement>(`[data-outgoing-id="${entry.localId}"] .outgoing-status-label`);
+      if (label) label.textContent = imageOperationLabel(entry.operation);
+      const transferLabel = entry.transfer && document.querySelector<HTMLElement>(`[data-transfer-id="${entry.transfer.id}"] .image-transfer-status`);
+      if (transferLabel) transferLabel.textContent = imageOperationLabel(entry.operation);
+      void queryImageOperation(entry);
+    }
+  }, 1000);
+}
+function restoreImageOperations() {
+  if (!state.sendOperations || !state.me || !steamAccessAllowed()) return;
+  try {
+    const stored: unknown = JSON.parse(sessionStorage.getItem(imageOperationKey()) || '[]');
+    if (!Array.isArray(stored)) return;
+    for (const value of stored.slice(-100)) {
+      if (!isRecord(value) || typeof value.operationId !== 'string' || !/^[a-f0-9]{32}$/.test(value.operationId)
+        || typeof value.peerId !== 'string' || !/^\d{17}$/.test(value.peerId)
+        || [...outgoingMessages.values()].some(item => (item as ImageOperationEntry).operation?.id === value.operationId)) continue;
+      const entry: ImageOperationEntry = { localId: ++outgoingId, context: chatContext(), state: 'sending',
+        item: { id: value.peerId, type: 'image', echo: true, message: '[图片]', sentAt: typeof value.createdAt === 'string' ? value.createdAt : new Date().toISOString() },
+        operation: { id: value.operationId, peerId: value.peerId, steamAccountId: state.steam.activeAccount?.steamId || state.steam.steamId || '',
+          version: 0, state: 'queued', attempts: 0, maxAttempts: 6, nextRetryAt: 0, phase: 'unknown', retryable: false, hasImage: false } };
+      outgoingMessages.set(entry.localId, entry); void queryImageOperation(entry, true);
+      if (value.thread === true && state.activeId === value.peerId) state.chatPanel = 'thread';
+    }
+    syncChatPanel(); startImageOperationPolling(); refreshOutgoing();
+  } catch { /* Invalid or disabled browser storage does not start any sends. */ }
+}
+async function imageOperationAction(entry: ImageOperationEntry, action: string) {
+  if (!entry.operation || entry.operationBusy || entry.context !== chatContext()) return;
+  entry.operationBusy = true;
+  try { applyImageOperation(entry, await api(`/api/send-operations/${entry.operation.id}/${action}`, jsonBody({ expectedVersion: entry.operation.version }))); }
+  catch (error) {
+    if (entry.context !== chatContext()) return;
+    entry.error = errorMessage(error); refreshOutgoing();
+  } finally { entry.operationBusy = false; void queryImageOperation(entry, true); }
+}
+async function dismissImageOperation(entry: ImageOperationEntry) {
+  if (!entry.operation || entry.context !== chatContext()) return;
+  await api(`/api/send-operations/${entry.operation.id}/cancel`, jsonBody({})).catch((): null => null);
+}
+async function resendImageOperation(entry: ImageOperationEntry) {
+  if (entry.operationBusy || entry.context !== chatContext()) return;
+  entry.operationBusy = true;
+  try {
+    let payload = entry.imagePayload;
+    if (!payload && entry.operation && !entry.operationMissing) {
+      const response = await fetch(`/api/send-operations/${entry.operation.id}/image`, { credentials: 'same-origin' });
+      if (!response.ok) throw new Error('原图已过期，请重新选择图片。');
+      const blob = await response.blob();
+      const data = await new Promise<string>((resolve, reject) => { const reader = new FileReader();
+        reader.onload = () => resolve(String(reader.result)); reader.onerror = () => reject(new Error('读取原图失败')); reader.readAsDataURL(blob); });
+      payload = { img: data };
+    }
+    if (!payload) throw new Error('原图已过期，请重新选择图片。');
+    if (entry.context !== chatContext()) return;
+    // Explicitly requesting another copy is a new logical send, never a retry of
+    // an unknown commit. Keep the old row honest until the user dismisses it.
+    const previousPeer = state.activeId;
+    if (previousPeer !== entry.item.id) return;
+    await sendImage(payload, undefined, entry.operationMissing ? undefined : entry.operation?.id);
+  } catch (error) { if (entry.context === chatContext()) { entry.error = errorMessage(error); refreshOutgoing(); } }
+  finally { entry.operationBusy = false; }
+}
+function appendImageOperationActions(bubble: HTMLElement, entry: ImageOperationEntry) {
+  const action = (label: string, run: () => unknown) => {
+    const button = create('button', 'ghost-btn image-operation-action', label); button.type = 'button';
+    button.disabled = label === '立即重试' && (entry.operation?.cooldownUntil || 0) > Date.now();
+    button.addEventListener('click', () => void run()); bubble.append(button);
+  };
+  const op = entry.operation;
+  if (!op) { if (entry.operationCreatingFailed && entry.imagePayload) action('重试发送', () => startImageOperation(entry, entry.imagePayload!, entry.transfer)); return; }
+  if (op.state === 'retry_wait') action('立即重试', () => imageOperationAction(entry, 'expedite'));
+  if (['queued', 'prepared', 'sending', 'retry_wait', 'waiting_connection'].includes(op.state)) {
+    action(op.phase === 'commit' || op.phase === 'unknown' ? '停止等待' : '停止重试', () => imageOperationAction(entry, 'cancel'));
+  }
+  if (op.state === 'failed' && op.retryable && !entry.operationMissing) action('重试发送', () => imageOperationAction(entry, 'retry'));
+  if (op.state === 'prepared' && entry.imagePayload) action('继续发送', () => activateImageOperation(entry, entry.imagePayload!));
+  if (op.state === 'unknown') {
+    action('检查发送结果', () => { if (entry.operationMissing) { requestDurableSync(); return; } return queryImageOperation(entry, true); });
+    if (!op.replacementId && (entry.imagePayload || (op.hasImage && !entry.operationMissing))) action('仍要发送一份', () => resendImageOperation(entry));
+  }
+}
+async function activateImageOperation(entry: ImageOperationEntry, payload: Record<string, string>) {
+  if (!entry.operation || entry.operationBusy || entry.context !== chatContext()) return;
+  entry.operationBusy = true;
+  try {
+    const result = await api(`/api/send-operations/${entry.operation.id}/start`, jsonBody(payload), percent => {
+      if (entry.transfer && entry.context === chatContext()) updateImageTransfer(entry.transfer, percent === 100 ? 'processing' : 'uploading', percent === 100 ? null : percent);
+    });
+    applyImageOperation(entry, result);
+  } catch (error) {
+    if (entry.context === chatContext()) {
+      entry.error = errorMessage(error);
+      if (isRecord(error) && [400, 404, 413].includes(Number(error.status)) && entry.operation?.state === 'prepared') {
+        entry.operation.state = 'failed'; entry.state = 'failed'; entry.operation.retryable = false;
+      }
+      refreshOutgoing();
+    }
+  }
+  finally { entry.operationBusy = false; void queryImageOperation(entry, true); }
+}
+async function startImageOperation(entry: ImageOperationEntry, payload: Record<string, string>, transfer?: ImageTransfer, previousOperationId?: string) {
+  if (entry.operationBusy || entry.context !== chatContext()) return;
+  entry.operationBusy = true;
+  entry.imagePayload = { ...payload }; entry.transfer = transfer; entry.operationCreatingFailed = false;
+  const context = entry.context;
+  try {
+    const result = await api('/api/send-operations', jsonBody({ kind: 'image', id: entry.item.id,
+      steamAccountId: state.steam.activeAccount?.steamId || state.steam.steamId, name: transfer?.name || '图片', previousOperationId }));
+    if (context !== chatContext()) return;
+    applyImageOperation(entry, result);
+    if (!entry.operation) throw new Error('服务器未创建有效的图片发送任务。');
+    startImageOperationPolling();
+    entry.operationBusy = false;
+    await activateImageOperation(entry, payload);
+  } catch (error) {
+    if (context !== chatContext()) return;
+    // No activation can have been sent when preparation failed.
+    entry.operationCreatingFailed = true; entry.error = errorMessage(error); entry.state = 'failed';
+    if (transfer) updateImageTransfer(transfer, 'failed', null, entry.error);
+    refreshOutgoing();
+  } finally { entry.operationBusy = false; }
+}
+
 function updateImageTransfer(transfer: ImageTransfer, stage: ImageTransferStage, percent: number | null = null, error?: string) {
   if (!imageTransfers.has(transfer.id)) return;
   transfer.stage = stage; transfer.percent = percent; transfer.error = error;
@@ -3999,7 +4222,7 @@ function renderImageTransfers(container = document.querySelector<HTMLElement>('#
   }
 }
 
-async function sendImage(payload: Record<string, string>, existing?: ImageTransfer) {
+async function sendImage(payload: Record<string, string>, existing?: ImageTransfer, previousOperationId?: string) {
   const id = activeIdOrWarn();
   if (!id) return;
   const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId;
@@ -4007,6 +4230,7 @@ async function sendImage(payload: Record<string, string>, existing?: ImageTransf
   const transfer = existing || createImageTransfer(emote?.name || (payload.url ? '图片 URL' : '图片'), payload.img ? 'uploading' : 'processing');
   updateImageTransfer(transfer, payload.img ? 'uploading' : 'processing', payload.img ? 0 : null);
   const outgoing = beginOutgoing(id, payload.emoteId ? emoteFileUrl(payload.emoteId) : payload.img || payload.url || '', 'image');
+  if (state.sendOperations) { await startImageOperation(outgoing, payload, transfer, previousOperationId); return; }
   let response: unknown;
   try {
     response = await api('/image', jsonBody({ id, ...payload, ...(steamAccountId ? { steamAccountId } : {}) }), (percent) => {
@@ -4494,6 +4718,12 @@ function ensureWebSocket() {
       return;
     }
     if (payload.type === 'pong') { pingSentAt = 0; return; }
+    if (payload.type === 'send_operation' && isRecord(payload.operation)) {
+      const op = payload.operation;
+      const entry = [...outgoingMessages.values()].find(item => (item as ImageOperationEntry).operation?.id === op.id);
+      if (entry) applyImageOperation(entry as ImageOperationEntry, op);
+      return;
+    }
     if (payload.type === 'sync_available') {
       if (payload.steamAccountId === (state.steam.activeAccount?.steamId || state.steam.steamId)) requestDurableSync();
       return;
@@ -4595,6 +4825,7 @@ function stopStatusPolling() {
 }
 
 async function logoutApp() {
+  try { sessionStorage.removeItem(imageOperationKey()); } catch { /* Browser storage may be disabled. */ }
   await api('/api/auth/logout', { method: 'POST' }).catch((): null => null);
   stopStatusPolling();
   stopWebSocket();
@@ -4621,11 +4852,13 @@ async function bootstrap() {
   }
   const [status, config] = await Promise.all([
     api('/api/steam/status').catch((): SteamStatus => state.steam),
-    api('/api/config').catch(() => ({ wsPath: '/ws' }))
+    api('/api/config').catch(() => ({ wsPath: '/ws', sendOperations: true }))
   ]);
   if (isRecord(status)) updateSteamStatus(status as SteamStatus);
   if (isRecord(config) && typeof config.wsPath === 'string') state.wsPath = config.wsPath;
+  state.sendOperations = isRecord(config) && config.sendOperations === true;
   renderShell();
+  restoreImageOperations();
 }
 
 function openLightbox(src: string) {

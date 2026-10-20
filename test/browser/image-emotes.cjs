@@ -20,7 +20,7 @@ const { createChatService } = require('../../dist/src/server/chat-service');
       const sessions = createSessionManager({ store: auth });
       const account = auth.upsertSteamAccount({ steamId: '76561198000000002', setActive: true });
       const steam = { status: 'online', steamId: account.steamId, accessAllowed: true };
-      const pending = [], requests = [], errors = [];
+      const pending = [], requests = [], preparations = [], errors = [];
       const service = createChatService({ authStore: auth, sessionManager: sessions,
         config: { host: '127.0.0.1', port: 0 }, logPath: join(directory, 'chat.jsonl'), imageEmoteDir: join(directory, 'image-emotes'),
         logger: { info() {}, warn() {}, error() {} }, getEmoticons: async () => ({ emoticons: [], stickers: [] }),
@@ -35,7 +35,11 @@ const { createChatService } = require('../../dist/src/server/chat-service');
         const separator = cookie.indexOf('=');
         await context.addCookies([{ name: cookie.slice(0, separator), value: cookie.slice(separator + 1), url: base }]);
         const page = await context.newPage(); page.on('pageerror', e => errors.push(e.message)); page.on('dialog', dialog => dialog.accept());
-        page.on('request', r => { if (new URL(r.url()).pathname === '/image') requests.push(r.postDataJSON()); });
+        page.on('request', r => {
+          const pathname = new URL(r.url()).pathname;
+          if (/^\/api\/send-operations\/[^/]+\/start$/.test(pathname)) requests.push(r.postDataJSON());
+          if (pathname === '/api/send-operations') preparations.push(r.postDataJSON());
+        });
         await page.addInitScript(() => localStorage.setItem('steam-chat.view', 'imageEmotes'));
         await page.route('**/api/conversations?*', route => route.fulfill({ json: { items: [{ id: '76561198000000001', name: 'Test friend' }] } }));
         await page.route('**/api/history?*', route => route.fulfill({ json: { items: [] } }));
@@ -78,17 +82,20 @@ const { createChatService } = require('../../dist/src/server/chat-service');
         if (!(await page.locator('#picker').isVisible())) await page.locator('#pickerToggle').click();
         await page.locator('.custom-emote-picker .picker-grid button').click();
         await page.locator('.outgoing-image-preview').waitFor();
-        await page.waitForTimeout(100);
+        await page.getByRole('button', { name: '停止等待', exact: true }).waitFor();
         assert.equal(pending.length, 1); assert.deepEqual(pending[0].buffer, buffer);
         assert.ok(requests[0].emoteId); assert.equal(requests[0].img, undefined); assert.equal(requests[0].url, undefined);
         assert.equal(await page.locator('#messageInput').inputValue(), '未发送的文字');
-        assert.equal(requests[0].steamAccountId, account.steamId);
+        assert.equal(preparations[0].steamAccountId, account.steamId);
         await page.route('**/proxy/image?*', route => route.fulfill({ body: buffer, contentType: 'image/png' }));
         pending[0].callback(null, 'https://images.steamusercontent.com/custom-test.png');
         await page.locator('[data-send-state="sent"]').first().waitFor();
         assert.deepEqual(errors, []);
         console.log(`PASS ${width}px: grouped CRUD and reload, real authenticated asset, ID-only send, original bytes, optimistic preview`);
-      } finally { await context.close(); await service.stop(); auth.close(); await rm(directory, { recursive: true, force: true }); }
+      } finally {
+        for (const item of pending) item.callback(new Error('Fixture cleanup'));
+        await context.close(); await service.stop(); auth.close(); await rm(directory, { recursive: true, force: true });
+      }
     }
   } finally { await browser.close(); }
 })().catch(error => { console.error(error); process.exitCode = 1; });

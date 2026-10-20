@@ -22,21 +22,44 @@ function transient(error: unknown): boolean {
     || /^HTTP error 5\d\d$/.test(errorMessage(error));
 }
 
-function trackedAttempt(community: Community) {
+type AttemptOptions = { authorize?: () => void; signal?: AbortSignal; onPhase?: (phase: ImageUploadPhase) => void;
+  onTransport?: (pending: Promise<unknown>) => void; timeoutMs?: number };
+
+function trackedAttempt(community: Community, options: AttemptOptions = {}) {
   let phase: ImageUploadPhase = 'unknown';
   let httpStatus: number | undefined;
+  let retryAfterMs: number | undefined;
   // Only this installed SDK's known begin -> PUT -> commit implementation is
   // evidence that an error happened before delivery. Custom senders fail closed.
   if (community.sendImageToUser !== installedImageSender || typeof community.httpRequest !== 'function'
-    || typeof community.httpRequestPost !== 'function') return { receiver: community, phase: () => phase, httpStatus: () => httpStatus };
+    || typeof community.httpRequestPost !== 'function') {
+    options.onPhase?.(phase);
+    return { receiver: community, phase: () => phase, httpStatus: () => httpStatus, retryAfterMs: () => retryAfterMs };
+  }
   phase = 'prepare';
+  options.onPhase?.(phase);
   const receiver: Community = Object.create(community);
   const wrap = (method: CallbackStyleFunction, nextPhase: (options: unknown) => ImageUploadPhase): CallbackStyleFunction => (...args) => {
-    if (phase !== 'commit') phase = nextPhase(args[0]);
     const callback = args[1];
+    try {
+      if (options.signal?.aborted) throw options.signal.reason instanceof Error ? options.signal.reason : Object.assign(new Error('发送已停止。'), { statusCode: 409 });
+      options.authorize?.();
+    } catch (error) {
+      if (typeof callback === 'function') return callback(error);
+      throw error;
+    }
+    if (phase !== 'commit') phase = nextPhase(args[0]);
+    options.onPhase?.(phase);
+    if (options.timeoutMs && isRecord(args[0])) args[0].timeout = options.timeoutMs;
     if (typeof callback === 'function') args[1] = (...reply: unknown[]) => {
       const response = reply[1];
       httpStatus = isRecord(response) && typeof response.statusCode === 'number' ? response.statusCode : undefined;
+      const header = isRecord(response) && isRecord(response.headers) ? response.headers['retry-after'] : undefined;
+      retryAfterMs = undefined;
+      if (typeof header === 'string') {
+        const ms = /^\d+(?:\.\d+)?$/.test(header) ? Number(header) * 1000 : Date.parse(header) - Date.now();
+        retryAfterMs = Number.isFinite(ms) ? Math.max(0, ms) : undefined;
+      }
       return callback(...reply);
     };
     // Delegate on the real instance so cookies, request IDs and session events
@@ -50,7 +73,37 @@ function trackedAttempt(community: Community) {
     return 'unknown';
   });
   receiver.httpRequest = wrap(community.httpRequest, options => isRecord(options) && options.method === 'PUT' ? 'upload' : 'unknown');
-  return { receiver, phase: () => phase, httpStatus: () => httpStatus };
+  return { receiver, phase: () => phase, httpStatus: () => httpStatus, retryAfterMs: () => retryAfterMs };
+}
+
+export async function sendSteamImageAttempt(community: Community, send: (receiver: Community) => Promise<unknown>, options: AttemptOptions = {}) {
+  const tracked = trackedAttempt(community, options);
+  let onAbort: () => void = () => {};
+  try {
+    const pending = send(tracked.receiver);
+    options.onTransport?.(pending);
+    if (!options.signal) return await pending;
+    return await Promise.race([pending, new Promise<never>((_resolve, reject) => {
+      onAbort = () => {
+        // A stopped pre-commit attempt can no longer issue a future request:
+        // the same signal is checked by every HTTP guard above.
+        if (tracked.phase() !== 'commit' && tracked.phase() !== 'unknown') reject(options.signal!.reason || new Error('发送已停止。'));
+      };
+      options.signal!.addEventListener('abort', onAbort, { once: true });
+      if (options.signal!.aborted) onAbort();
+    })]);
+  }
+  catch (error) {
+    const phase = tracked.phase(), uncertain = phase === 'commit' || phase === 'unknown';
+    const eresult = resultCode(error) || (tracked.httpStatus() === 429 ? 84 : undefined);
+    const retryable = !uncertain && (eresult === 84 || transient(error) || (isRecord(error) && error.retryable === true));
+    const message = eresult === 16 ? `Steam ${phase === 'commit' ? '提交' : phase === 'upload' ? '上传' : '处理'}图片超时（Timeout/16）。`
+      : eresult === 84 ? 'Steam 发送频率受限，请等待冷却后重试。' : errorMessage(error);
+    throw Object.assign(new Error(message), { imageUploadPhase: phase, uncertain, retryable,
+      statusCode: isRecord(error) && typeof error.statusCode === 'number' ? error.statusCode : 502,
+      ...(tracked.retryAfterMs() !== undefined ? { retryAfterMs: tracked.retryAfterMs() } : {}),
+      ...(eresult ? { eresult } : {}) });
+  } finally { options.signal?.removeEventListener('abort', onAbort); }
 }
 
 export async function sendSteamImage(
