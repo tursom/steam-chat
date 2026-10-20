@@ -543,7 +543,9 @@ async function api(path: string, options: RequestInit = {}, onUploadProgress?: (
       state.needsSetup = false;
       renderLogin();
     }
-    throw Object.assign(new Error(isRecord(payload) && typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`), { status: response.status });
+    throw Object.assign(new Error(isRecord(payload) && typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`), {
+      status: response.status, ...(isRecord(payload) && typeof payload.uncertain === 'boolean' ? { uncertain: payload.uncertain } : {})
+    });
   }
   return payload;
 }
@@ -2822,6 +2824,7 @@ function finishOutgoing(entry: OutgoingMessage, status: OutgoingState, response?
 }
 
 function outgoingFailure(error: unknown): 'failed' | 'unknown' {
+  if (isRecord(error) && typeof error.uncertain === 'boolean') return error.uncertain ? 'unknown' : 'failed';
   // Transport and server failures do not prove Steam rejected the send.
   return isRecord(error) && typeof error.status === 'number' && error.status >= 400 && error.status < 500 ? 'failed' : 'unknown';
 }

@@ -26,6 +26,7 @@ import type {
 } from '../types';
 import type { SteamFriendMessageEvent, SteamFriendMessageEventUser } from '../steam/friend-message-events';
 import { errorCode, errorMessage, isRecord } from '../types';
+import { sendSteamImage } from './image-upload';
 
 const fs = require('node:fs/promises');
 const http = require('node:http');
@@ -332,6 +333,10 @@ function errorPayload(error: unknown): UnknownRecord {
     payload.steamStatus = error.steamStatus;
   }
   if (isRecord(error) && error.resetRequired === true) payload.resetRequired = true;
+  if (isRecord(error) && typeof error.uncertain === 'boolean') payload.uncertain = error.uncertain;
+  if (isRecord(error) && ['prepare', 'begin', 'upload', 'commit', 'unknown'].includes(String(error.imageUploadPhase))) {
+    payload.imageUploadPhase = error.imageUploadPhase;
+  }
   return payload;
 }
 
@@ -1006,7 +1011,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     try {
       return await operation();
     } catch (error) {
-      if (isSessionExpiredError(error)) {
+      if (isSessionExpiredError(error) && !(needsWebSession && isRecord(error) && error.imageUploadPhase === 'commit')) {
         logger.warn?.('Steam web session rejected; refreshing before one retry');
         await refreshSharedWebSession();
         return operation();
@@ -1161,11 +1166,10 @@ function createChatService(options: ChatServiceOptions = {}) {
       throw Object.assign(new Error('img or url is required'), { statusCode: 400 });
     }
     const imageArgs = steamCommunity.sendImageToUser.length >= 4 ? [id, imageBuffer, {}] : [id, imageBuffer];
-    const result = await withSteamRetry(() => {
-      authorize?.();
-      checkSend(steamAccountId);
-      return callMaybeCallback(steamCommunity.sendImageToUser!, steamCommunity, imageArgs);
-    }, true);
+    const result = await withSteamRetry(() => sendSteamImage(steamCommunity,
+      receiver => callMaybeCallback(steamCommunity.sendImageToUser!, receiver, imageArgs), {
+        authorize: () => { authorize?.(); checkSend(steamAccountId); }, logger
+      }), true);
     if (typeof result === 'string' && result) message = result;
     else if (isRecord(result) && typeof result.url === 'string' && result.url) message = result.url;
     const record: HistoryRecordInput = {

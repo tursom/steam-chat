@@ -250,6 +250,17 @@ test('reset cancels a pending reader and ignores its late completion', async () 
   assert.equal(h.requests.length, 0);
 });
 
+for (const uncertain of [false, true]) {
+  test(`image API propagates explicit send certainty ${uncertain} into the local transfer`, async () => {
+    const h = harness(); const sending = h.sendImage({ img: 'YWJj' });
+    h.requests[0].respond(502, { error: 'Steam 图片超时（Timeout/16）', uncertain, imageUploadPhase: uncertain ? 'commit' : 'begin' });
+    await sending;
+    assert.equal(h.transfers()[0].stage, uncertain ? 'unknown' : 'failed');
+    assert.equal(h.transfers()[0].error, 'Steam 图片超时（Timeout/16）');
+    assert.equal(h.requests.length, 1); assert.equal(h.requests[0].sends, 1);
+  });
+}
+
 for (const outcome of ['success', 'failure'] as const) {
   test(`conversation switch keeps active upload but scopes ${outcome} feedback`, async () => {
     const h = harness();

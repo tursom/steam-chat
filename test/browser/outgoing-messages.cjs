@@ -165,8 +165,25 @@ async function run() {
       assert.equal(playerLoads, 1, 'sending, confirmation and dismissal must not reload the player');
       assert.equal(await playerFrame.evaluate(() => window.playbackMarker), 'playing-42s');
       assert.equal(await player.evaluate(node => node.isConnected), true);
+      for (const phase of ['begin', 'commit']) {
+        const writeIndex = writes.length;
+        await page.locator('input[type="file"]').setInputFiles({ name: `${phase}.png`, mimeType: 'image/png', buffer: previewImage });
+        await page.waitForFunction(() => document.querySelector('.msg-row[data-send-state="sending"] .outgoing-image-preview'));
+        const localId = await page.locator('.msg-row[data-send-state="sending"]').last().getAttribute('data-outgoing-id');
+        const attempt = page.locator(`[data-outgoing-id="${localId}"]`);
+        await page.waitForTimeout(50);
+        assert.equal(writes.length, writeIndex + 1);
+        await writes[writeIndex].route.fulfill({ status: 502, json: { error: `Steam ${phase} Timeout/16`,
+          uncertain: phase === 'commit', imageUploadPhase: phase } });
+        writes[writeIndex].done();
+        await page.waitForFunction(({ localId, expected }) => document.querySelector(`[data-outgoing-id="${localId}"]`)?.dataset.sendState === expected,
+          { localId, expected: phase === 'commit' ? 'unknown' : 'failed' });
+        assert.match(await attempt.innerText(), phase === 'commit' ? /结果未确认/ : /发送失败/);
+        await page.waitForTimeout(100); assert.equal(writes.length, writeIndex + 1, 'Client must not retry a server image result');
+      }
+      assert.equal(await playerFrame.evaluate(() => window.playbackMarker), 'playing-42s');
       assert.deepEqual(errors, []);
-      console.log(`PASS ${width}px: immediate text and images, consecutive sends, all states, echo deduplication`);
+      console.log(`PASS ${width}px: immediate sends, echo deduplication, image failure/unknown certainty and no client retries`);
       await page.close();
     }
   } finally { await browser.close(); }
