@@ -182,3 +182,114 @@ test('cancelled transport retains its byte reservation until the real callback d
   drain(); await delay(10); manager.start(two.id, owner, image);
   await until(() => manager.get(two.id, owner).state === 'sent'); assert.equal(calls, 2);
 });
+
+test('client IDs are validated and bound to owner, peer, name and previous operation without replacing authorization', async t => {
+  let online = false, calls = 0;
+  const manager = new SendOperations({ ...config, maxTasks: 1, refreshWebSession: async () => {},
+    send: async () => { calls++; return sent; } });
+  t.after(() => manager.close());
+  const id = 'a'.repeat(32);
+  for (const invalid of ['', 'A'.repeat(32), 'g'.repeat(32), 'a'.repeat(31), 'a'.repeat(33), null, 12]) {
+    assert.throws(() => manager.prepare(owner, peer, 'Image', () => true, undefined, invalid as string), (e: any) => e.statusCode === 400);
+  }
+  assert.throws(() => manager.prepare(owner, peer, 'Image', () => true, '', id), (e: any) => e.statusCode === 400);
+  const first = manager.prepare(owner, peer, 'Image', () => online, undefined, id);
+  assert.equal(first.id, id);
+  assert.deepEqual(manager.prepare(owner, peer, 'Image', () => true, undefined, id), first, 'replay does not consume another task slot');
+  for (const other of [{ ...owner, userId: 2 }, { ...owner, sessionId: 'other' }, { ...owner, account: '76561198000000003' }]) {
+    assert.throws(() => manager.prepare(other, peer, 'Image', () => true, undefined, id), (e: any) => e.statusCode === 403);
+  }
+  assert.throws(() => manager.prepare(owner, owner.account, 'Image', () => true, undefined, id), (e: any) => e.statusCode === 409);
+  assert.throws(() => manager.prepare(owner, peer, 'Changed', () => true, undefined, id), (e: any) => e.statusCode === 409);
+  assert.throws(() => manager.prepare(owner, peer, 'Image', () => true, 'b'.repeat(32), id), (e: any) => e.statusCode === 409);
+  assert.throws(() => manager.prepare(owner, peer, 'Image', () => true, undefined, 'b'.repeat(32)), (e: any) => e.statusCode === 429);
+  manager.start(id, owner, image);
+  await until(() => manager.get(id, owner).state === 'waiting_connection');
+  assert.equal(calls, 0, 'duplicate prepare cannot substitute its authorize callback');
+  online = true;
+  await until(() => manager.get(id, owner).state === 'sent');
+  assert.equal(manager.prepare(owner, peer, 'Image', () => true, undefined, id).state, 'sent');
+  assert.equal(manager.start(id, owner, image).state, 'sent');
+  assert.equal(calls, 1);
+});
+
+test('client replacement IDs cannot alias another task or silently reuse a different replacement', async t => {
+  const manager = new SendOperations({ ...config, refreshWebSession: async () => {}, send: async input => {
+    input.phase('commit'); throw transient({ uncertain: true });
+  } });
+  t.after(() => manager.close());
+  const parent = manager.prepare(owner, peer, 'Parent', () => true);
+  const unrelated = manager.prepare(owner, peer, 'Copy', () => true, undefined, 'a'.repeat(32));
+  assert.throws(() => manager.prepare(owner, peer, 'Copy', () => true, parent.id, 'b'.repeat(32)), (e: any) => e.statusCode === 409);
+  manager.start(parent.id, owner, image);
+  await until(() => manager.get(parent.id, owner).state === 'unknown');
+  assert.throws(() => manager.prepare(owner, peer, 'Copy', () => true, parent.id, unrelated.id), (e: any) => e.statusCode === 409);
+  assert.equal(manager.get(parent.id, owner).replacementId, undefined);
+  assert.throws(() => manager.prepare(owner, owner.account, 'Copy', () => true, parent.id, 'b'.repeat(32)), (e: any) => e.statusCode === 409);
+  assert.throws(() => manager.prepare({ ...owner, sessionId: 'other' }, peer, 'Copy', () => true, parent.id, 'b'.repeat(32)), (e: any) => e.statusCode === 403);
+  assert.throws(() => manager.prepare(owner, peer, 'Copy', () => true, 'f'.repeat(32), 'b'.repeat(32)), (e: any) => e.statusCode === 410);
+  const replacement = manager.prepare(owner, peer, 'Copy', () => true, parent.id, 'b'.repeat(32));
+  assert.equal(manager.prepare(owner, peer, 'Copy', () => true, parent.id, replacement.id).id, replacement.id);
+  assert.throws(() => manager.prepare(owner, peer, 'Copy', () => true, parent.id, 'c'.repeat(32)), (e: any) => e.statusCode === 409);
+  assert.throws(() => manager.prepare(owner, peer, 'Copy', () => true, undefined, replacement.id), (e: any) => e.statusCode === 409);
+  assert.equal(manager.get(parent.id, owner).replacementId, replacement.id);
+  assert.equal(manager.prepare(owner, peer, 'Copy', () => true, parent.id).id, replacement.id, 'legacy two-stage replacement remains compatible');
+});
+
+test('replacement replay survives a late parent acknowledgement and parent result expiration', async t => {
+  let finish!: (item: HistoryItem) => void;
+  const manager = new SendOperations({ ...config, resultMs: 15, refreshWebSession: async () => {}, send: input => {
+    input.phase('commit'); return new Promise(resolve => { finish = resolve; });
+  } });
+  t.after(() => manager.close());
+  const parent = manager.prepare(owner, peer, 'Parent', () => true);
+  manager.start(parent.id, owner, image);
+  await until(() => Boolean(finish));
+  assert.equal(manager.cancel(parent.id, owner).state, 'unknown');
+  const replacement = manager.prepare(owner, peer, 'Copy', () => true, parent.id, 'a'.repeat(32));
+  finish(sent);
+  await until(() => manager.get(parent.id, owner).state === 'sent');
+  assert.equal(manager.prepare(owner, peer, 'Copy', () => true, parent.id, replacement.id).id, replacement.id);
+  assert.throws(() => manager.prepare(owner, peer, 'Copy', () => true, parent.id, 'b'.repeat(32)), (e: any) => e.statusCode === 409);
+  await delay(30);
+  assert.throws(() => manager.get(parent.id, owner), (e: any) => e.statusCode === 410);
+  assert.equal(manager.prepare(owner, peer, 'Copy', () => true, parent.id, replacement.id).id, replacement.id);
+});
+
+test('a late image loader cannot start a reused client ID after its original operation expires', async t => {
+  let finish!: (buffer: Buffer) => void, calls = 0;
+  const manager = new SendOperations({ ...config, preparedMs: 20, refreshWebSession: async () => {},
+    send: async () => { calls++; return sent; } });
+  t.after(() => manager.close());
+  const id = 'a'.repeat(32);
+  manager.prepare(owner, peer, 'Original', () => true, undefined, id);
+  const pending = manager.loadAndStart(id, owner, () => new Promise(resolve => { finish = resolve; }));
+  const rejected = assert.rejects(pending, (e: any) => e.statusCode === 410);
+  await delay(30);
+  assert.throws(() => manager.get(id, owner), (e: any) => e.statusCode === 410);
+  manager.prepare(owner, owner.account, 'New', () => true, undefined, id);
+  finish(image); await rejected;
+  const view = manager.get(id, owner);
+  assert.equal(view.state, 'prepared');
+  assert.equal(view.peerId, owner.account);
+  assert.equal(view.hasImage, false);
+  assert.equal(calls, 0);
+});
+
+test('legacy replacement lookup cannot follow an expired child ID into an unrelated task', async t => {
+  const manager = new SendOperations({ ...config, preparedMs: 20, refreshWebSession: async () => {}, send: async input => {
+    input.phase('commit'); throw transient({ uncertain: true });
+  } });
+  t.after(() => manager.close());
+  const parent = manager.prepare(owner, peer, 'Parent', () => true);
+  manager.start(parent.id, owner, image);
+  await until(() => manager.get(parent.id, owner).state === 'unknown');
+  const child = manager.prepare(owner, peer, 'Copy', () => true, parent.id, 'a'.repeat(32));
+  await delay(30);
+  assert.throws(() => manager.get(child.id, owner), (e: any) => e.statusCode === 410);
+  assert.throws(() => manager.prepare(owner, peer, 'Copy', () => true, parent.id, child.id), (e: any) => e.statusCode === 410,
+    'expired replacement is not automatically recreated');
+  manager.prepare(owner, owner.account, 'Unrelated', () => true, undefined, child.id);
+  assert.throws(() => manager.prepare(owner, peer, 'Copy', () => true, parent.id), (e: any) => e.statusCode === 409);
+  assert.equal(manager.get(child.id, owner).state, 'prepared');
+});

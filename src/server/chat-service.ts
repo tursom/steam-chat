@@ -28,6 +28,7 @@ import type { SteamFriendMessageEvent, SteamFriendMessageEventUser } from '../st
 import { errorCode, errorMessage, isRecord } from '../types';
 import { sendSteamImage, sendSteamImageAttempt } from './image-upload';
 import { SendOperations, SendOperationOptions, SendOwner } from './send-operations';
+import { createHash } from 'node:crypto';
 
 const fs = require('node:fs/promises');
 const http = require('node:http');
@@ -424,9 +425,14 @@ async function serveStatic(req: IncomingMessage, res: ServerResponse, pathname: 
   }
   try {
     const data = await fs.readFile(filePath);
+    const versions = new URL(req.url || '/', 'http://localhost').searchParams.getAll('v');
+    const unversioned = ['/', '/index.html', '/sw.js', '/manifest.webmanifest'].includes(pathname);
+    // Match the build's v contract: the first 16 lowercase SHA-256 hex digits.
+    const immutable = !unversioned && versions.length === 1 && /^[a-f0-9]{16}$/.test(versions[0])
+      && versions[0] === createHash('sha256').update(data).digest('hex').slice(0, 16);
     textResponse(res, 200, data, {
       'Content-Type': contentTypeForPath(filePath),
-      'Cache-Control': ['/', '/index.html', '/sw.js', '/manifest.webmanifest'].includes(pathname) ? 'no-store' : 'public, max-age=60'
+      'Cache-Control': unversioned ? 'no-store' : immutable ? 'public, max-age=31536000, immutable' : 'public, max-age=60'
     });
     return true;
   } catch (error) {
@@ -736,13 +742,18 @@ function createChatService(options: ChatServiceOptions = {}) {
     jsonResponse(res, statusCodeForError(error), errorPayload(error));
   }
 
+  function clientConfig() {
+    return { wsPath: config.wsPath, ...(sessionManager && authStore ? { sendOperations: true, imageOperationUpload: true } : {}) };
+  }
+
   function authMe(req: IncomingMessage) {
     const session = sessionManager?.getSession(req) || null;
     return {
       needsSetup: authStore?.requiresSetup?.() ?? false,
       user: session?.user || null,
       permissions: session && authStore ? authStore.permissionsForRole(session.user.role) : [],
-      steam: steamStatusForSession(session)
+      steam: steamStatusForSession(session),
+      config: clientConfig()
     };
   }
 
@@ -750,7 +761,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (!authStore || !sessionManager) return false;
 
     if (req.method === 'GET' && pathname === '/api/auth/me') {
-      jsonResponse(res, 200, authMe(req));
+      jsonResponse(res, 200, authMe(req), { 'Cache-Control': 'no-store' });
       return true;
     }
 
@@ -1261,28 +1272,63 @@ function createChatService(options: ChatServiceOptions = {}) {
     return { userId: access.session.user.id, sessionId: access.session.sessionId, account: access.steamAccountId };
   }
 
+  function sendAuthorization(req: IncomingMessage, owner: SendOwner) {
+    return () => {
+      const live = sendOwner(req);
+      if (live.account !== owner.account || live.sessionId !== owner.sessionId || live.userId !== owner.userId) {
+        throw Object.assign(new Error('原账号或登录会话已改变。'), { statusCode: 409 });
+      }
+      return currentSteamStatus().status === 'online';
+    };
+  }
+
+  async function operationImage(body: UnknownRecord): Promise<Buffer> {
+    if ([body.img, body.url, body.emoteId].filter(value => value !== undefined).length !== 1) throw Object.assign(new Error('Provide exactly one image source'), { statusCode: 400 });
+    let buffer: Buffer;
+    if (body.emoteId !== undefined) buffer = (await imageEmotes.read(body.emoteId)).buffer;
+    else if (typeof body.img === 'string') buffer = decodeBase64Image(body.img);
+    else if (typeof body.url === 'string') buffer = (await loadOrDownloadRemoteImage(body.url, { fetchImpl })).buffer;
+    else throw Object.assign(new Error('Invalid image source'), { statusCode: 400 });
+    let size;
+    try { size = require('image-size').imageSize(buffer); }
+    catch { throw Object.assign(new Error('无法识别图片格式。'), { statusCode: 400 }); }
+    if (!['png', 'jpg', 'gif', 'webp'].includes(size.type) || !size.width || !size.height || size.width * size.height > 40000000) {
+      throw Object.assign(new Error('图片格式或尺寸不支持。'), { statusCode: 400 });
+    }
+    return buffer;
+  }
+
   async function handleSendOperations(req: IncomingMessage, res: ServerResponse, url: URL) {
     if (!url.pathname.startsWith('/api/send-operations')) return false;
     const owner = sendOwner(req);
-    if (url.pathname === '/api/send-operations' && req.method === 'POST') {
+    const upload = url.pathname === '/api/send-operations/upload';
+    if ((url.pathname === '/api/send-operations' || upload) && req.method === 'POST') {
       if (currentSteamStatus().status !== 'online') throw Object.assign(new Error('Steam 尚未在线，暂不能创建发送任务。'), { statusCode: 503 });
-      const body = await readJsonBody(req); const current = sendOwner(req);
+      const body = await readJsonBody(req);
+      const authorize = sendAuthorization(req, owner);
+      authorize();
       if (body.kind !== 'image' || typeof body.id !== 'string' || !/^\d{17}$/.test(body.id)) throw Object.assign(new Error('Invalid image recipient'), { statusCode: 400 });
       rejectGroupRecipient(body.id);
-      if (owner.account !== current.account) throw Object.assign(new Error('Steam account changed'), { statusCode: 409 });
       validateAccountPrecondition(body.steamAccountId);
       if (body.steamAccountId !== undefined && body.steamAccountId !== owner.account) throw Object.assign(new Error('Steam account changed'), { statusCode: 409 });
-      const authorize = () => {
-        const live = sendOwner(req);
-        if (live.account !== owner.account || live.sessionId !== owner.sessionId || live.userId !== owner.userId) {
-          throw Object.assign(new Error('原账号或登录会话已改变。'), { statusCode: 409 });
-        }
-        return currentSteamStatus().status === 'online';
-      };
       if (body.previousOperationId !== undefined && (typeof body.previousOperationId !== 'string' || !/^[a-f0-9]{32}$/.test(body.previousOperationId))) {
         throw Object.assign(new Error('Invalid previous operation'), { statusCode: 400 });
       }
-      jsonResponse(res, 201, sendOperations.prepare(owner, body.id, typeof body.name === 'string' ? body.name : '图片', authorize, body.previousOperationId as string | undefined), { 'Cache-Control': 'no-store' });
+      if (upload && (typeof body.operationId !== 'string' || !/^[a-f0-9]{32}$/.test(body.operationId))) {
+        throw Object.assign(new Error('Invalid operation ID'), { statusCode: 400 });
+      }
+      const operation = sendOperations.prepare(owner, body.id, typeof body.name === 'string' ? body.name : '图片', authorize,
+        body.previousOperationId as string | undefined, upload ? body.operationId as string : undefined);
+      if (upload) {
+        // Reserve the ID before asynchronous image loading so concurrent requests
+        // share one operation and a timed-out caller can query it immediately.
+        const started = await sendOperations.loadAndStart(operation.id, owner, async () => {
+          const buffer = await operationImage(body);
+          authorize();
+          return buffer;
+        });
+        jsonResponse(res, 202, started, { 'Cache-Control': 'no-store' });
+      } else jsonResponse(res, 201, operation, { 'Cache-Control': 'no-store' });
       return true;
     }
     const match = /^\/api\/send-operations\/([a-f0-9]{32})(?:\/(start|retry|expedite|cancel|image))?$/.exec(url.pathname);
@@ -1293,28 +1339,22 @@ function createChatService(options: ChatServiceOptions = {}) {
       const buffer = sendOperations.image(id, owner);
       const size = require('image-size').imageSize(buffer);
       textResponse(res, 200, buffer, { 'Content-Type': `image/${size.type === 'jpg' ? 'jpeg' : size.type}`, 'Cache-Control': 'private, no-store', 'X-Content-Type-Options': 'nosniff' });
+    } else if (req.method === 'POST' && action === 'start') {
+      const started = await sendOperations.loadAndStart(id, owner, async () => {
+        const body = await readJsonBody(req);
+        const authorize = sendAuthorization(req, owner);
+        authorize();
+        const buffer = await operationImage(body);
+        authorize();
+        return buffer;
+      });
+      jsonResponse(res, 202, started, { 'Cache-Control': 'no-store' });
     } else if (req.method === 'POST' && action) {
       sendOperations.get(id, owner);
       const body = await readJsonBody(req);
-      const current = sendOwner(req);
-      if (current.account !== owner.account || current.sessionId !== owner.sessionId) throw Object.assign(new Error('Steam account changed'), { statusCode: 409 });
-      if (action === 'start') {
-        if ([body.img, body.url, body.emoteId].filter(value => value !== undefined).length !== 1) throw Object.assign(new Error('Provide exactly one image source'), { statusCode: 400 });
-        let buffer: Buffer;
-        if (body.emoteId !== undefined) buffer = (await imageEmotes.read(body.emoteId)).buffer;
-        else if (typeof body.img === 'string') buffer = decodeBase64Image(body.img);
-        else if (typeof body.url === 'string') buffer = (await loadOrDownloadRemoteImage(body.url, { fetchImpl })).buffer;
-        else throw Object.assign(new Error('Invalid image source'), { statusCode: 400 });
-        let size;
-        try { size = require('image-size').imageSize(buffer); }
-        catch { throw Object.assign(new Error('无法识别图片格式。'), { statusCode: 400 }); }
-        if (!['png', 'jpg', 'gif', 'webp'].includes(size.type) || !size.width || !size.height || size.width * size.height > 40000000) {
-          throw Object.assign(new Error('图片格式或尺寸不支持。'), { statusCode: 400 });
-        }
-        const live = sendOwner(req);
-        if (live.account !== owner.account || live.sessionId !== owner.sessionId) throw Object.assign(new Error('Steam account changed'), { statusCode: 409 });
-        jsonResponse(res, 202, sendOperations.start(id, owner, buffer), { 'Cache-Control': 'no-store' });
-      } else if (action === 'cancel') jsonResponse(res, 200, sendOperations.cancel(id, owner), { 'Cache-Control': 'no-store' });
+      const authorize = sendAuthorization(req, owner);
+      authorize();
+      if (action === 'cancel') jsonResponse(res, 200, sendOperations.cancel(id, owner), { 'Cache-Control': 'no-store' });
       else if (action === 'retry' || action === 'expedite') {
         if (!Number.isInteger(body.expectedVersion)) throw Object.assign(new Error('expectedVersion required'), { statusCode: 400 });
         jsonResponse(res, 202, action === 'retry' ? sendOperations.retry(id, owner, body.expectedVersion as number) : sendOperations.expedite(id, owner, body.expectedVersion as number), { 'Cache-Control': 'no-store' });
@@ -1429,7 +1469,7 @@ function createChatService(options: ChatServiceOptions = {}) {
           return;
         }
         if (url.pathname === '/api/config') {
-          jsonResponse(res, 200, { wsPath: config.wsPath, ...(sessionManager && authStore ? { sendOperations: true } : {}) });
+          jsonResponse(res, 200, clientConfig(), { 'Cache-Control': 'no-store' });
           return;
         }
         if (url.pathname === '/api/emoticons') {

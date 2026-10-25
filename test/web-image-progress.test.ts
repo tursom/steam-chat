@@ -95,7 +95,7 @@ function harness() {
       querySelectorAll: (selector: string) => root.querySelectorAll(selector), createElement: (tag: string) => new Element(tag),
       addEventListener() {}, removeEventListener() {} },
     localStorage: { getItem: (): null => null, setItem() {} },
-    XMLHttpRequest: MockXHR, FileReader: Reader, URL: SandboxURL, URLSearchParams, Headers, console,
+    XMLHttpRequest: MockXHR, FileReader: Reader, URL: SandboxURL, URLSearchParams, Headers, AbortController, console,
     setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
     fetch: async (path: string, options: RequestInit) => { fetches.push({ path, options }); return { ok: true, status: 200, json: async () => ({ ok: true }) }; },
     holdHistory: () => new Promise<void>(resolve => history.push(resolve)),

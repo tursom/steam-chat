@@ -65,18 +65,38 @@ export class SendOperations {
     }
     return op;
   }
-  prepare(owner: SendOwner, peerId: string, name: string, authorize: () => boolean, previousOperationId?: string) {
+  prepare(owner: SendOwner, peerId: string, name: string, authorize: () => boolean, previousOperationId?: string, clientOperationId?: string) {
+    if (clientOperationId !== undefined && (typeof clientOperationId !== 'string' || !/^[a-f0-9]{32}$/.test(clientOperationId))) {
+      throw fault('Invalid operation ID', 400);
+    }
+    if (previousOperationId !== undefined && (typeof previousOperationId !== 'string' || !/^[a-f0-9]{32}$/.test(previousOperationId))) {
+      throw fault('Invalid previous operation', 400);
+    }
     this.cleanup();
+    // Resolve an existing ID before checking the parent: its late acknowledgement may
+    // have changed unknown to sent, or its retained result may already have expired.
+    if (clientOperationId && this.operations.has(clientOperationId)) {
+      const existing = this.find(clientOperationId, owner);
+      if (existing.peerId !== peerId || existing.previousOperationId !== previousOperationId || existing.name !== name.slice(0, 240)) {
+        throw fault('同一发送任务不能更换联系人、名称或原任务关联。');
+      }
+      return this.view(existing);
+    }
     const previous = previousOperationId ? this.find(previousOperationId, owner) : undefined;
     if (previous && (previous.state !== 'unknown' || previous.peerId !== peerId)) throw fault('只能为原联系人重新发送未知任务。');
-    if (previous?.replacementId) return this.view(this.find(previous.replacementId, owner));
+    if (previous?.replacementId) {
+      if (clientOperationId && previous.replacementId !== clientOperationId) throw fault('原任务已有替换任务，请查询发送结果。');
+      const replacement = this.find(previous.replacementId, owner);
+      if (replacement.peerId !== peerId || replacement.previousOperationId !== previous.id) throw fault('原任务的替换关联已失效，请检查聊天记录。');
+      return this.view(replacement);
+    }
     if (this.closed) throw fault('服务正在停止。', 503);
     if (this.operations.size >= (this.options.maxTasks ?? 1000)
       || [...this.operations.values()].filter(op => op.owner.userId === owner.userId && (active(op.state) || op.state === 'prepared')).length >= 10) {
       throw fault('待发送任务已满，请稍后重试。', 429);
     }
     const now = Date.now();
-    const op: Operation = { id: randomBytes(16).toString('hex'), owner: { ...owner }, peerId, name: name.slice(0, 240),
+    const op: Operation = { id: clientOperationId ?? randomBytes(16).toString('hex'), owner: { ...owner }, peerId, name: name.slice(0, 240),
       state: 'prepared', version: 1, phase: 'prepare', attempts: 0, totalAttempts: 0, nextRetryAt: 0, deadline: 0,
       createdAt: now, expiresAt: now + (this.options.preparedMs ?? 300000), retryable: false,
       running: false, refreshed: false, stopped: false, authorize, previousOperationId, transports: 0, releaseRequested: false };
@@ -89,6 +109,15 @@ export class SendOperations {
     this.cleanup(); const op = this.find(id, owner);
     if (!op.buffer || op.releaseRequested) throw fault('原图已过期，请重新选择图片。', 410);
     return op.buffer;
+  }
+  async loadAndStart(id: string, owner: SendOwner, load: () => Promise<Buffer>) {
+    this.cleanup(); const op = this.find(id, owner);
+    const buffer = await load();
+    // A client ID can be reused after retention expires. A late image load must
+    // never activate a different operation that has since acquired that ID.
+    this.cleanup();
+    if (this.operations.get(id) !== op) throw fault('原发送状态已失效，请检查聊天记录。', 410);
+    return this.start(id, owner, buffer);
   }
   start(id: string, owner: SendOwner, buffer: Buffer) {
     this.cleanup(); const op = this.find(id, owner);

@@ -5,6 +5,7 @@ import type { Server } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { TestContext } from 'node:test';
 import type { WebSocket as WsConnection } from 'ws';
+import { createHash } from 'node:crypto';
 
 const assert = require('node:assert/strict');
 const { EventEmitter } = require('node:events');
@@ -160,6 +161,42 @@ test('backend auth gates chat HTTP APIs and reports Steam offline as 503', async
     error: 'Steam is not logged in',
     steamStatus: 'logged_out'
   });
+});
+
+test('static responses grant immutable caching only to the matching content hash', async (t: TestContext) => {
+  const service = createChatService({ config: { host: '127.0.0.1', port: 0, wsPath: '/legacy-ws' },
+    logger: { info() {}, warn() {}, error() {} } }) as ChatServiceRuntime;
+  t.after(() => service.stop());
+  const base = `http://127.0.0.1:${await listen(service.server)}`;
+  const config = await fetch(base + '/api/config');
+  assert.deepEqual(await config.json(), { wsPath: '/legacy-ws' }, 'legacy auth does not advertise session-only operations');
+  for (const pathname of ['/app.js', '/style.css', '/vendor/artplayer-5.4.0.mjs']) {
+    const plain = await fetch(base + pathname);
+    assert.equal(plain.status, 200);
+    assert.equal(plain.headers.get('cache-control'), 'public, max-age=60');
+    const bytes = Buffer.from(await plain.arrayBuffer());
+    const hash = createHash('sha256').update(bytes).digest('hex').slice(0, 16);
+    const versioned = await fetch(`${base}${pathname}?v=${hash}`);
+    assert.equal(versioned.status, 200);
+    assert.equal(versioned.headers.get('cache-control'), 'public, max-age=31536000, immutable');
+    assert.deepEqual(Buffer.from(await versioned.arrayBuffer()), bytes);
+    const stale = `${hash[0] === '0' ? '1' : '0'}${hash.slice(1)}`;
+    for (const query of [`v=${stale}`, 'v=anything', 'v=', `v=${hash.slice(0, 8)}`, `v=${hash}&v=${hash}`, `v=${hash}&v=${stale}`]) {
+      const response = await fetch(`${base}${pathname}?${query}`);
+      assert.equal(response.status, 200);
+      assert.equal(response.headers.get('cache-control'), 'public, max-age=60', query);
+      assert.deepEqual(Buffer.from(await response.arrayBuffer()), bytes);
+    }
+  }
+  for (const pathname of ['/', '/index.html', '/sw.js', '/manifest.webmanifest']) {
+    const response = await fetch(base + pathname);
+    assert.equal(response.status, 200);
+    assert.equal(response.headers.get('cache-control'), 'no-store');
+    const hash = createHash('sha256').update(Buffer.from(await response.arrayBuffer())).digest('hex').slice(0, 16);
+    const versioned = await fetch(`${base}${pathname}?v=${hash}`);
+    assert.equal(versioned.headers.get('cache-control'), 'no-store', pathname);
+    await versioned.arrayBuffer();
+  }
 });
 
 test('backend WebSocket rejects missing cookies and accepts authenticated users', async (t: TestContext) => {

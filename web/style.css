@@ -1935,6 +1935,11 @@ dl.friend-facts {
   border-radius: 6px;
 }
 
+.image-button[data-loading="true"] {
+  min-width: min(240px, 100%);
+  min-height: 160px;
+}
+
 .message-content > .image-button:has(img) {
   overflow: hidden;
   padding: 0;

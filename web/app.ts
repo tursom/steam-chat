@@ -89,6 +89,7 @@ type MeResponse = {
   user: User | null;
   permissions: Permission[];
   steam: SteamStatus;
+  config?: { wsPath?: string; sendOperations?: boolean; imageOperationUpload?: boolean };
 };
 
 type ListEntry = Record<string, unknown> & {
@@ -193,6 +194,7 @@ type AppState = {
   historyLimit: number;
   wsPath: string;
   sendOperations: boolean;
+  imageOperationUpload: boolean;
   ws: WebSocket | null;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   statusTimer: ReturnType<typeof setInterval> | null;
@@ -248,6 +250,7 @@ const state: AppState = {
   historyLimit: clampLimit(localStorage.getItem('steam-chat.history-limit') || 100),
   wsPath: '/ws',
   sendOperations: false,
+  imageOperationUpload: false,
   ws: null,
   reconnectTimer: null,
   statusTimer: null,
@@ -265,7 +268,8 @@ type OutgoingMessage = { localId: number; context: string; item: MessageItem; st
 type ImageOperation = { id: string; peerId: string; steamAccountId: string; state: string; version: number;
   attempts: number; maxAttempts: number; nextRetryAt: number; phase: string; error?: string; retryable: boolean; hasImage: boolean; item?: MessageItem; cooldownUntil?: number; replacementId?: string };
 type ImageOperationEntry = OutgoingMessage & { operation?: ImageOperation; imagePayload?: Record<string, string>; transfer?: ImageTransfer;
-  operationBusy?: boolean; operationQueryBusy?: boolean; operationQueryError?: boolean; lastOperationQuery?: number; operationMissing?: boolean; operationCreatingFailed?: boolean };
+  operationBusy?: boolean; operationQueryBusy?: boolean; operationQueryError?: boolean; lastOperationQuery?: number; operationMissing?: boolean; operationCreatingFailed?: boolean;
+  uploadRejection?: string };
 const outgoingMessages = new Map<number, OutgoingMessage>();
 let outgoingId = 0;
 let chatEpoch = 0;
@@ -292,8 +296,148 @@ const imageTransfers = new Map<number, ImageTransfer>();
 let imageTransferId = 0;
 let conversationsBefore = '';
 let conversationsBusy = false;
+let conversationsLoaded = false;
+let historyLoaded = false;
 const recentConversationUpdates = new Map<string, ListEntry>();
 let storageHealth: unknown;
+
+type ThreadSnapshot = {
+  items: MessageItem[]; live: MessageItem[]; before: string; after: string; at: string;
+  detached: boolean; top: number; following: boolean; savedAt: number; rebase?: boolean;
+};
+const threadCache = new Map<string, ThreadSnapshot>();
+const networkThreads = new Set<string>();
+const cacheMaxAge = 24 * 60 * 60 * 1000;
+let cacheGeneration = 0;
+let cacheTimer: ReturnType<typeof setTimeout> | null = null;
+let cacheDatabase: Promise<IDBDatabase | null> | null = null;
+let historyRefreshing = false;
+let historyCacheRebase = false;
+let historyFromCache = false;
+
+function cacheScope() {
+  const account = state.steam.activeAccount?.steamId || state.steam.steamId;
+  return state.me && account && steamAccessAllowed() ? `${state.me.id}:${state.me.sessionVersion || 0}:${account}` : '';
+}
+
+function openChatCache(): Promise<IDBDatabase | null> {
+  if (cacheDatabase) return cacheDatabase;
+  cacheDatabase = new Promise(resolve => {
+    if (typeof indexedDB === 'undefined') { resolve(null); return; }
+    try {
+      const request = indexedDB.open('steam-chat-recent', 1);
+      request.onupgradeneeded = () => request.result.createObjectStore('snapshots');
+      request.onsuccess = () => {
+        const db = request.result;
+        db.onversionchange = () => { db.close(); cacheDatabase = null; };
+        resolve(db);
+      };
+      request.onerror = request.onblocked = () => resolve(null);
+    } catch { resolve(null); }
+  });
+  return cacheDatabase;
+}
+
+function clearChatCache(persistent = true) {
+  cacheGeneration++;
+  threadCache.clear();
+  networkThreads.clear();
+  if (cacheTimer) clearTimeout(cacheTimer);
+  cacheTimer = null;
+  if (persistent) void openChatCache().then(db => {
+    try { db?.transaction('snapshots', 'readwrite').objectStore('snapshots').clear(); } catch { /* Optional local cache. */ }
+  });
+}
+
+function rememberThread() {
+  if (!cacheScope() || !state.activeId || isCommunityGroup()) return;
+  const messages = document.querySelector<HTMLElement>('#messages');
+  if (!messages) return;
+  if (!historyItems.length) { if (historyLoaded) threadCache.delete(state.activeId); return; }
+  // Never truncate a page while retaining its cursor: that would skip history.
+  if (historyItems.length > 1000) { threadCache.delete(state.activeId); return; }
+  const following = historyScroll?.following() ?? Boolean(messages && messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48);
+  threadCache.delete(state.activeId);
+  threadCache.set(state.activeId, { items: [...historyItems], live: [...historyLive], before: historyBefore,
+    after: historyAfter, at: historyAt, detached: historyDetached, top: messages?.scrollTop || 0, following, savedAt: Date.now(), rebase: historyCacheRebase });
+  while (threadCache.size > 20) threadCache.delete(threadCache.keys().next().value!);
+}
+
+function updateCachedMessage(item: MessageItem) {
+  if (item.id === state.activeId && document.querySelector('#messages')) return;
+  const cached = threadCache.get(item.id);
+  if (!cached || !item.eventId) return;
+  cached.live = sortHistoryItems([...cached.live, item]).slice(-500);
+  if (!cached.detached) cached.items = sortHistoryItems([...cached.items, item]);
+  if (cached.items.length > 1000) threadCache.delete(item.id);
+}
+
+function restoreThread() {
+  const cached = threadCache.get(state.activeId);
+  if (!cacheScope() || !cached) return false;
+  if (Date.now() - cached.savedAt > cacheMaxAge) { threadCache.delete(state.activeId); return false; }
+  historyItems = [...cached.items]; historyLive = [...cached.live];
+  historyBefore = cached.before; historyAfter = cached.after; historyAt = cached.at; historyDetached = cached.detached;
+  historyCacheRebase = cached.rebase === true;
+  historyFromCache = true;
+  if (cached.detached && historyBusy) { historyRequest++; historyBusy = historyBrowsingRequest = false; }
+  renderHistory(historyItems);
+  const messages = document.querySelector<HTMLElement>('#messages');
+  if (messages && !cached.following) { messages.scrollTop = cached.top; watchHistoryLayout(messages, false); }
+  const date = document.querySelector<HTMLInputElement>('#historyDate');
+  if (date) date.value = historyAt;
+  updateHistoryControls();
+  return true;
+}
+
+function scheduleChatCache() {
+  if (cacheTimer || !cacheScope()) return;
+  const scope = cacheScope(), generation = cacheGeneration;
+  cacheTimer = setTimeout(() => {
+    cacheTimer = null;
+    if (scope !== cacheScope() || generation !== cacheGeneration) return;
+    rememberThread();
+    const snapshot = { scope, savedAt: Date.now(), conversations: state.conversations.slice(0, 100),
+      threads: [...threadCache].filter(([, entry]) => entry.items.length <= 500 && Date.now() - entry.savedAt < cacheMaxAge) };
+    // A single bounded snapshot also bounds storage across users and accounts.
+    while (JSON.stringify(snapshot).length > 2 * 1024 * 1024 && snapshot.threads.length) snapshot.threads.shift();
+    if (JSON.stringify(snapshot).length > 2 * 1024 * 1024) return;
+    void openChatCache().then(db => {
+      if (!db || scope !== cacheScope() || generation !== cacheGeneration) return;
+      try { db.transaction('snapshots', 'readwrite').objectStore('snapshots').put(snapshot, 'recent'); } catch { /* Quota/private browsing. */ }
+    });
+  }, 500);
+}
+
+async function restoreChatCache() {
+  const scope = cacheScope(), generation = cacheGeneration;
+  if (!scope) return;
+  const db = await openChatCache();
+  if (!db || scope !== cacheScope() || generation !== cacheGeneration) return;
+  const snapshot: unknown = await new Promise(resolve => {
+    try {
+      const request = db.transaction('snapshots').objectStore('snapshots').get('recent');
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => resolve(null);
+    } catch { resolve(null); }
+  });
+  if (scope !== cacheScope() || generation !== cacheGeneration || !isRecord(snapshot) || snapshot.scope !== scope
+    || typeof snapshot.savedAt !== 'number' || Date.now() - snapshot.savedAt > cacheMaxAge) return;
+  // Network/live data always wins over an asynchronous disk read.
+  if (!conversationsLoaded && !state.conversations.length) state.conversations = asListEntries(snapshot.conversations).slice(0, 100);
+  if (Array.isArray(snapshot.threads)) for (const pair of snapshot.threads.slice(-20)) {
+    if (!Array.isArray(pair) || typeof pair[0] !== 'string' || !isRecord(pair[1]) || threadCache.has(pair[0]) || networkThreads.has(pair[0])) continue;
+    const entry = pair[1];
+    if (!Array.isArray(entry.items) || entry.items.length > 500 || typeof entry.savedAt !== 'number'
+      || Date.now() - entry.savedAt > cacheMaxAge) continue;
+    threadCache.set(pair[0], { items: asMessages(entry.items).filter(item => item.id === pair[0]), live: [],
+      before: typeof entry.before === 'string' ? entry.before : '', after: typeof entry.after === 'string' ? entry.after : '',
+      at: typeof entry.at === 'string' ? entry.at : '', detached: entry.detached === true,
+      top: typeof entry.top === 'number' ? entry.top : 0, following: entry.following === true, savedAt: entry.savedAt, rebase: true });
+  }
+  updateChatLists();
+  if (!historyLoaded && !historyItems.length && state.view === 'chat') restoreThread();
+}
 
 function chatContext() {
   return `${chatEpoch}|${state.me?.id || ''}|${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}|${steamAccessAllowed()}`;
@@ -307,6 +451,9 @@ function resetHistory() {
   renderImageDrafts();
   historyRequest += 1;
   historyItems = [];
+  historyLoaded = false;
+  historyCacheRebase = false;
+  historyFromCache = false;
   historyLive = [];
   historyBefore = historyAfter = historyAt = '';
   historyBusy = historyDetached = historyBrowsingRequest = false;
@@ -314,7 +461,11 @@ function resetHistory() {
   updateHistoryControls();
 }
 
-function invalidateChat() {
+function invalidateChat(purgePersistent = true) {
+  clearChatCache(purgePersistent);
+  inventoryTask = null;
+  inventoryContext = '';
+  state.emoticons = []; state.stickers = []; state.effects = [];
   stopImageOperationPolling();
   resetDurableSync();
   closeDesktopNotifications();
@@ -330,6 +481,7 @@ function invalidateChat() {
   healthRequest += 1;
   conversationsBefore = '';
   conversationsBusy = false;
+  conversationsLoaded = false;
   recentConversationUpdates.clear();
   imageEmoteRequest++;
   imageEmoteCatalog = { version: 0, groups: [], images: [] };
@@ -497,7 +649,7 @@ function updateSteamStatus(status: SteamStatus) {
   state.steam = { ...defaultSteamStatus, ...status };
   const accountChanged = previousAccount !== `${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}`;
   if (accountChanged || !steamAccessAllowed()) {
-    invalidateChat();
+    invalidateChat(previousAccount !== '|' || !steamAccessAllowed());
     stopWebSocket();
     state.activeName = '';
     state.friendDetailsOpen = false;
@@ -527,7 +679,7 @@ function updateSteamStatus(status: SteamStatus) {
     syncFriendDetails();
   }
   updateChatAvailability();
-  if ((accountChanged || previousAccess !== steamAccessAllowed()) && state.me && state.view === 'chat') {
+  if ((accountChanged || previousAccess !== steamAccessAllowed()) && state.me && state.view === 'chat' && document.querySelector('#chatLayout')) {
     updateChatLists();
     void loadHistory();
     ensureWebSocket();
@@ -536,26 +688,38 @@ function updateSteamStatus(status: SteamStatus) {
 }
 
 async function api(path: string, options: RequestInit = {}, onUploadProgress?: (percent: number | null) => void): Promise<unknown> {
-  const headers = new Headers(options.headers || {});
-  headers.set('Accept', 'application/json');
-  if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
-  const response = onUploadProgress
-    ? await uploadRequest(path, { ...options, headers }, onUploadProgress)
-    : await fetch(path, { ...options, headers, credentials: 'same-origin' });
-  const payload: unknown = await response.json().catch((): null => null);
-  if (!response.ok) {
-    if (response.status === 401 && !path.startsWith('/api/auth/me') && !path.startsWith('/api/auth/login')) {
-      stopWebSocket();
-      state.me = null;
-      state.permissions = [];
-      state.needsSetup = false;
-      renderLogin();
+  const context = chatContext();
+  const controller = !options.signal && (!options.method || options.method === 'GET') ? new AbortController() : null;
+  const deadline = controller ? setTimeout(() => controller.abort(), networkDeadlineMs) : null;
+  if (controller) options = { ...options, signal: controller.signal };
+  try {
+    const headers = new Headers(options.headers || {});
+    headers.set('Accept', 'application/json');
+    if (options.body && !headers.has('Content-Type')) headers.set('Content-Type', 'application/json');
+    const response = onUploadProgress
+      ? await uploadRequest(path, { ...options, headers }, onUploadProgress)
+      : await fetch(path, { ...options, headers, credentials: 'same-origin' });
+    const payload: unknown = await response.json().catch((): null => null);
+    if (!response.ok) {
+      if (context === chatContext() && response.status === 401 && !path.startsWith('/api/auth/me') && !path.startsWith('/api/auth/login')) {
+        stopWebSocket();
+        state.me = null;
+        state.permissions = [];
+        state.needsSetup = false;
+        renderLogin();
+      }
+      if (context === chatContext() && response.status === 403 && /^\/api\/(history|conversations|messages\/sync)(?:\?|$)/.test(path)) {
+        invalidateChat();
+        state.conversations = []; state.friends = []; state.groups = [];
+        state.steam.accessAllowed = false;
+        stopWebSocket(); updateChatLists(); updateChatAvailability();
+      }
+      throw Object.assign(new Error(isRecord(payload) && typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`), {
+        status: response.status, ...(isRecord(payload) && typeof payload.uncertain === 'boolean' ? { uncertain: payload.uncertain } : {})
+      });
     }
-    throw Object.assign(new Error(isRecord(payload) && typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`), {
-      status: response.status, ...(isRecord(payload) && typeof payload.uncertain === 'boolean' ? { uncertain: payload.uncertain } : {})
-    });
-  }
-  return payload;
+    return payload;
+  } finally { if (deadline !== null) clearTimeout(deadline); }
 }
 
 function uploadRequest(path: string, options: RequestInit, onProgress: (percent: number | null) => void): Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }> {
@@ -590,9 +754,9 @@ function formValue(form: HTMLFormElement, name: string): string {
   return typeof value === 'string' ? value : '';
 }
 
-function authPage(title: string, subtitle: string, form: HTMLElement) {
+function authPage(title: string, subtitle: string, form: HTMLElement, purgePersistent = true) {
   historyScroll?.dispose();
-  invalidateChat();
+  invalidateChat(purgePersistent);
   stopStatusPolling();
   stopWebSocket();
   clear(root);
@@ -670,6 +834,7 @@ function panel(title: string, className = '') {
 }
 
 function renderShell() {
+  rememberThread();
   historyScroll?.dispose();
   if (!state.me) {
     renderLogin();
@@ -732,7 +897,10 @@ function renderShell() {
   main.append(top, content, feedback);
   shell.append(sidebar, main);
   root.append(shell);
-  if (state.view === 'chat') { void refreshChatData(); void loadImageEmotes(); }
+  if (state.view === 'chat') {
+    void refreshChatData(Boolean(durableSyncCursor));
+    requestDurableSync();
+  }
   if (state.view === 'imageEmotes') void loadImageEmotes();
   if (state.view === 'users' && hasPermission('user.manage')) {
     void loadSteamAccounts();
@@ -1601,7 +1769,11 @@ function renderChatView() {
   details.hidden = !state.friendDetailsOpen || !state.activeId;
   detailsBackdrop.hidden = details.hidden;
   setTimeout(() => {
-    if (state.activeId) void loadHistory();
+    if (state.activeId) {
+      const restored = restoreThread();
+      if (durableSyncCursor && !historyDetached) void loadHistory('latest', '', { preserve: restored, cacheRefresh: restored });
+      else if (durableSyncCursor && historyDetached && historyCacheRebase) void loadHistory('date', historyAt);
+    }
     else renderHistory([]);
     updateChatAvailability();
     updateHistoryControls();
@@ -1612,19 +1784,34 @@ function renderChatView() {
 }
 
 function renderChatListSections(container: HTMLElement) {
-  clear(container);
+  const existing = new Map(Array.from(container.children).filter(row => (row as HTMLElement).dataset.peerId)
+    .map(row => [(row as HTMLElement).dataset.peerId, row as HTMLElement]));
+  const desired: HTMLElement[] = [];
   const items = filterChatEntries(chatEntriesForActiveTab(), state.chatQuery);
   if (!items.length) {
-    container.append(create('div', 'conversation-empty', state.chatQuery.trim() ? '没有匹配的会话' : '暂无会话'));
+    desired.push(create('div', 'conversation-empty', state.chatQuery.trim() ? '没有匹配的会话' : '暂无会话'));
   }
-  for (const item of items) container.append(renderListItem(item));
+  for (const item of items) {
+    const signature = JSON.stringify([item.name, item.avatar, item.preview, item.updatedAt, item.gameName,
+      item.clanId, item.clanid, item.online, state.chatListCollapsed, formatConversationTime(item.updatedAt)]);
+    let row = existing.get(item.id);
+    if (!row || row.dataset.signature !== signature) {
+      row = renderListItem(item); row.dataset.peerId = item.id; row.dataset.signature = signature;
+    }
+    row.className = `list-item${item.id === state.activeId ? ' is-active' : ''}`;
+    row.setAttribute('aria-current', String(item.id === state.activeId));
+    desired.push(row);
+  }
   if (state.chatListTab === 'recent' && conversationsBefore) {
     const more = create('button', 'ghost-btn conversations-more', conversationsBusy ? '加载中…' : '加载更多会话');
     more.type = 'button';
     more.disabled = conversationsBusy;
     more.addEventListener('click', () => void loadConversations(true));
-    container.append(more);
+    desired.push(more);
   }
+  const retained = new Set(desired);
+  for (const row of Array.from(container.children)) if (!retained.has(row as HTMLElement)) row.remove();
+  desired.forEach((row, index) => { if (container.children[index] !== row) container.insertBefore(row, container.children[index] || null); });
 }
 
 function filterChatEntries(items: ListEntry[], query: string): ListEntry[] {
@@ -1811,6 +1998,8 @@ function renderAvatar(item: ListEntry | null, name: string, className = 'avatar'
   if (item?.avatar) {
     const image = document.createElement('img');
     image.src = item.avatar;
+    image.loading = 'lazy';
+    image.decoding = 'async';
     image.alt = '';
     avatar.replaceChildren(image);
   }
@@ -2049,7 +2238,7 @@ function renderComposer() {
   const pickerControls = bindFloatingPanel(pickerButton, picker);
   pickerButton.addEventListener('click', () => {
     attachmentControls.close();
-    if (picker.hidden) { renderPicker(picker); void loadImageEmotes(); }
+    if (picker.hidden) { renderPicker(picker); void loadImageEmotes(); void loadChatInventory(); }
     pickerControls.toggle();
   });
 
@@ -2194,7 +2383,27 @@ function updateChatAvailability() {
   }
 }
 
-async function refreshChatData() {
+let inventoryContext = '';
+let inventoryTask: Promise<void> | null = null;
+async function loadChatInventory() {
+  const context = chatContext();
+  if (!steamOnline() || !steamAccessAllowed() || inventoryContext === context) return;
+  if (inventoryTask) return inventoryTask;
+  const task = (async () => {
+    try {
+      const inventory = await api('/api/emoticons');
+      if (context !== chatContext() || !isRecord(inventory)) return;
+      state.emoticons = asInventory(inventory.emoticons); state.stickers = asInventory(inventory.stickers); state.effects = asInventory(inventory.effects);
+      inventoryContext = context;
+      const picker = document.querySelector<HTMLElement>('#picker');
+      if (picker && !picker.hidden) renderPicker(picker);
+    } catch { /* Opening the picker again retries. */ }
+  })();
+  inventoryTask = task;
+  try { await task; } finally { if (inventoryTask === task) inventoryTask = null; }
+}
+
+async function refreshChatData(includeConversations = true) {
   if (!state.me) return;
   if (!steamAccessAllowed()) {
     state.conversations = [];
@@ -2210,8 +2419,7 @@ async function refreshChatData() {
   const context = chatContext();
   const request = ++listRequest;
   try {
-    await loadConversations();
-    if (context !== chatContext() || request !== listRequest) return;
+    const conversationsRequest = includeConversations ? loadConversations() : Promise.resolve();
     if (steamOnline()) {
       const friendsRequest = api('/api/friends').catch((): InventoryItem[] => []);
       friendsRequest.then(friends => {
@@ -2226,17 +2434,13 @@ async function refreshChatData() {
         }
       }).catch(() => {});
       const groupsRequest = api('/api/groups').catch((): ListEntry[] => []);
-      const inventoryRequest = api('/api/emoticons').catch((): { emoticons: InventoryItem[]; stickers: InventoryItem[]; effects: InventoryItem[] } => ({ emoticons: [], stickers: [], effects: [] }));
-      const [friends, groups, inventory] = await Promise.all([friendsRequest, groupsRequest, inventoryRequest]);
+      const [friends, groups] = await Promise.all([friendsRequest, groupsRequest, conversationsRequest]);
       if (context !== chatContext() || request !== listRequest) return;
       state.friends = asListEntries(friends);
       state.groups = asListEntries(groups);
-      state.emoticons = isRecord(inventory) ? asInventory(inventory.emoticons) : [];
-      state.stickers = isRecord(inventory) ? asInventory(inventory.stickers) : [];
-      state.effects = isRecord(inventory) ? asInventory(inventory.effects) : [];
-      const picker = document.querySelector<HTMLElement>('#picker');
-      if (picker && !picker.hidden) renderPicker(picker);
     } else {
+      await conversationsRequest;
+      if (context !== chatContext() || request !== listRequest) return;
       state.friends = [];
       state.groups = [];
       state.emoticons = [];
@@ -2263,6 +2467,7 @@ function openConversation(id: unknown, name = '') {
     return;
   }
   const alreadyActive = target === state.activeId;
+  if (!alreadyActive) rememberThread();
   reopenConversation(target);
   state.activeId = target;
   if (!alreadyActive) resetHistory();
@@ -2282,7 +2487,11 @@ function openConversation(id: unknown, name = '') {
   if (head) renderThreadHeader(head);
   syncFriendDetails();
   updateChatAvailability();
-  if (!alreadyActive || historyDetached) void loadHistory();
+  if (!alreadyActive) {
+    const restored = restoreThread();
+    if (!historyDetached) void loadHistory('latest', '', { preserve: restored, cacheRefresh: restored });
+    else if (historyCacheRebase) void loadHistory('date', historyAt);
+  }
   else {
     const messages = document.querySelector<HTMLElement>('#messages');
     if (messages) followHistoryBottom(messages);
@@ -2334,7 +2543,9 @@ async function loadConversations(more = false, signal?: AbortSignal) {
       }
     }
     state.conversations = [...merged.values()].sort((left, right) => conversationTimestamp(right.updatedAt) - conversationTimestamp(left.updatedAt));
+    conversationsLoaded = true;
     conversationsBefore = pageCursor(payload);
+    scheduleChatCache();
     return true;
   } catch (_) {
     if (!signal?.aborted && context === chatContext() && request === conversationRequest) setFeedback('会话列表暂时无法加载，请稍后重试。', 'warn');
@@ -2401,7 +2612,7 @@ function updateHistoryControls() {
     }
   }
   const older = document.querySelector<HTMLElement>('#historyOlder');
-  if (older) older.textContent = historyBusy ? '加载中…' : '更早消息';
+  if (older) older.textContent = historyBusy ? (historyRefreshing ? '正在同步…' : '加载中…') : '更早消息';
   document.querySelector('#historyTools')?.setAttribute('aria-busy', String(historyBusy));
 }
 
@@ -2461,7 +2672,7 @@ function uniqueMessages(items: MessageItem[]): MessageItem[] {
   });
 }
 
-async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest', date = '', options: { signal?: AbortSignal; preserve?: boolean } = {}) {
+async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest', date = '', options: { signal?: AbortSignal; preserve?: boolean; cacheRefresh?: boolean } = {}) {
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages || !state.activeId || !steamAccessAllowed()) return;
   if (isCommunityGroup()) {
@@ -2478,6 +2689,7 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
   const request = ++historyRequest;
   const current = () => request === historyRequest && target === state.activeId && context === chatContext() && messages === document.querySelector('#messages');
   historyBusy = true;
+  historyRefreshing = mode === 'latest' && Boolean(options.preserve);
   historyBrowsingRequest = mode !== 'latest';
   updateHistoryControls();
   try {
@@ -2488,6 +2700,8 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
     const payload = await api(`/api/history?${params}`, { signal: options.signal });
     if (options.signal?.aborted || !current()) return;
     const items = uniqueMessages(asMessages(isRecord(payload) ? payload.items : payload));
+    historyLoaded = true;
+    networkThreads.add(target);
     const confirmed = new Set(items.map((item) => item.eventId).filter(Boolean));
     historyLive = historyLive.filter((item) => !item.eventId || !confirmed.has(item.eventId));
     if (mode === 'older' || mode === 'newer') {
@@ -2513,16 +2727,23 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
       const following = historyScroll?.following() ?? messages.scrollHeight - top - messages.clientHeight < 48;
       historyDetached = mode === 'date';
       historyAt = mode === 'date' ? date : '';
-      historyItems = sortHistoryItems([...(options.preserve ? historyItems : []), ...items, ...(historyDetached ? [] : historyLive)]);
-      if (!options.preserve || !historyBefore) historyBefore = pageCursor(payload);
+      // A disconnected cache must not imply that the gap between two pages is loaded.
+      const overlap = items.some(item => item.eventId && historyItems.some(old => old.eventId === item.eventId));
+      const preserve = options.preserve && !historyCacheRebase && (!options.cacheRefresh || overlap);
+      historyItems = sortHistoryItems([...(preserve ? historyItems : []), ...items, ...(historyDetached ? [] : historyLive)]);
+      if (!preserve || !historyBefore) historyBefore = pageCursor(payload);
       historyAfter = pageCursor(payload, 'previousCursor');
+      historyCacheRebase = false;
+      historyFromCache = false;
       renderHistory(historyItems);
-      if (options.preserve && !following) { messages.scrollTop = top; watchHistoryLayout(messages, false); }
+      if (preserve && !following) { messages.scrollTop = top; watchHistoryLayout(messages, false); }
       void loadReactionSnapshots(true);
       if (historyDetached) messages.scrollTop = 0;
       const input = document.querySelector<HTMLInputElement>('#historyDate');
       if (input) input.value = historyAt;
     }
+    rememberThread();
+    scheduleChatCache();
     return true;
   } catch (_) {
     if (!options.signal?.aborted && current()) setFeedback('历史消息暂时无法加载，请重试。', 'warn');
@@ -2689,6 +2910,8 @@ function receiveHistoryMessage(item: MessageItem) {
   const account = state.steam.activeAccount?.steamId || state.steam.steamId;
   if (item.steamAccountId && item.steamAccountId !== account) return;
   updateRecentConversation(item);
+  updateCachedMessage(item);
+  scheduleChatCache();
   notifyIncomingMessage(item);
   if (item.id === state.activeId && state.view === 'chat' && !historyDetached && document.visibilityState === 'visible') {
     const match = /^\[roomeffect\s+type="([a-z0-9_]+)"[^\]]*\]\s*\[\/roomeffect\]$/i.exec(item.message || '');
@@ -2710,7 +2933,7 @@ function receiveHistoryMessage(item: MessageItem) {
     : messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48;
   messages.querySelector('.thread-empty')?.remove();
   messages.append(renderMessage(item));
-  markMessageRuns(messages);
+  markMessageRuns(messages, Math.max(0, messages.children.length - 1));
   if (atBottom) followHistoryBottom(messages);
   else watchHistoryLayout(messages, false);
 }
@@ -2878,7 +3101,7 @@ function renderHistory(items: MessageItem[]) {
     const operationEntry = entry as ImageOperationEntry;
     if (operationEntry.operation) row.dataset.operationId = operationEntry.operation.id;
     const status = create('span', 'message-send-state');
-    if (operationEntry.operation) status.append(create('span', 'outgoing-status-label', imageOperationLabel(operationEntry.operation)));
+    if (operationEntry.operation) status.append(create('span', 'outgoing-status-label', imageOperationLabel(operationEntry.operation, operationEntry.uploadRejection)));
     else status.textContent = labels[entry.state];
     status.setAttribute('role', 'status');
     if (entry.error) {
@@ -2952,11 +3175,12 @@ function messageDayLabel(time: number): string {
 
 // Group consecutive messages from one sender and mark day boundaries.
 // State lives on data attributes so retained rows never need re-rendering.
-function markMessageRuns(messages: HTMLElement) {
-  let previousSender = '';
-  let previousTime = NaN;
-  let previousDay = '';
-  for (const row of Array.from(messages.children) as HTMLElement[]) {
+function markMessageRuns(messages: HTMLElement, start = 0) {
+  const previous = messages.children[start - 1] as HTMLElement | undefined;
+  let previousSender = previous?.dataset.sender || '';
+  let previousTime = previous ? Number(previous.dataset.sentAt) : NaN;
+  let previousDay = Number.isFinite(previousTime) ? new Date(previousTime).toDateString() : '';
+  for (const row of Array.from(messages.children).slice(start) as HTMLElement[]) {
     const sender = row.dataset.sender || '';
     const time = Number(row.dataset.sentAt);
     if (!sender) {
@@ -2992,8 +3216,9 @@ function messageReactionKey(item: MessageItem) {
 
 function refreshReactionBars() {
   const nodes = document.querySelectorAll<HTMLElement>('#messages [data-event-id]');
+  const items = new Map(historyItems.map(item => [item.eventId, item]));
   for (const node of Array.from(nodes)) {
-    const item = historyItems.find(item => item.eventId === node.dataset.eventId);
+    const item = items.get(node.dataset.eventId);
     const bar = node.querySelector<HTMLElement>('.message-reactions');
     if (item && bar && !bar.querySelector('.reaction-picker')) renderReactionBar(bar, item);
   }
@@ -3002,7 +3227,7 @@ function refreshReactionBars() {
 async function loadReactionSnapshots(force = false) {
   if (!state.me || !steamOnline() || !steamAccessAllowed() || isCommunityGroup() || state.view !== 'chat'
     || !state.activeId || !historyItems.length || reactionLoading || reactionPending.size
-    || (!force && Date.now() - reactionLastLoad < 10000)) return;
+    || (!force && (document.visibilityState !== 'visible' || Date.now() - reactionLastLoad < 30000))) return;
   const context = chatContext(), peer = state.activeId, generation = reactionGeneration;
   const newest = Math.max(...historyItems.map(item => Math.floor(Date.parse(item.sentAt || item.date || '') / 1000)).filter(Number.isFinite));
   if (!Number.isFinite(newest)) return;
@@ -3772,6 +3997,8 @@ function stickerNode(type: string) {
   image.className = 'sticker';
   image.src = `/proxy/sticker/${encodeURIComponent(type)}`;
   image.alt = type;
+  image.loading = 'lazy';
+  image.decoding = 'async';
   return image;
 }
 
@@ -3792,6 +4019,7 @@ function steamImageNode(preview: SteamImagePreview) {
   if (preview.sourceSet) image.srcset = preview.sourceSet;
   image.alt = '图片';
   image.loading = 'lazy';
+  image.decoding = 'async';
   image.addEventListener('error', () => {
     const fallback = externalLink('bbcode-image-fallback', preview.sourceUrl, preview.sourceUrl);
     fallback.title = '图片加载失败';
@@ -3827,8 +4055,12 @@ function imageNode(sourceUrl: string) {
   const image = document.createElement('img');
   image.src = proxiedImageUrl(sourceUrl);
   image.alt = '图片';
-  image.onload = () => shell.replaceChildren(image);
-  image.onerror = () => shell.textContent = '图片加载失败';
+  image.loading = 'lazy';
+  image.decoding = 'async';
+  shell.dataset.loading = 'true';
+  image.onload = () => { delete shell.dataset.loading; };
+  shell.replaceChildren(image);
+  image.onerror = () => { delete shell.dataset.loading; shell.textContent = '图片加载失败'; };
   shell.addEventListener('click', () => openLightbox(image.src));
   return shell;
 }
@@ -3986,6 +4218,7 @@ function saveImageOperationMetadata() {
     sessionStorage.setItem(imageOperationKey(), JSON.stringify([...outgoingMessages.values()].map(item => item as ImageOperationEntry)
       .filter(item => item.context === chatContext() && item.operation && item.state !== 'sent')
       .slice(-100).map(item => ({ operationId: item.operation!.id, peerId: item.item.id, createdAt: item.item.sentAt,
+        uploadRejection: item.uploadRejection,
         thread: state.chatPanel === 'thread' && state.activeId === item.item.id }))));
   } catch { /* Browser storage may be disabled. Current-page retry still works. */ }
 }
@@ -3995,8 +4228,9 @@ function stopImageOperationPolling() {
   for (const controller of imageOperationRequests) controller.abort();
   imageOperationRequests.clear();
 }
-function imageOperationLabel(op: ImageOperation) {
+function imageOperationLabel(op: ImageOperation, uploadRejection?: string) {
   const count = `第 ${op.attempts}/${op.maxAttempts} 次`;
+  if (op.state === 'prepared' && uploadRejection) return '图片上传失败';
   if (op.state === 'retry_wait') return `${Math.max(0, Math.ceil((op.nextRetryAt - Date.now()) / 1000))} 秒后重试 · ${count}`;
   if (op.state === 'waiting_connection') return '等待 Steam 恢复连接…';
   if (op.state === 'prepared') return '准备上传图片…';
@@ -4016,6 +4250,13 @@ function applyImageOperation(entry: ImageOperationEntry, value: unknown) {
   const op = entry.operation;
   if (!op.hasImage && ['failed', 'cancelled', 'unknown'].includes(op.state)) entry.imagePayload = undefined;
   entry.operationMissing = false; entry.error = op.error;
+  if (op.state === 'prepared' && entry.uploadRejection) {
+    entry.state = 'failed'; entry.error = entry.uploadRejection;
+    if (entry.transfer) updateImageTransfer(entry.transfer, 'failed', null, entry.error);
+    refreshOutgoing(); saveImageOperationMetadata();
+    return;
+  }
+  if (op.state !== 'prepared') entry.uploadRejection = undefined;
   if (op.state === 'prepared' && !entry.imagePayload) entry.error = '原图尚未上传。请先停止此任务，再重新选择图片。';
   if (op.state === 'sent') {
     if (entry.transfer) updateImageTransfer(entry.transfer, 'sent', 100);
@@ -4030,13 +4271,14 @@ function applyImageOperation(entry: ImageOperationEntry, value: unknown) {
   saveImageOperationMetadata();
 }
 async function queryImageOperation(entry: ImageOperationEntry, force = false) {
-  if (!entry.operation || entry.operationQueryBusy || entry.operationBusy || entry.operationMissing || entry.context !== chatContext()) return;
+  if (!entry.operation || !outgoingMessages.has(entry.localId) || entry.operationQueryBusy || entry.operationBusy || entry.operationMissing || entry.context !== chatContext()) return;
   const now = Date.now();
-  const interval = entry.state === 'sending' ? 2000 : 10000;
+  const interval = document.visibilityState !== 'visible' ? 60000
+    : state.ws?.readyState === WebSocket.OPEN ? 15000 : entry.state === 'sending' ? 5000 : 15000;
   if (!force && now - (entry.lastOperationQuery || 0) < interval) return;
   entry.lastOperationQuery = now; entry.operationQueryBusy = true;
   const controller = new AbortController(); imageOperationRequests.add(controller);
-  const deadline = setTimeout(() => controller.abort(), 8000);
+  const deadline = setTimeout(() => controller.abort(), networkDeadlineMs);
   try {
     const payload = await api(`/api/send-operations/${entry.operation.id}`, { signal: controller.signal });
     const wasUnavailable = entry.operationQueryError; entry.operationQueryError = false;
@@ -4046,8 +4288,9 @@ async function queryImageOperation(entry: ImageOperationEntry, force = false) {
   catch (error) {
     if (entry.context !== chatContext() || !outgoingMessages.has(entry.localId)) return;
     if (isRecord(error) && [403, 404, 410].includes(Number(error.status))) {
-      entry.operationMissing = true; entry.state = 'unknown'; entry.error = '原发送状态已失效，请检查聊天记录。';
-      entry.operation.state = 'unknown'; entry.operation.retryable = false; refreshOutgoing();
+      entry.operationMissing = true; entry.state = entry.uploadRejection ? 'failed' : 'unknown';
+      entry.error = entry.uploadRejection || '原发送状态已失效，请检查聊天记录。';
+      entry.operation.state = entry.state; entry.operation.retryable = false; refreshOutgoing();
     } else if (!entry.operationQueryError) {
       entry.operationQueryError = true; refreshOutgoing();
     }
@@ -4060,9 +4303,9 @@ function startImageOperationPolling() {
       const entry = item as ImageOperationEntry;
       if (!entry.operation || entry.context !== chatContext()) continue;
       const label = document.querySelector<HTMLElement>(`[data-outgoing-id="${entry.localId}"] .outgoing-status-label`);
-      if (label) label.textContent = imageOperationLabel(entry.operation);
+      if (label) label.textContent = imageOperationLabel(entry.operation, entry.uploadRejection);
       const transferLabel = entry.transfer && document.querySelector<HTMLElement>(`[data-transfer-id="${entry.transfer.id}"] .image-transfer-status`);
-      if (transferLabel) transferLabel.textContent = imageOperationLabel(entry.operation);
+      if (transferLabel) transferLabel.textContent = imageOperationLabel(entry.operation, entry.uploadRejection);
       void queryImageOperation(entry);
     }
   }, 1000);
@@ -4077,6 +4320,7 @@ function restoreImageOperations() {
         || typeof value.peerId !== 'string' || !/^\d{17}$/.test(value.peerId)
         || [...outgoingMessages.values()].some(item => (item as ImageOperationEntry).operation?.id === value.operationId)) continue;
       const entry: ImageOperationEntry = { localId: ++outgoingId, context: chatContext(), state: 'sending',
+        uploadRejection: typeof value.uploadRejection === 'string' ? value.uploadRejection.slice(0, 500) : undefined,
         item: { id: value.peerId, type: 'image', echo: true, message: '[图片]', sentAt: typeof value.createdAt === 'string' ? value.createdAt : new Date().toISOString() },
         operation: { id: value.operationId, peerId: value.peerId, steamAccountId: state.steam.activeAccount?.steamId || state.steam.steamId || '',
           version: 0, state: 'queued', attempts: 0, maxAttempts: 6, nextRetryAt: 0, phase: 'unknown', retryable: false, hasImage: false } };
@@ -4144,6 +4388,7 @@ function appendImageOperationActions(bubble: HTMLElement, entry: ImageOperationE
 async function activateImageOperation(entry: ImageOperationEntry, payload: Record<string, string>) {
   if (!entry.operation || entry.operationBusy || entry.context !== chatContext()) return;
   entry.operationBusy = true;
+  entry.uploadRejection = undefined;
   try {
     const result = await api(`/api/send-operations/${entry.operation.id}/start`, jsonBody(payload), percent => {
       if (entry.transfer && entry.context === chatContext()) updateImageTransfer(entry.transfer, percent === 100 ? 'processing' : 'uploading', percent === 100 ? null : percent);
@@ -4161,6 +4406,9 @@ async function activateImageOperation(entry: ImageOperationEntry, payload: Recor
   finally { entry.operationBusy = false; void queryImageOperation(entry, true); }
 }
 async function startImageOperation(entry: ImageOperationEntry, payload: Record<string, string>, transfer?: ImageTransfer, previousOperationId?: string) {
+  if (state.imageOperationUpload && typeof crypto !== 'undefined' && typeof crypto.getRandomValues === 'function') {
+    return uploadImageOperation(entry, payload, transfer, previousOperationId);
+  }
   if (entry.operationBusy || entry.context !== chatContext()) return;
   entry.operationBusy = true;
   entry.imagePayload = { ...payload }; entry.transfer = transfer; entry.operationCreatingFailed = false;
@@ -4181,6 +4429,40 @@ async function startImageOperation(entry: ImageOperationEntry, payload: Record<s
     if (transfer) updateImageTransfer(transfer, 'failed', null, entry.error);
     refreshOutgoing();
   } finally { entry.operationBusy = false; }
+}
+
+async function uploadImageOperation(entry: ImageOperationEntry, payload: Record<string, string>, transfer?: ImageTransfer, previousOperationId?: string) {
+  if (entry.operationBusy || entry.context !== chatContext()) return;
+  const operationId = Array.from(crypto.getRandomValues(new Uint8Array(16)), byte => byte.toString(16).padStart(2, '0')).join('');
+  const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId || '';
+  entry.operationBusy = true; entry.imagePayload = { ...payload }; entry.transfer = transfer;
+  entry.operation = { id: operationId, peerId: entry.item.id, steamAccountId, state: 'queued', version: 0,
+    attempts: 0, maxAttempts: 6, nextRetryAt: 0, phase: 'prepare', retryable: false, hasImage: false };
+  // Persist identity before any bytes leave the browser. A lost response is queried, never resent automatically.
+  saveImageOperationMetadata();
+  startImageOperationPolling();
+  try {
+    const result = await api('/api/send-operations/upload', jsonBody({ ...payload, operationId, kind: 'image', id: entry.item.id,
+      steamAccountId, name: transfer?.name || '图片', previousOperationId }), percent => {
+      if (transfer && entry.context === chatContext()) updateImageTransfer(transfer, percent === 100 ? 'processing' : 'uploading', percent === 100 ? null : percent);
+    });
+    applyImageOperation(entry, result);
+  } catch (error) {
+    if (entry.context !== chatContext() || !outgoingMessages.has(entry.localId)) return;
+    // A push may already have confirmed this operation while its HTTP response was lost.
+    const rejected = isRecord(error) && [400, 413, 415, 422].includes(Number(error.status));
+    if (rejected) entry.uploadRejection = errorMessage(error);
+    if (entry.operation.version === 0 || (rejected && entry.operation.state === 'prepared')) {
+      if (entry.operation.version === 0) entry.operation.state = 'unknown';
+      entry.state = rejected ? 'failed' : 'unknown';
+    }
+    entry.error = errorMessage(error);
+    if (transfer) updateImageTransfer(transfer, entry.state === 'failed' ? 'failed' : entry.state === 'unknown' ? 'unknown' : 'processing', null, entry.error);
+    refreshOutgoing(); saveImageOperationMetadata();
+  } finally {
+    entry.operationBusy = false;
+    if (entry.operation.version === 0) void queryImageOperation(entry, true);
+  }
 }
 
 function updateImageTransfer(transfer: ImageTransfer, stage: ImageTransferStage, percent: number | null = null, error?: string) {
@@ -4560,8 +4842,20 @@ let wsHeartbeat: ReturnType<typeof setInterval> | null = null;
 let statusPollGeneration = 0;
 let statusPollAbort: AbortController | null = null;
 let resumeSetup = false;
+let durableHintTimer: ReturnType<typeof setTimeout> | null = null;
+let wsProbe: (() => void) | null = null;
+let wsConnectedAt = 0;
+const networkDeadlineMs = 30000;
+const heartbeatDeadlineMs = 45000;
+
+function scheduleDurableSync() {
+  if (durableHintTimer) return;
+  durableHintTimer = setTimeout(() => { durableHintTimer = null; requestDurableSync(); }, 250);
+}
 
 function resetDurableSync() {
+  if (durableHintTimer) clearTimeout(durableHintTimer);
+  durableHintTimer = null;
   durableSyncGeneration++;
   durableSyncAbort?.abort();
   durableSyncAbort = null;
@@ -4582,8 +4876,8 @@ function sortHistoryItems(items: MessageItem[]) {
 function applyDurableMessages(items: MessageItem[]) {
   const account = state.steam.activeAccount?.steamId || state.steam.steamId;
   const accepted = items.filter(item => item.id && item.eventId && item.steamAccountId === account);
-  for (const item of accepted) updateRecentConversation(item, false);
-  if (accepted.length) updateChatLists();
+  for (const item of accepted) { updateRecentConversation(item, false); updateCachedMessage(item); }
+  if (accepted.length) { updateChatLists(); scheduleChatCache(); }
   const current = accepted.filter(item => item.id === state.activeId);
   if (!current.length) return;
   historyLive = sortHistoryItems([...historyLive, ...current]).slice(-500);
@@ -4599,9 +4893,28 @@ function applyDurableMessages(items: MessageItem[]) {
 }
 
 async function refreshDurableBaseline(context: string, signal: AbortSignal) {
-  if (!await loadConversations(false, signal) || signal.aborted || context !== chatContext()) return false;
-  if (!state.activeId || state.view !== 'chat' || historyDetached || historyBrowsingRequest || isCommunityGroup()) return true;
-  return Boolean(await loadHistory('latest', '', { signal, preserve: true }));
+  const conversationsRequest = loadConversations(false, signal);
+  const refreshHistory = state.activeId && state.view === 'chat' && !historyBrowsingRequest && !isCommunityGroup();
+  const history = refreshHistory && (!historyDetached || historyCacheRebase)
+    ? loadHistory(historyDetached ? 'date' : 'latest', historyDetached ? historyAt : '',
+      { signal, preserve: !historyDetached, cacheRefresh: historyFromCache }) : Promise.resolve(true);
+  const [conversations, messages] = await Promise.all([conversationsRequest, history]);
+  return Boolean(conversations && messages && !signal.aborted && context === chatContext());
+}
+
+function invalidateHistoryBoundaries() {
+  // A reset durable cursor can mean a new storage generation or a missing replay
+  // window. Realtime tail overlap cannot prove continuity with cached old pages.
+  historyRequest++;
+  historyBusy = historyBrowsingRequest = false;
+  historyCacheRebase = true;
+  historyBefore = historyAfter = '';
+  for (const cached of threadCache.values()) {
+    cached.rebase = true;
+    cached.before = cached.after = '';
+  }
+  updateHistoryControls();
+  scheduleChatCache();
 }
 
 function requestDurableSync() {
@@ -4623,7 +4936,7 @@ function requestDurableSync() {
         else params.set('cursor', durableSyncCursor);
         const controller = new AbortController();
         durableSyncAbort = controller;
-        const deadline = setTimeout(() => controller.abort(), 10000);
+        const deadline = setTimeout(() => controller.abort(), networkDeadlineMs);
         try {
           const page = initializing && durableSyncSeed ? durableSyncSeed : await api(`/api/messages/sync?${params}`, { signal: controller.signal });
           if (!current() || controller.signal.aborted) return;
@@ -4648,6 +4961,7 @@ function requestDurableSync() {
           more = initializing || page.hasMore;
         } catch (error) {
           if (current() && isRecord(error) && error.status === 409 && !rebased) {
+            invalidateHistoryBoundaries();
             durableSyncCursor = ''; durableSyncSeed = null; rebased = true; continue;
           }
           throw error;
@@ -4668,12 +4982,14 @@ function requestDurableSync() {
   });
 }
 
-function recoverRealtimeConnection() {
+function recoverRealtimeConnection(force = false) {
   if (!state.me || !steamAccessAllowed()) return;
-  durableSyncAbort?.abort();
-  stopWebSocket();
-  stopStatusPolling();
+  const ws = state.ws;
+  if (force || (ws && (ws.readyState > WebSocket.OPEN || (ws.readyState === WebSocket.CONNECTING && Date.now() - wsConnectedAt > heartbeatDeadlineMs)))) {
+    stopWebSocket();
+  }
   ensureWebSocket();
+  wsProbe?.();
   startStatusPolling();
   requestDurableSync();
 }
@@ -4683,8 +4999,9 @@ function setupRealtimeResume() {
   resumeSetup = true;
   document.addEventListener('visibilitychange', () => {
     if (document.visibilityState === 'visible') recoverRealtimeConnection();
+    else { rememberThread(); scheduleChatCache(); }
   });
-  window.addEventListener('online', recoverRealtimeConnection);
+  window.addEventListener('online', () => recoverRealtimeConnection());
   window.addEventListener('pageshow', event => { if (event.persisted) recoverRealtimeConnection(); });
 }
 
@@ -4693,20 +5010,22 @@ function ensureWebSocket() {
   const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
   const ws = new WebSocket(`${protocol}//${location.host}${state.wsPath}`);
   state.ws = ws;
+  wsConnectedAt = Date.now();
   const context = chatContext();
   let pingSentAt = 0;
   ws.addEventListener('open', () => {
     if (state.ws !== ws || context !== chatContext()) return;
     requestDurableSync();
     if (wsHeartbeat) clearInterval(wsHeartbeat);
-    wsHeartbeat = setInterval(() => {
+    wsProbe = () => {
       if (state.ws !== ws || context !== chatContext()) return;
-      if (pingSentAt && Date.now() - pingSentAt >= 10000) { recoverRealtimeConnection(); return; }
+      if (pingSentAt && Date.now() - pingSentAt >= heartbeatDeadlineMs) { recoverRealtimeConnection(true); return; }
       if (!pingSentAt && ws.readyState === WebSocket.OPEN) {
         pingSentAt = Date.now();
         ws.send(JSON.stringify({ type: 'ping' }));
       }
-    }, 5000);
+    };
+    wsHeartbeat = setInterval(() => wsProbe?.(), 5000);
   });
   ws.addEventListener('message', (event) => {
     if (state.ws !== ws || context !== chatContext()) return;
@@ -4725,7 +5044,7 @@ function ensureWebSocket() {
       return;
     }
     if (payload.type === 'sync_available') {
-      if (payload.steamAccountId === (state.steam.activeAccount?.steamId || state.steam.steamId)) requestDurableSync();
+      if (payload.steamAccountId === (state.steam.activeAccount?.steamId || state.steam.steamId)) scheduleDurableSync();
       return;
     }
     if (payload.type === 'storage_status') {
@@ -4752,6 +5071,7 @@ function ensureWebSocket() {
     if (state.ws !== ws) return;
     if (wsHeartbeat) clearInterval(wsHeartbeat);
     wsHeartbeat = null;
+    wsProbe = null;
     state.ws = null;
     if (state.me) {
       state.reconnectTimer = setTimeout(() => {
@@ -4763,6 +5083,7 @@ function ensureWebSocket() {
 }
 
 function stopWebSocket() {
+  wsProbe = null;
   if (wsHeartbeat) clearInterval(wsHeartbeat);
   wsHeartbeat = null;
   if (state.reconnectTimer) clearTimeout(state.reconnectTimer);
@@ -4775,22 +5096,30 @@ function stopWebSocket() {
 function startStatusPolling() {
   if (state.statusTimer || !state.me) return;
   const generation = ++statusPollGeneration;
-  let lastTick = Date.now();
+  let lastStatus = 0;
+  let lastHealth = 0;
   let polling = false;
   state.statusTimer = setInterval(async () => {
     const now = Date.now();
-    const gap = now - lastTick;
-    lastTick = now;
-    if (document.visibilityState === 'visible' && gap > 15000) { recoverRealtimeConnection(); return; }
-    if (Date.now() - durableSyncLastPoll >= 15000) requestDurableSync();
-    if (polling) return;
+    const visible = document.visibilityState === 'visible';
+    const connected = state.ws?.readyState === WebSocket.OPEN;
+    if (now - durableSyncLastPoll >= (visible ? (connected ? 60000 : 15000) : 120000)) requestDurableSync();
+    const statusInterval = visible ? (connected && steamOnline() ? 30000 : 10000) : 120000;
+    if (polling || now - lastStatus < statusInterval) return;
+    lastStatus = now;
     polling = true;
     const context = chatContext();
     const controller = new AbortController();
     statusPollAbort = controller;
-    const deadline = setTimeout(() => controller.abort(), 10000);
+    const deadline = setTimeout(() => controller.abort(), networkDeadlineMs);
     try {
-      const status = await api('/api/steam/status', { signal: controller.signal });
+      const statusRequest = api('/api/steam/status', { signal: controller.signal });
+      let healthRequest: Promise<void> = Promise.resolve();
+      if (state.view === 'chat' && visible && now - lastHealth >= 60000) {
+        lastHealth = now;
+        healthRequest = loadStorageHealth(controller.signal);
+      }
+      const [status] = await Promise.all([statusRequest, healthRequest]);
       if (context !== chatContext() || !state.me || generation !== statusPollGeneration) return;
       const previousSignature = steamStatusSignature();
       const wasOnline = steamOnline();
@@ -4799,9 +5128,6 @@ function startStatusPolling() {
         renderShell();
         return;
       }
-      if (state.view === 'chat') {
-        await loadStorageHealth(controller.signal);
-      }
       if (controller.signal.aborted || context !== chatContext() || !state.me || generation !== statusPollGeneration) return;
       if (state.view === 'chat') void loadReactionSnapshots();
       ensureWebSocket();
@@ -4809,11 +5135,12 @@ function startStatusPolling() {
     } catch (_) {
       // Authentication errors are handled by api().
     } finally {
+      controller.abort();
       clearTimeout(deadline);
       if (statusPollAbort === controller) statusPollAbort = null;
       polling = false;
     }
-  }, 3000);
+  }, 5000);
 }
 
 function stopStatusPolling() {
@@ -4825,6 +5152,7 @@ function stopStatusPolling() {
 }
 
 async function logoutApp() {
+  clearChatCache();
   try { sessionStorage.removeItem(imageOperationKey()); } catch { /* Browser storage may be disabled. */ }
   await api('/api/auth/logout', { method: 'POST' }).catch((): null => null);
   stopStatusPolling();
@@ -4850,14 +5178,12 @@ async function bootstrap() {
     renderLogin();
     return;
   }
-  const [status, config] = await Promise.all([
-    api('/api/steam/status').catch((): SteamStatus => state.steam),
-    api('/api/config').catch(() => ({ wsPath: '/ws', sendOperations: true }))
-  ]);
-  if (isRecord(status)) updateSteamStatus(status as SteamStatus);
+  const config = mePayload.config || await api('/api/config').catch(() => ({ wsPath: '/ws', sendOperations: true }));
   if (isRecord(config) && typeof config.wsPath === 'string') state.wsPath = config.wsPath;
   state.sendOperations = isRecord(config) && config.sendOperations === true;
+  state.imageOperationUpload = isRecord(config) && config.imageOperationUpload === true;
   renderShell();
+  void restoreChatCache();
   restoreImageOperations();
 }
 
@@ -4910,5 +5236,6 @@ document.addEventListener('keydown', (event) => {
 });
 
 bootstrap().catch((error) => {
-  authPage('启动失败', errorMessage(error), create('div'));
+  // A network outage is not a logout. Keep the disk snapshot for the next authenticated opening.
+  authPage('启动失败', errorMessage(error), create('div'), false);
 });
