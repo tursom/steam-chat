@@ -22,6 +22,8 @@
     "@harperfast/rocksdb-js": "^2.8.0",
     "artplayer": "5.4.0",
     "image-size": "1.2.1",
+    "qrcode": "^1.5.4",
+    "steam-session": "^1.9.4",
     "steam-user": "^5.0.8",
     "steamcommunity": "^3.48.2",
     "winston": "^3.12.0",

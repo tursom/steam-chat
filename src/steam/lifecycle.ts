@@ -80,7 +80,18 @@ type SteamLifecycleOptions = {
   timers?: TimerApi;
 };
 
-type SteamStatus = 'logged_out' | 'logging_in' | 'waiting_guard' | 'online' | 'error' | 'reconnecting';
+type SteamStatus = 'logged_out' | 'logging_in' | 'waiting_guard' | 'waiting_qr' | 'online' | 'error' | 'reconnecting';
+
+type QrLoginSession = Pick<import('steam-session').LoginSession,
+  'on' | 'startWithQR' | 'cancelLoginAttempt' | 'refreshToken' | 'steamID' | 'loginTimeout'>;
+
+type QrLoginAttempt = {
+  session: QrLoginSession;
+  imageDataUrl: string | null;
+  scanned: boolean;
+  expiresAt: number;
+  timer: TimerHandle | null;
+};
 
 type SteamGuardInfo = {
   guardType: 'email' | 'device';
@@ -96,6 +107,7 @@ type SteamStatusSummary = {
   lastCodeWrong: boolean;
   error: string | null;
   steamId: string | null;
+  qrLogin: { imageDataUrl: string | null; scanned: boolean; expiresAt: number } | null;
 };
 
 type SteamLoginRequest = {
@@ -105,6 +117,7 @@ type SteamLoginRequest = {
 };
 
 type SteamLoginServiceOptions = SteamLifecycleOptions & {
+  createQrSession?: () => QrLoginSession;
   replaceClient?: () => void;
   getDefaultLogonID?: () => number;
   onLoggedOn?: (steamId: string | null) => void;
@@ -407,6 +420,99 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
   let loginGeneration = 0;
   let retryGeneration = 0;
   let steamId: string | null = null;
+  let qrAttempt: QrLoginAttempt | null = null;
+
+  function clearQrAttempt() {
+    const attempt = qrAttempt;
+    qrAttempt = null;
+    if (!attempt) return;
+    if (attempt.timer !== null) timers.clearTimeout(attempt.timer);
+    attempt.session.cancelLoginAttempt();
+  }
+
+  function failQrLogin(attempt: QrLoginAttempt, error: unknown) {
+    if (qrAttempt !== attempt) return;
+    clearQrAttempt();
+    status = 'error';
+    lastError = errorMessage(error);
+    loginDeferred.reject(error);
+    webDeferred.reject(error);
+  }
+
+  function assertLoginInactive() {
+    assertReusable();
+    if (['logging_in', 'waiting_guard', 'waiting_qr', 'reconnecting', 'online'].includes(status)) {
+      throw Object.assign(new Error('Steam login is already active'), { statusCode: 409 });
+    }
+  }
+
+  function startQrLogin() {
+    assertLoginInactive();
+    const { LoginSession, EAuthTokenPlatformType } = require('steam-session') as typeof import('steam-session');
+    const session = options.createQrSession?.() || new LoginSession(EAuthTokenPlatformType.SteamClient);
+    session.loginTimeout = LOGIN_TIMEOUT_MS;
+    clearRetryTimer();
+    resetDeferreds();
+    status = 'waiting_qr';
+    lastError = null;
+    guard = null;
+    pendingGuardCallback = null;
+    steamId = null;
+    latestWebSession = null;
+    const attempt: QrLoginAttempt = {
+      session, imageDataUrl: null, scanned: false,
+      expiresAt: Date.now() + LOGIN_TIMEOUT_MS, timer: null
+    };
+    qrAttempt = attempt;
+    attempt.timer = timers.setTimeout(() => {
+      failQrLogin(attempt, new Error('Steam 二维码已过期，请重新生成'));
+    }, LOGIN_TIMEOUT_MS);
+    if (typeof attempt.timer === 'object') attempt.timer.unref?.();
+    session.on('error', (error) => failQrLogin(attempt, error));
+    session.on('timeout', () => failQrLogin(attempt, new Error('Steam 二维码已过期，请重新生成')));
+    session.on('remoteInteraction', () => {
+      if (qrAttempt === attempt) attempt.scanned = true;
+    });
+    session.on('authenticated', () => {
+      if (qrAttempt !== attempt) return;
+      try {
+        const token = session.refreshToken;
+        const accountSteamId = steamIdToText(session.steamID);
+        if (!token || !accountSteamId) throw new Error('Steam QR authentication returned no account or refresh token');
+        clearQrAttempt();
+        // Persist before loggedOn: its account hook reads this file, and CM login may not renew the token.
+        fileSystem.mkdirSync(path.dirname(refreshTokenPath), { recursive: true });
+        fileSystem.writeFileSync(refreshTokenPath, `${token}\n`, 'utf8');
+        callHook('onRefreshToken', () => onRefreshToken?.(token, accountSteamId));
+        const logonID = getDefaultLogonID?.();
+        beginLogin({ refreshToken: token, steamID: accountSteamId, ...(logonID ? { logonID } : {}) }, 'QR refresh token', false).catch(() => {});
+      } catch (error) {
+        // clearQrAttempt may already have detached this session before persistence failed.
+        if (qrAttempt === attempt) clearQrAttempt();
+        status = 'error';
+        lastError = errorMessage(error);
+        loginDeferred.reject(error);
+        webDeferred.reject(error);
+      }
+    });
+    void (async () => {
+      try {
+        const result = await session.startWithQR();
+        if (qrAttempt !== attempt) {
+          // startWithQR re-enables SDK polling when its request resolves, even after cancellation.
+          session.cancelLoginAttempt();
+          return;
+        }
+        if (!result.qrChallengeUrl) throw new Error('Steam returned no QR challenge');
+        const qr = require('qrcode') as { toDataURL: (text: string, options: unknown) => Promise<string> };
+        const image = await qr.toDataURL(result.qrChallengeUrl, { width: 256, margin: 4, errorCorrectionLevel: 'M' });
+        if (qrAttempt === attempt) attempt.imageDataUrl = image;
+      } catch (error) {
+        failQrLogin(attempt, error);
+      }
+    })();
+    return getStatus();
+  }
 
   function clearLoginTimer() {
     loginGeneration += 1;
@@ -484,10 +590,10 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
     return base;
   }
 
-  function beginLogin(logOnOptions: LogOnOptions, label: string) {
+  function beginLogin(logOnOptions: LogOnOptions, label: string, resetWaiters = true) {
     assertReusable();
     clearRetryTimer();
-    resetDeferreds();
+    if (resetWaiters) resetDeferreds();
     status = 'logging_in';
     guard = null;
     pendingGuardCallback = null;
@@ -511,7 +617,8 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
       return Promise.resolve(false);
     }
     status = nextStatus;
-    const logOnOptions = { ...baseLoginOptions(), refreshToken };
+    // The saved token identifies its account; config.steamID may refer to an older account after QR login.
+    const logOnOptions = { refreshToken };
     return beginLogin(logOnOptions, 'refresh token');
   }
 
@@ -546,7 +653,7 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
   }
 
   function handleLoginFailure(error: unknown, disconnected = false) {
-    if (handlingFailure || stopped || retired || manualLogoff || status === 'logged_out' || status === 'error') return;
+    if (handlingFailure || stopped || retired || manualLogoff || status === 'logged_out' || status === 'error' || status === 'waiting_qr') return;
     const recoverable = disconnected || isRecoverableLoginError(error);
     if (retryTimer !== null && recoverable) return;
     clearRetryTimer();
@@ -660,7 +767,12 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
       domain: guard?.domain || null,
       lastCodeWrong: Boolean(guard?.lastCodeWrong),
       error: lastError,
-      steamId
+      steamId,
+      qrLogin: qrAttempt ? {
+        imageDataUrl: qrAttempt.imageDataUrl,
+        scanned: qrAttempt.scanned,
+        expiresAt: qrAttempt.expiresAt
+      } : null
     };
   }
 
@@ -668,12 +780,13 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
     start() {
       assertReusable();
       if (status === 'online') return Promise.resolve(true);
-      if (status === 'logging_in' || status === 'waiting_guard' || status === 'reconnecting') return loginDeferred.promise;
+      if (status === 'logging_in' || status === 'waiting_guard' || status === 'waiting_qr' || status === 'reconnecting') return loginDeferred.promise;
       return tryTokenLogin();
     },
     stop() {
       const pendingLogin = status === 'logging_in' || status === 'waiting_guard';
       stopped = true;
+      clearQrAttempt();
       clearRetryTimer();
       clearLoginTimer();
       status = 'logged_out';
@@ -689,10 +802,7 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
       if (pendingLogin) process.nextTick(() => steamUser.logOff?.());
     },
     login(input: SteamLoginRequest) {
-      assertReusable();
-      if (status === 'logging_in' || status === 'waiting_guard' || status === 'reconnecting' || status === 'online') {
-        throw Object.assign(new Error('Steam login is already active'), { statusCode: 409 });
-      }
+      assertLoginInactive();
       const accountName = String(input.accountName || '').trim();
       const password = String(input.password || '');
       if (!accountName || !password) {
@@ -712,10 +822,7 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
       return getStatus();
     },
     connectWithRefreshToken(refreshToken: unknown, steamID?: unknown) {
-      assertReusable();
-      if (status === 'logging_in' || status === 'waiting_guard' || status === 'reconnecting' || status === 'online') {
-        throw Object.assign(new Error('Steam login is already active'), { statusCode: 409 });
-      }
+      assertLoginInactive();
       const token = String(refreshToken || '').trim();
       if (!token) throw Object.assign(new Error('Steam account refresh token is missing'), { statusCode: 409 });
       const logOnOptions: LogOnOptions = {
@@ -746,6 +853,7 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
       return getStatus();
     },
     logout() {
+      clearQrAttempt();
       clearRetryTimer();
       clearLoginTimer();
       retired ||= status === 'logging_in' || status === 'waiting_guard';
@@ -763,6 +871,20 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
       deleteRefreshToken(refreshTokenPath);
       if (typeof steamUser.logOff === 'function') steamUser.logOff();
       if (retired) process.nextTick(() => steamUser.logOff?.());
+      return getStatus();
+    },
+    startQrLogin,
+    cancelQrLogin() {
+      if (status !== 'waiting_qr') {
+        throw Object.assign(new Error('Steam QR login is not pending'), { statusCode: 409 });
+      }
+      clearQrAttempt();
+      status = 'logged_out';
+      lastError = null;
+      const error = new Error('Steam QR login cancelled');
+      loginDeferred.reject(error);
+      webDeferred.reject(error);
+      resetDeferreds();
       return getStatus();
     },
     ensureOnline() {

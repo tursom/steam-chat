@@ -191,6 +191,7 @@ type SteamStatusSummary = {
   steamId?: string | null;
   activeAccount?: Pick<PublicSteamAccount, 'id' | 'steamId' | 'label'> | null;
   accessAllowed?: boolean;
+  qrLogin?: { imageDataUrl: string | null; scanned: boolean; expiresAt: number } | null;
 };
 
 type SteamLoginServiceLike = {
@@ -198,6 +199,8 @@ type SteamLoginServiceLike = {
   getStatus: () => SteamStatusSummary;
   connectWithRefreshToken?: (refreshToken: unknown, steamID?: unknown) => SteamStatusSummary;
   login: (input: UnknownRecord) => SteamStatusSummary;
+  startQrLogin?: () => SteamStatusSummary;
+  cancelQrLogin?: () => SteamStatusSummary;
   logout: () => SteamStatusSummary;
   submitGuard: (code: unknown) => SteamStatusSummary;
 };
@@ -605,6 +608,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     const accessAllowed = !session || !active ? false : authStore?.canAccessSteamAccount(session.user.id, active.id) === true;
     return {
       ...status,
+      qrLogin: session && authStore?.hasPermission(session.user, 'steam.manage') ? status.qrLogin : null,
       activeAccount: accessAllowed || session?.user.role === 'admin' ? activeAccountSummary(active) : null,
       accessAllowed
     };
@@ -920,9 +924,19 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (!steamLoginService) return false;
     const pathname = url.pathname;
 
+    if ((req.method === 'POST' || req.method === 'DELETE') && pathname === '/api/steam/login/qr') {
+      const session = requirePermission(req, 'steam.manage');
+      const operation = req.method === 'POST' ? steamLoginService.startQrLogin : steamLoginService.cancelQrLogin;
+      if (!operation) throw Object.assign(new Error('Steam QR login is unavailable'), { statusCode: 503 });
+      operation.call(steamLoginService);
+      recordAudit(session, req, req.method === 'POST' ? 'steam_account.qr_start' : 'steam_account.qr_cancel', 'steam_account', 'pending');
+      jsonResponse(res, 200, steamStatusForSession(session), { 'Cache-Control': 'no-store' });
+      return true;
+    }
+
     if (req.method === 'GET' && pathname === '/api/steam/status') {
       const session = requireLegacyOrSession(req);
-      jsonResponse(res, 200, steamStatusForSession(session));
+      jsonResponse(res, 200, steamStatusForSession(session), { 'Cache-Control': 'no-store' });
       return true;
     }
 

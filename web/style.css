@@ -497,6 +497,7 @@ nav button.is-active {
 }
 
 .steam-badge[data-status="waiting_guard"],
+.steam-badge[data-status="waiting_qr"],
 .steam-badge[data-status="logging_in"],
 .steam-badge[data-status="reconnecting"] {
   background: var(--warn-soft);
@@ -692,6 +693,27 @@ nav button.is-active {
 
 .steam-account-login {
   grid-template-columns: minmax(150px, 1fr) minmax(170px, 1fr) minmax(170px, 1fr) minmax(120px, 0.7fr) auto;
+}
+
+.steam-qr-panel {
+  max-width: 720px;
+  justify-items: start;
+}
+
+.steam-qr-message,
+.steam-qr-panel > p {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.steam-qr-image {
+  display: block;
+  width: min(256px, 100%);
+  height: auto;
+  aspect-ratio: 1;
+  background: #fff;
+  border: 12px solid #fff;
+  border-radius: 8px;
 }
 
 .audit-filters {
@@ -931,7 +953,7 @@ nav button.is-active {
   color: var(--ok);
 }
 
-.chat-account-copy :is([data-status="waiting_guard"], [data-status="logging_in"], [data-status="reconnecting"]) {
+.chat-account-copy :is([data-status="waiting_guard"], [data-status="waiting_qr"], [data-status="logging_in"], [data-status="reconnecting"]) {
   color: var(--warn);
 }
 

@@ -82,6 +82,7 @@ type SteamStatus = {
   steamId: string | null;
   activeAccount?: Pick<SteamAccount, 'id' | 'steamId' | 'label'> | null;
   accessAllowed?: boolean;
+  qrLogin?: { imageDataUrl: string | null; scanned: boolean; expiresAt: number } | null;
 };
 
 type MeResponse = {
@@ -216,7 +217,8 @@ const defaultSteamStatus: SteamStatus = {
   error: null,
   steamId: null,
   activeAccount: null,
-  accessAllowed: false
+  accessAllowed: false,
+  qrLogin: null
 };
 
 const root = document.querySelector<HTMLElement>('#app');
@@ -588,6 +590,7 @@ function steamLabel(status = state.steam.status): string {
     logged_out: '未连接',
     logging_in: '登录中',
     waiting_guard: '等待验证',
+    waiting_qr: '等待扫码',
     online: '在线',
     error: '异常',
     reconnecting: '重连中'
@@ -644,9 +647,12 @@ function steamStatusSignature(status = state.steam) {
 
 function updateSteamStatus(status: SteamStatus) {
   const previousSignature = steamStatusSignature();
+  const previousLoginMode = steamLoginMode();
+  const wasOnline = steamOnline();
   const previousAccess = steamAccessAllowed();
   const previousAccount = `${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}`;
   state.steam = { ...defaultSteamStatus, ...status };
+  if (steamOnline() || state.steam.status === 'waiting_qr') steamQrError = '';
   const accountChanged = previousAccount !== `${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}`;
   if (accountChanged || !steamAccessAllowed()) {
     invalidateChat(previousAccount !== '|' || !steamAccessAllowed());
@@ -685,6 +691,15 @@ function updateSteamStatus(status: SteamStatus) {
     ensureWebSocket();
   }
   if ((accountChanged || previousAccess !== steamAccessAllowed()) && state.sendOperations && state.me && steamAccessAllowed()) restoreImageOperations();
+  const steamView = document.querySelector<HTMLElement>('#steamConnectionView');
+  if (steamView && (previousLoginMode !== steamLoginMode()
+    || (state.me?.role !== 'admin' && previousSignature !== steamStatusSignature()))) steamView.replaceWith(renderSteamView());
+  const summaryStatus = document.querySelector<HTMLElement>('#steamSummaryStatus');
+  if (summaryStatus) summaryStatus.textContent = steamLabel();
+  const summaryDetail = document.querySelector<HTMLElement>('#steamSummaryDetail');
+  if (summaryDetail) summaryDetail.textContent = steamSummaryDetail();
+  syncSteamLoginUi();
+  if (state.me && hasPermission('steam.account.manage') && (accountChanged || (!wasOnline && steamOnline()))) void loadSteamAccounts();
 }
 
 async function api(path: string, options: RequestInit = {}, onUploadProgress?: (percent: number | null) => void): Promise<unknown> {
@@ -897,6 +912,7 @@ function renderShell() {
   main.append(top, content, feedback);
   shell.append(sidebar, main);
   root.append(shell);
+  syncSteamLoginUi();
   if (state.view === 'chat') {
     void refreshChatData(Boolean(durableSyncCursor));
     requestDurableSync();
@@ -945,14 +961,158 @@ function renderCurrentView() {
   return renderSteamView();
 }
 
+let steamLoginRequest: 'qr' | 'cancel' | 'password' | null = null;
+let steamLoginRevision = 0;
+let steamQrError = '';
+let steamQrAttempted = false;
+
+function steamLoginMode() {
+  if (state.steam.requiresGuard) return `guard|${state.steam.guardType}|${state.steam.domain}|${state.steam.lastCodeWrong}`;
+  return ['logging_in', 'online', 'reconnecting'].includes(state.steam.status) ? 'connected' : 'password';
+}
+
+function steamLoginBlocked() {
+  return steamLoginRequest !== null || state.steam.status === 'waiting_qr'
+    || ['logging_in', 'reconnecting'].includes(state.steam.status) || state.steam.requiresGuard;
+}
+
+function steamSummaryDetail() {
+  const account = state.steam.activeAccount;
+  return state.steam.error || (account ? `${account.label || account.steamId} · ${account.steamId}`
+    : state.steam.steamId ? `当前 SteamID：${state.steam.steamId}` : '当前没有可用的 Steam 会话');
+}
+
+function renderSteamQrLogin() {
+  const section = panel('Steam 扫码登录', 'steam-qr-panel');
+  section.id = 'steamQrLogin';
+  syncSteamQrLogin(section);
+  return section;
+}
+
+function syncSteamQrLogin(section: HTMLElement) {
+  const waiting = state.steam.status === 'waiting_qr';
+  const qr = waiting ? state.steam.qrLogin : null;
+  const expired = Boolean(qr && qr.expiresAt <= Date.now());
+  const signature = JSON.stringify([waiting, qr, expired, steamLoginRequest, steamQrError, steamQrAttempted,
+    state.steam.status, state.steam.requiresGuard, state.steam.error]);
+  if (section.dataset.signature === signature) return;
+  section.dataset.signature = signature;
+  clear(section);
+  section.append(create('h2', 'panel-title', 'Steam 扫码登录'));
+  const message = create('p', 'steam-qr-message');
+  message.setAttribute('role', 'status');
+  message.setAttribute('aria-live', 'polite');
+  if (steamLoginRequest === 'qr') message.textContent = '正在生成二维码…';
+  else if (steamLoginRequest === 'cancel') message.textContent = '正在取消扫码登录…';
+  else if (steamQrError) message.textContent = steamQrError;
+  else if (expired) message.textContent = '二维码已过期，请重新生成。';
+  else if (waiting && qr?.scanned) message.textContent = '已扫码，请在手机 Steam App 中确认登录。';
+  else if (waiting) message.textContent = qr?.imageDataUrl ? '请使用手机 Steam App 扫描二维码。' : '正在加载二维码…';
+  else if (steamOnline()) message.textContent = 'Steam 已在线；如需登录其他账户，请先退出当前账户。';
+  else message.textContent = state.steam.error || '打开手机 Steam App，进入 Steam 令牌页面扫描二维码并确认登录。';
+  if (steamQrError || expired || state.steam.error) message.className += ' warn-text';
+  section.append(message);
+  if (waiting && qr?.imageDataUrl && !expired && !qr.scanned && !steamLoginRequest) {
+    const image = create('img', 'steam-qr-image');
+    image.src = qr.imageDataUrl;
+    image.alt = 'Steam 登录二维码，请使用手机 Steam App 扫描';
+    image.width = 256;
+    image.height = 256;
+    section.append(image, create('p', 'muted', '打开 Steam App → Steam 令牌 → 扫描二维码，然后在手机上确认登录。'));
+  }
+  const actions = create('div', 'page-actions');
+  if (!waiting || expired || steamQrError) {
+    const start = create('button', '', steamQrAttempted || expired || state.steam.status === 'error' ? '重新生成二维码' : '扫码登录 Steam');
+    start.type = 'button';
+    start.disabled = steamLoginRequest !== null || ['logging_in', 'reconnecting', 'online'].includes(state.steam.status) || state.steam.requiresGuard;
+    start.addEventListener('click', () => changeSteamQrLogin('POST'));
+    actions.append(start);
+  }
+  if (waiting) {
+    const cancel = create('button', 'ghost-btn', '取消扫码登录');
+    cancel.type = 'button';
+    cancel.disabled = steamLoginRequest !== null;
+    cancel.addEventListener('click', () => changeSteamQrLogin('DELETE'));
+    actions.append(cancel);
+  }
+  section.append(actions);
+}
+
+function syncSteamLoginUi() {
+  const qr = document.querySelector<HTMLElement>('#steamQrLogin');
+  if (qr) syncSteamQrLogin(qr);
+  document.querySelectorAll<HTMLInputElement | HTMLButtonElement>('.steam-password-login input, .steam-password-login button').forEach(control => {
+    control.disabled = steamLoginBlocked();
+  });
+  document.querySelectorAll<HTMLButtonElement>('.steam-account-connect').forEach(button => {
+    button.disabled = steamLoginBlocked() || button.dataset.unavailable === 'true';
+  });
+  const logout = document.querySelector<HTMLButtonElement>('#steamLogout');
+  if (logout) logout.disabled = steamLoginRequest !== null || state.steam.status === 'waiting_qr' || state.steam.status === 'logged_out';
+}
+
+async function changeSteamQrLogin(method: 'POST' | 'DELETE') {
+  if (!hasPermission('steam.manage') || steamLoginRequest !== null) return;
+  if (method === 'POST' && (['logging_in', 'reconnecting', 'online'].includes(state.steam.status) || state.steam.requiresGuard)) return;
+  steamLoginRequest = method === 'POST' ? 'qr' : 'cancel';
+  steamLoginRevision++;
+  steamQrError = '';
+  if (method === 'POST') steamQrAttempted = true;
+  syncSteamLoginUi();
+  try {
+    if (method === 'POST' && state.steam.status === 'waiting_qr') {
+      try {
+        const cancelled = await api('/api/steam/login/qr', { method: 'DELETE' });
+        updateSteamStatus(cancelled as SteamStatus);
+      } catch (error) {
+        // The server may already have expired the QR while the browser still displays its last poll.
+        if (!isRecord(error) || error.status !== 409) throw error;
+      }
+    }
+    const status = await api('/api/steam/login/qr', { method });
+    updateSteamStatus(status as SteamStatus);
+  } catch (error) {
+    steamQrError = errorMessage(error);
+    setFeedback(steamQrError, 'error');
+  } finally {
+    steamLoginRequest = null;
+    steamLoginRevision++;
+    syncSteamLoginUi();
+  }
+}
+
+async function submitSteamPassword(form: HTMLFormElement, path: string) {
+  if (steamLoginBlocked()) return;
+  const rawLogonID = formValue(form, 'logonID').trim();
+  const body = jsonBody({
+    accountName: formValue(form, 'accountName'), password: formValue(form, 'password'),
+    label: formValue(form, 'label'), ...(rawLogonID ? { logonID: Number(rawLogonID) } : {})
+  });
+  steamLoginRequest = 'password';
+  steamLoginRevision++;
+  syncSteamLoginUi();
+  try {
+    const status = await api(path, body);
+    updateSteamStatus(status as SteamStatus);
+    form.reset();
+    if (state.view === 'steamAccounts') await loadSteamAccounts();
+  } catch (error) {
+    setFeedback(errorMessage(error), 'error');
+  } finally {
+    steamLoginRequest = null;
+    steamLoginRevision++;
+    syncSteamLoginUi();
+  }
+}
+
 function renderSteamView() {
   const view = create('div', 'steam-view');
+  view.id = 'steamConnectionView';
   const summary = create('section', 'status-panel');
   const statusText = create('strong', '', steamLabel());
-  const activeLabel = state.steam.activeAccount
-    ? `${state.steam.activeAccount.label || state.steam.activeAccount.steamId} · ${state.steam.activeAccount.steamId}`
-    : state.steam.steamId ? `当前 SteamID：${state.steam.steamId}` : '当前没有可用的 Steam 会话';
-  const detail = create('p', 'muted', state.steam.error || activeLabel);
+  statusText.id = 'steamSummaryStatus';
+  const detail = create('p', 'muted', steamSummaryDetail());
+  detail.id = 'steamSummaryDetail';
   summary.append(statusText, detail);
   view.append(summary);
 
@@ -967,6 +1127,7 @@ function renderSteamView() {
     return view;
   }
 
+  if (hasPermission('steam.manage')) view.append(renderSteamQrLogin());
   if (state.steam.requiresGuard) {
     const guardPanel = panel('Steam Guard', 'form-panel');
     const guardForm = create('form', 'inline-form') as HTMLFormElement;
@@ -997,7 +1158,7 @@ function renderSteamView() {
     view.append(guardPanel);
   } else if (!['logging_in', 'online', 'reconnecting'].includes(state.steam.status)) {
     const loginPanel = panel('登录 Steam', 'form-panel');
-    const loginForm = create('form', 'stack-form narrow-form') as HTMLFormElement;
+    const loginForm = create('form', 'stack-form narrow-form steam-password-login') as HTMLFormElement;
     loginForm.innerHTML = `
       <label>显示名称<input name="label" autocomplete="off" placeholder="例如：客服一号"></label>
       <label>Steam 账号<input name="accountName" autocomplete="username" required></label>
@@ -1007,19 +1168,7 @@ function renderSteamView() {
     `;
     loginForm.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const rawLogonID = formValue(loginForm, 'logonID').trim();
-      try {
-        const result = await api('/api/steam/login', jsonBody({
-          accountName: formValue(loginForm, 'accountName'),
-          password: formValue(loginForm, 'password'),
-          label: formValue(loginForm, 'label'),
-          ...(rawLogonID ? { logonID: Number(rawLogonID) } : {})
-        }));
-        updateSteamStatus(result as SteamStatus);
-        renderShell();
-      } catch (error) {
-        setFeedback(errorMessage(error), 'error');
-      }
+      await submitSteamPassword(loginForm, '/api/steam/login');
     });
     loginPanel.append(loginForm);
     view.append(loginPanel);
@@ -1027,6 +1176,7 @@ function renderSteamView() {
 
   const actions = create('div', 'page-actions');
   const logout = create('button', 'danger-btn', '退出 Steam 并删除 token');
+  logout.id = 'steamLogout';
   logout.type = 'button';
   logout.disabled = state.steam.status === 'logged_out';
   logout.addEventListener('click', async () => {
@@ -1318,8 +1468,9 @@ async function deleteUser(id: number) {
 function renderSteamAccountsView() {
   const view = create('div', 'steam-accounts-view');
   if (hasPermission('steam.manage')) {
+    view.append(renderSteamQrLogin());
     const loginPanel = panel('登录新账户', 'toolbar-panel');
-    const loginForm = create('form', 'inline-form steam-account-login') as HTMLFormElement;
+    const loginForm = create('form', 'inline-form steam-account-login steam-password-login') as HTMLFormElement;
     loginForm.innerHTML = `
       <label>显示名称<input name="label" maxlength="80"></label>
       <label>Steam 账号<input name="accountName" autocomplete="username" required></label>
@@ -1329,20 +1480,7 @@ function renderSteamAccountsView() {
     `;
     loginForm.addEventListener('submit', async (event) => {
       event.preventDefault();
-      const rawLogonID = formValue(loginForm, 'logonID').trim();
-      try {
-        const status = await api('/api/steam/accounts/login', jsonBody({
-          label: formValue(loginForm, 'label'),
-          accountName: formValue(loginForm, 'accountName'),
-          password: formValue(loginForm, 'password'),
-          ...(rawLogonID ? { logonID: Number(rawLogonID) } : {})
-        }));
-        updateSteamStatus(status as SteamStatus);
-        loginForm.reset();
-        await loadSteamAccounts();
-      } catch (error) {
-        setFeedback(errorMessage(error), 'error');
-      }
+      await submitSteamPassword(loginForm, '/api/steam/accounts/login');
     });
     loginPanel.append(loginForm);
     view.append(loginPanel);
@@ -1372,9 +1510,10 @@ function renderSteamAccountTable(container: HTMLElement) {
       create('span', 'muted', account.accountNameHint ? `账号提示：${account.accountNameHint}` : '无账号提示')
     );
     const actions = create('div', 'row-actions');
-    const connect = create('button', 'ghost-btn', '连接');
+    const connect = create('button', 'ghost-btn steam-account-connect', '连接');
     connect.type = 'button';
-    connect.disabled = account.active || !account.enabled;
+    connect.dataset.unavailable = String(account.active || !account.enabled);
+    connect.disabled = account.active || !account.enabled || steamLoginBlocked();
     connect.addEventListener('click', () => connectSteamAccount(account.id));
     const edit = create('button', 'ghost-btn', '编辑');
     edit.type = 'button';
@@ -1407,6 +1546,7 @@ async function loadSteamAccounts() {
 }
 
 async function connectSteamAccount(id: number) {
+  if (steamLoginBlocked()) return;
   try {
     const status = await api(`/api/steam/accounts/${id}/connect`, { method: 'POST' });
     updateSteamStatus(status as SteamStatus);
@@ -5101,14 +5241,16 @@ function startStatusPolling() {
   let polling = false;
   state.statusTimer = setInterval(async () => {
     const now = Date.now();
+    if (state.steam.status === 'waiting_qr') syncSteamLoginUi();
     const visible = document.visibilityState === 'visible';
     const connected = state.ws?.readyState === WebSocket.OPEN;
     if (now - durableSyncLastPoll >= (visible ? (connected ? 60000 : 15000) : 120000)) requestDurableSync();
-    const statusInterval = visible ? (connected && steamOnline() ? 30000 : 10000) : 120000;
+    const statusInterval = visible ? (state.steam.status === 'waiting_qr' ? 5000 : connected && steamOnline() ? 30000 : 10000) : 120000;
     if (polling || now - lastStatus < statusInterval) return;
     lastStatus = now;
     polling = true;
     const context = chatContext();
+    const loginRevision = steamLoginRevision;
     const controller = new AbortController();
     statusPollAbort = controller;
     const deadline = setTimeout(() => controller.abort(), networkDeadlineMs);
@@ -5121,13 +5263,10 @@ function startStatusPolling() {
       }
       const [status] = await Promise.all([statusRequest, healthRequest]);
       if (context !== chatContext() || !state.me || generation !== statusPollGeneration) return;
+      if (steamLoginRequest !== null || loginRevision !== steamLoginRevision) return;
       const previousSignature = steamStatusSignature();
       const wasOnline = steamOnline();
       updateSteamStatus(status as SteamStatus);
-      if (state.view === 'steam' && steamStatusSignature() !== previousSignature) {
-        renderShell();
-        return;
-      }
       if (controller.signal.aborted || context !== chatContext() || !state.me || generation !== statusPollGeneration) return;
       if (state.view === 'chat') void loadReactionSnapshots();
       ensureWebSocket();
