@@ -8,6 +8,7 @@ RUN npm ci
 COPY tsconfig.json tsconfig.web.json config.example.js ./
 COPY src ./src
 COPY web ./web
+COPY scripts ./scripts
 
 RUN npm run build \
   && npm prune --omit=dev
