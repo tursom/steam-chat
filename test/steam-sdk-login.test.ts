@@ -47,5 +47,5 @@ test('service repeated start and immediate stop are safe with installed SDK next
 
 test('production client explicitly disables SDK autoRelogin', () => {
   const source = fs.readFileSync(path.resolve(__dirname, '../../src/index.ts'), 'utf8');
-  assert.match(source, /new SteamUser\(\{ renewRefreshTokens: true, autoRelogin: false \}\)/);
+  assert.match(source, /new SteamUser\(\{\s*renewRefreshTokens: true, autoRelogin: false/);
 });

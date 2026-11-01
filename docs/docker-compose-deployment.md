@@ -33,6 +33,7 @@ services:
       STEAM_CHAT_HOST: 0.0.0.0
       STEAM_CHAT_PORT: 3000
       STEAM_CHAT_WS_PATH: /ws
+      STEAM_CHAT_PROXY: ${STEAM_CHAT_PROXY:-}
       STEAM_CHAT_WS_HEARTBEAT_MS: ${STEAM_CHAT_WS_HEARTBEAT_MS:-}
       STEAM_CHAT_DEPLOY_WEBHOOK_URL: ${STEAM_CHAT_DEPLOY_WEBHOOK_URL:-}
     extra_hosts:
@@ -69,6 +70,32 @@ STEAM_CHAT_PORT=3000
 `STEAM_CHAT_IMAGE` 支持已发布的版本标签、`sha-<提交短哈希>` 标签或镜像 digest。生产部署建议固定版本或 digest；`latest` 会随默认分支发布更新。
 
 Compose 读取 `.env` 做变量替换，不会自动把所有变量传入容器。不要在这些文件里保存 Steam 密码、后台密码、Guard code 或 refresh token。
+
+### Steam 出站代理
+
+通过 `STEAM_CHAT_PROXY` 为 Steam 登录、聊天长连接、扫码登录及社区图片上传指定代理，留空则保持原连接方式。支持 `http://`、`https://`、`socks://`、`socks4://`、`socks4a://`、`socks5://` 和 `socks5h://`；SOCKS 未指定端口时使用 1080。需要由代理解析目标域名时可使用 `socks5h://`。
+
+例如，在 `.env` 中配置宿主机的 HTTP 代理：
+
+```dotenv
+STEAM_CHAT_PROXY=http://host.docker.internal:7890
+```
+
+或使用 SOCKS 代理：
+
+```dotenv
+STEAM_CHAT_PROXY=socks5h://host.docker.internal:1080
+```
+
+Compose 已透传该变量。容器中的 `127.0.0.1` 指向容器自身；访问宿主机代理应使用 `host.docker.internal`，并确保代理监听容器可访问的接口。修改后重新创建容器：
+
+```bash
+docker compose up -d --no-build steam-chat
+```
+
+代理 URL 可包含 `user:password@` 认证信息，含凭据时应保护配置文件。启用代理后，Steam 长连接使用端口 443 上的 WebSocket，HTTP 代理需支持 CONNECT。
+
+直接运行 Node.js 时需传入进程环境，例如 `STEAM_CHAT_PROXY=http://127.0.0.1:7890 npm start`；程序不会自行加载 `.env`。该变量只配置 Steam SDK，不影响 Bilibili 解析、媒体下载等使用 `fetch` 的请求，也不使用 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 或 `NO_PROXY` 为 Steam SDK 选择代理。未设置该变量时，社区 SDK 原有的环境代理行为保持不变。
 
 ## 首次部署
 

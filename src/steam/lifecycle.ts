@@ -1,6 +1,7 @@
 'use strict';
 
 import type { LoggerLike } from '../types';
+import type { SteamProxyOptions } from './proxy';
 import { errorCode, errorMessage, isRecord } from '../types';
 
 const fs = require('node:fs');
@@ -117,6 +118,7 @@ type SteamLoginRequest = {
 };
 
 type SteamLoginServiceOptions = SteamLifecycleOptions & {
+  proxy?: SteamProxyOptions;
   createQrSession?: () => QrLoginSession;
   replaceClient?: () => void;
   getDefaultLogonID?: () => number;
@@ -449,7 +451,7 @@ function createSteamLoginService(options: SteamLoginServiceOptions) {
   function startQrLogin() {
     assertLoginInactive();
     const { LoginSession, EAuthTokenPlatformType } = require('steam-session') as typeof import('steam-session');
-    const session = options.createQrSession?.() || new LoginSession(EAuthTokenPlatformType.SteamClient);
+    const session = options.createQrSession?.() || new LoginSession(EAuthTokenPlatformType.SteamClient, options.proxy);
     session.loginTimeout = LOGIN_TIMEOUT_MS;
     clearRetryTimer();
     resetDeferreds();

@@ -2,6 +2,7 @@
 
 import { createHistoryStorage } from './storage/history-storage';
 import { replaceableSteamClient } from './steam/replaceable-client';
+import { getSteamProxyOptions, getSteamCommunityProxyOptions, type SteamProxyOptions } from './steam/proxy';
 import type { CallbackStyleFunction, Persona, UnknownRecord } from './types';
 import type { IncomingMessage } from 'node:http';
 import { errorMessage, isRecord } from './types';
@@ -48,12 +49,13 @@ type SteamUserMain = import('node:events').EventEmitter & {
 };
 
 type SteamCommunityMain = {
+  request: { defaults: (options: ReturnType<typeof getSteamCommunityProxyOptions>) => SteamCommunityMain['request'] };
   setCookies?: (cookies: string[]) => void;
   startConfirmationChecker?: (intervalMs: number, identitySecret: string) => void;
   sendImageToUser?: CallbackStyleFunction;
 };
 
-type SteamUserConstructor = new (options: { renewRefreshTokens: boolean; autoRelogin: boolean }) => SteamUserMain;
+type SteamUserConstructor = new (options: SteamProxyOptions & { renewRefreshTokens: boolean; autoRelogin: boolean; webCompatibilityMode?: boolean }) => SteamUserMain;
 type SteamCommunityConstructor = new () => SteamCommunityMain;
 type ChatServiceRuntime = {
   start: () => unknown;
@@ -71,10 +73,16 @@ const SteamCommunity = require('steamcommunity') as SteamCommunityConstructor;
 const SteamUser = require('steam-user') as SteamUserConstructor;
 
 const config = loadConfig();
+const steamProxy = getSteamProxyOptions();
 // The application owns reconnects; SDK auto-relogin would race scheduleReconnect.
-const steamClient = replaceableSteamClient(() => new SteamUser({ renewRefreshTokens: true, autoRelogin: false }));
+const steamClient = replaceableSteamClient(() => new SteamUser({
+  renewRefreshTokens: true, autoRelogin: false,
+  ...steamProxy,
+  ...(steamProxy.httpProxy || steamProxy.socksProxy ? { webCompatibilityMode: true } : {})
+}));
 const steamUser = steamClient.client;
 const steamCommunity = new SteamCommunity();
+steamCommunity.request = steamCommunity.request.defaults(getSteamCommunityProxyOptions(steamProxy));
 const users: Record<string, Persona> = {};
 const authStore = createAuthStore({ dbPath: AUTH_DB_PATH });
 const chatAuthConfig = isRecord(config.chat) && isRecord(config.chat.auth) ? config.chat.auth : {};
@@ -141,6 +149,7 @@ async function getSelfName(steamAccountId?: string) {
 }
 
 const lifecycle = createSteamLoginService({
+  proxy: steamProxy,
   replaceClient: steamClient.replace,
   steamUser,
   steamCommunity,
