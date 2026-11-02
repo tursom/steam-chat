@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { setImmediate as nextTurn } from 'node:timers/promises';
+import { setImmediate as nextTurn, setTimeout as delay } from 'node:timers/promises';
 import { strict as assert } from 'node:assert';
 import { test, type TestContext } from 'node:test';
 
@@ -57,12 +57,14 @@ function fixture(t: TestContext, startWithQR?: QrSession['startWithQR']) {
 }
 
 async function waitForImage(service: { getStatus(): { qrLogin: { imageDataUrl: string | null } } }) {
-  for (let turn = 0; turn < 100; turn += 1) {
+  // PNG encoding waits on zlib work; event-loop turns do not bound that work's completion.
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
     const image = service.getStatus().qrLogin?.imageDataUrl;
     if (image) return image;
-    await nextTurn();
+    await delay(5);
   }
-  assert.fail('QR image was not generated');
+  assert.fail('QR image was not generated within 5 seconds');
 }
 
 test('QR login creates a PNG, reports scan, persists the correct account token and connects through CM', async (t) => {

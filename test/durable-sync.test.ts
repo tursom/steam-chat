@@ -267,7 +267,7 @@ test('actual HTTP/worker sync: offline granted account, pages, cursor errors, du
   } finally { await seed.close(); }
   const auth = createAuthStore({ dbPath: join(dir, 'auth.sqlite') });
   const admin = auth.createInitialAdmin({ username: 'admin', password: 'password123' });
-  const user = auth.createUser({ username: 'reader', password: 'password123', role: 'user' });
+  const user = auth.createUser({ username: 'reader', password: 'password123', role: 'user' }, admin.id);
   const active = auth.upsertSteamAccount({ steamId: account, setActive: true });
   const second = auth.upsertSteamAccount({ steamId: other });
   const sessions = createSessionManager({ store: auth });
@@ -391,7 +391,7 @@ test('HTTP history sync: empty-account cursors and authorization rechecks after 
   t.after(() => rm(dir, { recursive: true, force: true }));
   const auth = createAuthStore({ dbPath: join(dir, 'auth.sqlite') });
   const admin = auth.createInitialAdmin({ username: 'admin', password: 'password123' });
-  const user = auth.createUser({ username: 'reader', password: 'password123', role: 'user' });
+  const user = auth.createUser({ username: 'reader', password: 'password123', role: 'user' }, admin.id);
   const active = auth.upsertSteamAccount({ steamId: account, setActive: true });
   const second = auth.upsertSteamAccount({ steamId: other });
   auth.replaceUserSteamAccounts(user.id, [active.id, second.id], admin.id);

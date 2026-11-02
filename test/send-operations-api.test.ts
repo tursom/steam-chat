@@ -22,7 +22,7 @@ async function fixture(t: TestContext, requestHook: (phase: string, reply: Reply
   const dir = await mkdtemp(join(tmpdir(), 'send-operation-api-'));
   const auth = createAuthStore({ dbPath: join(dir, 'auth.sqlite') });
   const admin = auth.createInitialAdmin({ username: 'admin', password: 'password123' });
-  const user = auth.createUser({ username: 'reader', password: 'password123', role: 'user' });
+  const user = auth.createUser({ username: 'reader', password: 'password123', role: 'user' }, admin.id);
   const active = auth.upsertSteamAccount({ steamId: account, setActive: true });
   const second = auth.upsertSteamAccount({ steamId: '76561198000000003' });
   auth.replaceUserSteamAccounts(user.id, [active.id, second.id], admin.id);

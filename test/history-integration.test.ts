@@ -1,11 +1,16 @@
 import { strict as assert } from 'node:assert';
 import { EventEmitter, once } from 'node:events';
+import { mkdtemp, rm } from 'node:fs/promises';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import { setTimeout as delay } from 'node:timers/promises';
 import { WebSocket } from 'ws';
 import type { HistoryStorage, StorageStatus } from '../src/storage/history-storage';
 import type { HistoryItem, HistoryRecordInput } from '../src/types';
 const { createChatService } = require('../src/server/chat-service');
+const { createAuthStore } = require('../src/auth/store');
+const { createSessionManager } = require('../src/auth/session');
 const { createSteamMessageLogger } = require('../src/steam/message-logger');
 const { normalizeHistoryItem } = require('../src/storage/chat-log');
 const account = '76561198000000001';
@@ -65,7 +70,14 @@ test('injected HTTP history uses pages, legacy arrays, account checks and authen
     assert.equal((await fetch(f.base + '/api/history/status', { headers: { 'X-Forwarded-For': '203.0.113.10' } })).status, 401);
     const health = await (await f.request('/api/history/status')).json();
     assert.equal(JSON.stringify(health).includes('private record'), false);
-    assert.equal((await f.request('/api/history')).status, 400);
+    const latest = await f.request('/api/history');
+    assert.equal(latest.status, 200);
+    assert.deepEqual(await latest.json(), { items: [] });
+    assert.deepEqual(f.queries.splice(0), [
+      { steamAccountId: account, limit: 100, before: undefined },
+      { steamAccountId: account, limit: 100, before: 'next' }
+    ], 'a repeated conversation cursor terminates latest-history pagination');
+    assert.equal((await f.request('/api/history?before=cursor')).status, 400);
     assert.equal((await f.request(`/api/history?id=${peer}&steamAccountId=other`)).status, 403);
     assert.deepEqual(await (await f.request(`/api/history?id=${peer}&limit=3&before=cursor`)).json(), { items: [], nextCursor: 'next' });
     assert.deepEqual(f.queries[0], { steamAccountId: account, id: peer, limit: 3, before: 'cursor', after: undefined, at: undefined });
@@ -75,6 +87,36 @@ test('injected HTTP history uses pages, legacy arrays, account checks and authen
     f.storage.history = async () => { throw Object.assign(new Error('DB unavailable'), { statusCode: 503 }); };
     assert.equal((await f.request(`/history?id=${peer}`)).status, 503);
   } finally { await f.service.stop(); }
+});
+
+test('storage health requires chat.use without a Steam grant and rechecks revoked permissions', async (t) => {
+  const dir = await mkdtemp(join(tmpdir(), 'history-health-auth-'));
+  const store = createAuthStore({ dbPath: join(dir, 'auth.sqlite') });
+  const admin = store.createInitialAdmin({ username: 'admin', password: 'password123' });
+  const user = store.createUser({ username: 'reader', password: 'password123', role: 'user' }, admin.id);
+  const sessions = createSessionManager({ store });
+  const cookie = sessions.createSetCookie(user).split(';')[0];
+  const fake = fakeStorage();
+  const service = createChatService({ historyStorage: fake.storage, authStore: store, sessionManager: sessions,
+    chatConfig: { host: '127.0.0.1', port: 0 }, logger: quiet });
+  t.after(async () => {
+    try { await service.stop(); }
+    finally { store.close(); await rm(dir, { recursive: true, force: true }); }
+  });
+  service.start();
+  await once(service.server, 'listening');
+  const url = `http://127.0.0.1:${service.server.address().port}/api/history/status`;
+  assert.equal((await fetch(url)).status, 401);
+  assert.deepEqual(store.listUserSteamAccounts(user.id), []);
+  const response = await fetch(url, { headers: { Cookie: cookie } });
+  assert.equal(response.status, 200);
+  assert.equal(response.headers.get('cache-control'), 'no-store');
+  const lane = { state: 'healthy', queued: 0, writable: true, durable: 0, missed: 0 };
+  assert.deepEqual(await response.json(), { jsonl: lane, rocksdb: lane });
+  store.setPermissionOverrides(user.id, [{ permission: 'chat.use', effect: 'revoke' }], admin.id);
+  const denied = await fetch(url, { headers: { Cookie: cookie } });
+  assert.equal(denied.status, 403);
+  assert.doesNotMatch(await denied.text(), /private record|jsonl|rocksdb/);
 });
 
 test('HTTP and WS text/image append; one failed lane allows sending, two block; append failure never resends', async () => {

@@ -151,6 +151,16 @@ test('backend auth gates chat HTTP APIs and reports Steam offline as 503', async
   });
   assert.equal(configResponse.status, 200);
 
+  const meResponse = await fetch(`http://127.0.0.1:${port}/api/auth/me`, {
+    headers: { Cookie: cookie }
+  });
+  assert.equal(meResponse.status, 200);
+  assert.deepEqual((await meResponse.json()).permissions, [
+    'user.view', 'user.manage', 'role.manage', 'session.manage', 'audit.view',
+    'steam.manage', 'steam.account.manage', 'steam.grant.manage', 'steam.account.all',
+    'chat.use', 'emote.manage', 'self.password.change'
+  ]);
+
   const sendResponse = await fetch(`http://127.0.0.1:${port}/message`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', Cookie: cookie },
@@ -236,7 +246,7 @@ test('backend blocks ordinary users from ungranted active Steam account history'
   t.after(() => store.close());
   const sessions = createSessionManager({ store });
   const admin = store.createInitialAdmin({ username: 'admin', password: 'password123' });
-  const user = store.createUser({ username: 'worker', password: 'password123', role: 'user' });
+  const user = store.createUser({ username: 'worker', password: 'password123', role: 'user' }, admin.id);
   const account = store.upsertSteamAccount({ steamId: '76561198000000000', label: 'Support', setActive: true });
   await appendLog({
     steamAccountId: account.steamId,

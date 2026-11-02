@@ -15,7 +15,7 @@ test('QR API enforces management permissions and never exposes challenges throug
   const store = createAuthStore({ dbPath: join(dir, 'auth.sqlite') });
   const sessions = createSessionManager({ store });
   const admin = store.createInitialAdmin({ username: 'admin', password: 'password123' });
-  const member = store.createUser({ username: 'worker', password: 'password123', role: 'user' });
+  const member = store.createUser({ username: 'worker', password: 'password123', role: 'user' }, admin.id);
   const cookies = {
     admin: sessions.createSetCookie(admin).split(';')[0],
     user: sessions.createSetCookie(member).split(';')[0]
