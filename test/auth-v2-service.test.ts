@@ -470,7 +470,10 @@ test('v2 storage pages and sync filter rows without stalling cursors, including 
   assert.equal(sync.hasMore, false);
   const conversations = await (await f.request('/api/conversations')).json();
   assert.deepEqual(conversations.items.map((x: { id: string }) => x.id), [ALICE]);
-  assert.equal(conversations.nextCursor, 'conversation-cursor');
+  assert.match(conversations.nextCursor, /^sc1\./, 'restricted conversation cursors must not disclose index peer IDs');
+  const nextPage = await f.request('/api/conversations?before=' + encodeURIComponent(conversations.nextCursor));
+  assert.equal(nextPage.status, 200);
+  assert.deepEqual((await nextPage.json()).items, []);
   await denied(await f.request(`/api/history?id=${BOB}`), 'steam_peer_out_of_scope');
   const global = await (await f.request('/api/history')).json();
   assert.deepEqual(global.items.map((x: { id: string }) => x.id), [ALICE]);
