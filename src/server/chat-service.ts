@@ -28,7 +28,9 @@ import type { SteamFriendMessageEvent, SteamFriendMessageEventUser } from '../st
 import { errorCode, errorMessage, isRecord } from '../types';
 import { sendSteamImage, sendSteamImageAttempt } from './image-upload';
 import { SendOperations, SendOperationOptions, SendOwner } from './send-operations';
-import { createHash } from 'node:crypto';
+import { createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
+
+const { ALL_PERMISSIONS } = require('../auth/store') as { ALL_PERMISSIONS: UserPermission[] };
 
 const fs = require('node:fs/promises');
 const http = require('node:http');
@@ -95,6 +97,8 @@ type SteamCommunityLike = {
   steamID?: unknown;
   getUserInventoryContents?: CallbackStyleFunction;
   sendImageToUser?: CallbackStyleFunction;
+  httpRequest?: CallbackStyleFunction;
+  httpRequestPost?: CallbackStyleFunction;
 };
 
 type EmoticonPayload = {
@@ -151,14 +155,27 @@ type AuthStoreLike = {
   deleteUser: (id: unknown, currentUserId: unknown) => void;
   getActiveSteamAccount: (includeToken?: boolean) => (PublicSteamAccount & { refreshToken?: string | null }) | null;
   getSteamAccountById: (id: unknown, includeToken?: boolean) => (PublicSteamAccount & { refreshToken?: string | null }) | null;
-  hasPermission: (roleOrUser: string | Pick<PublicUser, 'role'>, permission: UserPermission) => boolean;
+  hasPermission: (user: PublicUser, permission: UserPermission) => boolean;
+  effectivePermissions: (userOrId: PublicUser | number) => UserPermission[];
+  permissionDetails: (userId: unknown) => Array<{ permission: UserPermission; effective: boolean; source: string }>;
+  getPermissionOverrides: (userId: unknown) => Array<{ permission: UserPermission; effect: 'grant' | 'revoke' }>;
+  getUserById: (id: unknown) => PublicUser | null;
+  listRoles: () => RoleView[];
+  getRole: (id: unknown) => RoleView | null;
+  createRole: (input: UnknownRecord, actorId?: unknown) => RoleView;
+  updateRole: (id: unknown, input: UnknownRecord, actorId?: unknown) => RoleView;
+  deleteRole: (id: unknown, actorId?: unknown) => void;
+  setPermissionOverrides: (userId: unknown, overrides: unknown, actorId?: unknown) => unknown;
+  getSteamGrant: (userId: unknown, accountId: unknown) => StoredSteamGrant | null;
+  listUserSteamGrants: (userId: unknown) => SteamGrantRecord[];
+  replaceUserSteamGrants: (userId: unknown, grants: unknown, actorId?: unknown) => unknown;
+  listSteamGrantOverview: () => unknown;
   listAuditLogs: (filters?: UnknownRecord) => PublicAuditLog[];
   listSteamAccountsForUser: (userId: unknown) => PublicSteamAccount[];
   listUserSessions: (userId: unknown) => PublicUserSession[];
   listUserSteamAccounts: (userId: unknown) => PublicSteamAccount[];
   listUsers: (filters?: UnknownRecord) => PublicUser[];
   markSteamAccountActive: (id: unknown) => void;
-  permissionsForRole: (role: PublicUser['role']) => UserPermission[];
   recordAudit: (input: UnknownRecord) => PublicAuditLog;
   replaceUserSteamAccounts: (userId: unknown, steamAccountIds: unknown, grantedBy?: unknown) => PublicSteamAccount[];
   requiresSetup: () => boolean;
@@ -167,7 +184,7 @@ type AuthStoreLike = {
   setActiveSteamAccount: (id: unknown) => PublicSteamAccount;
   setPassword: (id: unknown, password: unknown, options?: UnknownRecord) => PublicUser;
   updateSteamAccount: (id: unknown, patch: UnknownRecord) => PublicSteamAccount;
-  updateUser: (id: unknown, patch: UnknownRecord) => PublicUser;
+  updateUser: (id: unknown, patch: UnknownRecord, actorId?: unknown) => PublicUser;
   upsertSteamAccount: (input: UnknownRecord) => PublicSteamAccount;
 };
 
@@ -175,7 +192,6 @@ type SessionManagerLike = {
   createClearCookie: (req?: IncomingMessage) => string;
   createSetCookie: (user: PublicUser, req?: IncomingMessage) => string;
   getSession: (req: IncomingMessage) => AppSession | null;
-  requireAdmin: (req: IncomingMessage) => AppSession;
   requireSession: (req: IncomingMessage) => AppSession;
   revokeCurrentSession: (req: IncomingMessage, revokedBy?: unknown) => boolean;
   revokeUserSessions: (userId: unknown, revokedBy?: unknown, exceptSessionId?: unknown) => number;
@@ -191,6 +207,7 @@ type SteamStatusSummary = {
   steamId?: string | null;
   activeAccount?: Pick<PublicSteamAccount, 'id' | 'steamId' | 'label'> | null;
   accessAllowed?: boolean;
+  steamGrant?: { level: SteamLevel; scope: 'all' | 'some'; peerCount: number; expiresAt: string | null; via: 'grant' | 'all' } | null;
   qrLogin?: { imageDataUrl: string | null; scanned: boolean; expiresAt: number } | null;
 };
 
@@ -221,7 +238,46 @@ type SteamAccessContext = {
   activeAccount: PublicSteamAccount | null;
   steamAccountId?: string;
   includeLegacy: boolean;
+  grant: { level: SteamLevel; scope: 'all' | 'some'; peers: Set<string> } | null;
 };
+
+type SteamLevel = 'read' | 'chat' | 'full';
+type StoredSteamGrant = { level: SteamLevel; scope: 'all' | 'some'; peers: Set<string>; expiresAt: string | null; via: 'grant' | 'all' };
+type SteamGrantRecord = Omit<StoredSteamGrant, 'via' | 'peers'> & { peers: string[]; steamAccountId: number; updatedAt?: string; updatedBy?: number | null };
+type RoleView = { id: string; name: string; description: string; builtin: boolean; permissions: UserPermission[]; memberCount: number; editable?: boolean; deletable?: boolean };
+
+function requiresFullLevel(text: unknown): boolean {
+  return /^\s*\/(sticker|roomeffect)(\s|$)/i.test(String(text || '')) || /\[(sticker|roomeffect)\b/i.test(String(text || ''));
+}
+
+function requireLevel(access: Pick<SteamAccessContext, 'grant'>, required: SteamLevel) {
+  const ranks = { read: 1, chat: 2, full: 3 };
+  if (!access.grant || ranks[access.grant.level] < ranks[required]) {
+    const names = { read: '只读', chat: '聊天', full: '完整' };
+    throw Object.assign(new Error(`当前 Steam 授权不足，需要「${names[required]}」授权`), {
+      statusCode: 403, code: 'steam_grant_insufficient', required
+    });
+  }
+}
+
+function peerAllowed(access: Pick<SteamAccessContext, 'grant'>, peer: unknown): boolean {
+  const id = String(peer || '');
+  if (!access.grant) return false;
+  if (access.grant.scope === 'all') return true;
+  // A restricted grant never includes group/clan IDs, even if one was stored as a peer.
+  if (/^\d{17}$/.test(id) && [7n, 8n].includes((BigInt(id) >> 52n) & 15n)) return false;
+  return access.grant.peers.has(id);
+}
+
+function requirePeer(access: SteamAccessContext, peer: unknown) {
+  if (!peerAllowed(access, peer)) throw Object.assign(new Error('该会话不在 Steam 授权好友范围内'), {
+    statusCode: 403, code: 'steam_peer_out_of_scope'
+  });
+}
+
+function filterPeers<T extends { id: string }>(access: SteamAccessContext, items: T[]): T[] {
+  return items.filter(item => peerAllowed(access, item.id));
+}
 
 type FriendSummary = {
   id: string;
@@ -335,6 +391,10 @@ function errorPayload(error: unknown): UnknownRecord {
   const payload: UnknownRecord = {
     error: errorMessage(error) || 'Internal Server Error'
   };
+  if (isRecord(error) && typeof error.code === 'string') payload.code = error.code;
+  if (isRecord(error) && typeof error.required === 'string') payload.required = error.required;
+  if (isRecord(error) && typeof error.memberCount === 'number') payload.memberCount = error.memberCount;
+  if (isRecord(error) && error.statusCode === 403) payload.statusCode = 403;
   if (isRecord(error) && typeof error.steamStatus === 'string') {
     payload.steamStatus = error.steamStatus;
   }
@@ -411,6 +471,7 @@ function isStaticRequest(pathname: string) {
     || pathname === '/index.html'
     || pathname === '/style.css'
     || pathname === '/app.js'
+    || pathname === '/console.js'
     || pathname === '/vendor/artplayer-5.4.0.mjs'
     || pathname === '/vendor/artplayer-LICENSE.txt'
     || pathname === '/sw.js'
@@ -502,6 +563,7 @@ function sendWs(ws: WsConnection, payload: unknown) {
 }
 
 function createChatService(options: ChatServiceOptions = {}) {
+  const conversationCursorKey = randomBytes(32);
   const rawConfig = isRecord(options.config) && 'chat' in options.config
     ? options.config.chat
     : options.chatConfig ?? options.config ?? true;
@@ -512,19 +574,25 @@ function createChatService(options: ChatServiceOptions = {}) {
     onChange: (owner, operation) => {
       for (const ws of clients) {
         const session = liveWsSession(ws);
-        if (session?.user.id === owner.userId && session.sessionId === owner.sessionId && canWsReceiveActiveAccount(ws)
+        if (session?.user.id === owner.userId && session.sessionId === owner.sessionId && canWsReceive(ws, { id: operation.peerId, steamAccountId: owner.account })
+          && wsAccessContext(ws, false).grant?.level === 'full'
           && ensureActiveSteamAccount()?.steamId === owner.account) sendWs(ws, { type: 'send_operation', operation });
       }
     },
     send: async input => {
-      input.authorize();
+      let authorizationError: unknown;
+      const authorize = () => {
+        try { input.authorize(); }
+        catch (error) { authorizationError = error; throw error; }
+      };
+      authorize();
       try { checkSend(input.account); } catch (error) { throw Object.assign(error as object, { uncertain: false, retryable: true }); }
       if (!steamCommunity?.sendImageToUser) throw Object.assign(new Error('Steam 图片发送器不可用。'), { uncertain: false });
       const args = steamCommunity.sendImageToUser.length >= 4 ? [input.peerId, input.buffer, {}] : [input.peerId, input.buffer];
       try {
         const result = await sendSteamImageAttempt(steamCommunity,
           receiver => callMaybeCallback(steamCommunity.sendImageToUser!, receiver, args), {
-            signal: input.signal, authorize: input.authorize, onPhase: input.phase, onTransport: input.transport,
+            signal: input.signal, authorize, onPhase: input.phase, onTransport: input.transport,
             timeoutMs: Math.max(1, Math.min(30000, input.deadline - Date.now()))
           });
         const message = typeof result === 'string' ? result : isRecord(result) && typeof result.url === 'string' ? result.url : '';
@@ -533,6 +601,7 @@ function createChatService(options: ChatServiceOptions = {}) {
           id: input.peerId, name: await settleMetadata(getSelfName(input.account), 'Me'), message };
         return persistSent(record);
       } catch (error) {
+        if (authorizationError) throw authorizationError;
         const info = { operationId: input.operationId, attempt: input.attempt, totalAttempts: input.totalAttempts,
           ...(isRecord(error) ? { phase: error.imageUploadPhase, uncertain: error.uncertain, eresult: error.eresult } : { phase: 'unknown' }) };
         logger.warn?.(`Steam image operation attempt failed ${JSON.stringify(info)}`, info);
@@ -602,25 +671,102 @@ function createChatService(options: ChatServiceOptions = {}) {
     return active;
   }
 
-  function steamStatusForSession(session: AppSession | null): SteamStatusSummary {
+  function steamStatusForSession(session: Pick<AppSession, 'user'> | null): SteamStatusSummary {
     const status = currentSteamStatus();
     const active = ensureActiveSteamAccount(status);
-    const accessAllowed = !session || !active ? false : authStore?.canAccessSteamAccount(session.user.id, active.id) === true;
+    const grant = session && active ? authStore?.getSteamGrant(session.user.id, active.id) : null;
+    const legacy = !sessionManager;
+    const accessAllowed = legacy || Boolean(grant);
     return {
       ...status,
       qrLogin: session && authStore?.hasPermission(session.user, 'steam.manage') ? status.qrLogin : null,
-      activeAccount: accessAllowed || session?.user.role === 'admin' ? activeAccountSummary(active) : null,
-      accessAllowed
+      activeAccount: accessAllowed || (session && authStore?.hasPermission(session.user, 'steam.manage')) ? activeAccountSummary(active) : null,
+      accessAllowed,
+      steamGrant: grant ? { level: grant.level, scope: grant.scope, peerCount: grant.peers.size, expiresAt: grant.expiresAt, via: grant.via }
+        : legacy ? { level: 'full', scope: 'all', peerCount: 0, expiresAt: null, via: 'all' } : null
     };
   }
 
   function requirePermission(req: IncomingMessage, permission: UserPermission): AppSession | null {
-    if (!sessionManager || !authStore) return requireAdminSession(req);
+    if (!sessionManager || !authStore) return requireLegacyOrSession(req);
     const session = sessionManager.requireSession(req);
     if (!authStore.hasPermission(session.user, permission)) {
       throw Object.assign(new Error('Forbidden'), { statusCode: 403 });
     }
     return session;
+  }
+
+  function requireAnyPermission(req: IncomingMessage, permissions: UserPermission[]): AppSession | null {
+    const session = requireLegacyOrSession(req);
+    if (session && authStore && !permissions.some(permission => authStore.hasPermission(session.user, permission))) {
+      throw Object.assign(new Error('Forbidden'), { statusCode: 403 });
+    }
+    return session;
+  }
+
+  function requireUser(id: unknown): PublicUser {
+    const user = authStore!.getUserById(id);
+    if (!user) throw Object.assign(new Error('User not found'), { statusCode: 404 });
+    return user;
+  }
+
+  async function readManagementBody(req: IncomingMessage) {
+    if (!/^application\/json(?:\s*;|$)/i.test(String(req.headers['content-type'] || ''))) {
+      throw Object.assign(new Error('JSON body is required'), { statusCode: 400 });
+    }
+    const parsed: unknown = JSON.parse(await readRequestBody(req));
+    if (!isRecord(parsed) || Array.isArray(parsed)) throw Object.assign(new Error('JSON object is required'), { statusCode: 400 });
+    return parsed;
+  }
+
+  function userGrants(id: unknown) {
+    requireUser(id);
+    return { steamAccounts: authStore!.listUserSteamAccounts(id), grants: authStore!.listUserSteamGrants(id) };
+  }
+
+  function userPermissions(id: unknown) {
+    const user = requireUser(id);
+    const details = authStore!.permissionDetails(id);
+    return { roleId: user.roleId, overrides: authStore!.getPermissionOverrides(id), details };
+  }
+
+  async function handleRolesApi(req: IncomingMessage, res: ServerResponse, url: URL) {
+    if (!authStore || !sessionManager) return false;
+    if (url.pathname === '/api/steam/grants' && req.method === 'GET') {
+      requireAnyPermission(req, ['steam.grant.manage', 'user.view']);
+      jsonResponse(res, 200, authStore.listSteamGrantOverview());
+      return true;
+    }
+    if (url.pathname === '/api/roles') {
+      if (req.method === 'GET') {
+        requireAnyPermission(req, ['user.view', 'role.manage']);
+        jsonResponse(res, 200, { roles: authStore.listRoles(), permissions: ALL_PERMISSIONS });
+        return true;
+      }
+      if (req.method === 'POST') {
+        const session = requirePermission(req, 'role.manage');
+        const body = await readManagementBody(req);
+        const role = authStore.createRole(body, session?.user.id);
+        jsonResponse(res, 201, { role });
+        return true;
+      }
+    }
+    const match = /^\/api\/roles\/([^/]+)$/.exec(url.pathname);
+    if (match && ['PATCH', 'DELETE'].includes(req.method || '')) {
+      const session = requirePermission(req, 'role.manage');
+      const id = decodeURIComponent(match[1]);
+      const before = authStore.getRole(id);
+      if (!before) throw Object.assign(new Error('Role not found'), { statusCode: 404 });
+      if (req.method === 'PATCH') {
+        const role = authStore.updateRole(id, await readManagementBody(req), session?.user.id);
+        jsonResponse(res, 200, { role });
+      } else {
+        authStore.deleteRole(id, session?.user.id);
+        jsonResponse(res, 200, { ok: true });
+      }
+      return true;
+    }
+    return false;
   }
 
   function recordAudit(session: AppSession | null, req: IncomingMessage, action: string, targetType: string, targetId: unknown, detail: UnknownRecord = {}) {
@@ -646,6 +792,9 @@ function createChatService(options: ChatServiceOptions = {}) {
 
   function requireSteamAccountAccess(req: IncomingMessage, needsOnline: boolean): SteamAccessContext {
     const session = requireLegacyOrSession(req);
+    if (session && authStore && !authStore.hasPermission(session.user, 'chat.use')) {
+      throw Object.assign(new Error('没有使用聊天的权限'), { statusCode: 403 });
+    }
     if (needsOnline) requireSteamOnline();
     if (!sessionManager || !authStore) {
       const active = ensureActiveSteamAccount();
@@ -653,21 +802,22 @@ function createChatService(options: ChatServiceOptions = {}) {
         session,
         activeAccount: active,
         steamAccountId: active?.steamId || currentSteamStatus().steamId || undefined,
-        includeLegacy: true
+        includeLegacy: true,
+        grant: { level: 'full', scope: 'all', peers: new Set() }
       };
     }
     const status = currentSteamStatus();
     const active = ensureActiveSteamAccount(status);
     if (!active) throw steamAccountUnavailable(status);
-    if (!authStore.canAccessSteamAccount(session?.user.id, active.id)) {
-      throw Object.assign(new Error('Steam account access denied'), { statusCode: 403 });
-    }
+    const grant = authStore.getSteamGrant(session?.user.id, active.id);
+    if (!grant) requireLevel({ grant: null }, 'read');
     authStore.markSteamAccountActive(active.id);
     return {
       session,
       activeAccount: active,
       steamAccountId: active.steamId,
-      includeLegacy: session?.user.role === 'admin'
+      includeLegacy: Boolean(session && authStore.hasPermission(session.user, 'steam.account.all')),
+      grant: grant ? { ...grant, peers: new Set(grant.peers) } : null
     };
   }
 
@@ -679,34 +829,60 @@ function createChatService(options: ChatServiceOptions = {}) {
     return session;
   }
 
+  function recheckReadAccess(req: IncomingMessage, previous: SteamAccessContext, needsOnline = false) {
+    const current = requireSteamAccountAccess(req, needsOnline);
+    if (previous.steamAccountId !== current.steamAccountId) {
+      throw Object.assign(new Error('Steam account changed during request'), { statusCode: 409 });
+    }
+    return current;
+  }
+
   function wsAccessContext(ws: WsConnection, needsOnline: boolean): SteamAccessContext {
     const session = liveWsSession(ws);
     if (sessionManager && !session) throw Object.assign(new Error('Unauthorized'), { statusCode: 401 });
+    if (session && authStore && !authStore.hasPermission(session.user, 'chat.use')) {
+      throw Object.assign(new Error('没有使用聊天的权限'), { statusCode: 403 });
+    }
     if (needsOnline) requireSteamOnline();
     if (!sessionManager || !authStore) {
       const active = ensureActiveSteamAccount();
-      return { session, activeAccount: active, steamAccountId: active?.steamId || currentSteamStatus().steamId || undefined, includeLegacy: true };
+      return { session, activeAccount: active, steamAccountId: active?.steamId || currentSteamStatus().steamId || undefined, includeLegacy: true,
+        grant: { level: 'full', scope: 'all', peers: new Set() } };
     }
     const status = currentSteamStatus();
     const active = ensureActiveSteamAccount(status);
     if (!active) throw steamAccountUnavailable(status);
-    if (!session || !authStore.canAccessSteamAccount(session.user.id, active.id)) {
-      throw Object.assign(new Error('Steam account access denied'), { statusCode: 403 });
-    }
+    const grant = session ? authStore.getSteamGrant(session.user.id, active.id) : null;
+    if (!grant) requireLevel({ grant: null }, 'read');
     authStore.markSteamAccountActive(active.id);
-    return { session, activeAccount: active, steamAccountId: active.steamId, includeLegacy: session.user.role === 'admin' };
+    return { session, activeAccount: active, steamAccountId: active.steamId,
+      includeLegacy: Boolean(session && authStore.hasPermission(session.user, 'steam.account.all')),
+      grant: grant ? { ...grant, peers: new Set(grant.peers) } : null };
   }
 
-  function canWsReceiveActiveAccount(ws: WsConnection): boolean {
+  function canWsReceive(ws: WsConnection, item?: { id: string; steamAccountId?: string }): boolean {
     if (!sessionManager || !authStore) return true;
     const session = liveWsSession(ws);
     const active = ensureActiveSteamAccount();
-    return Boolean(session && active && authStore.canAccessSteamAccount(session.user.id, active.id));
+    if (!session || !active || (item?.steamAccountId && item.steamAccountId !== active.steamId)) return false;
+    const grant = authStore.getSteamGrant(session.user.id, active.id);
+    return Boolean(grant && (!item || peerAllowed({ grant: { ...grant, peers: new Set(grant.peers) } }, item.id)));
   }
 
   function broadcast(payload: unknown, except?: WsConnection) {
     for (const ws of clients) {
-      if (ws !== except && canWsReceiveActiveAccount(ws)) sendWs(ws, payload);
+      if (isRecord(payload) && payload.type === 'steam_status') {
+        if (ws === except) continue;
+        const session = liveWsSession(ws);
+        if (sessionManager && !session) continue;
+        sendWs(ws, { type: 'steam_status', ...steamStatusForSession(session),
+          permissions: session && authStore ? authStore.effectivePermissions(session.user) : [],
+          permissionDetails: session && authStore ? authStore.permissionDetails(session.user.id) : [] });
+        continue;
+      }
+      const item = isRecord(payload) && payload.type === 'message' && typeof payload.id === 'string'
+        ? { id: payload.id, steamAccountId: typeof payload.steamAccountId === 'string' ? payload.steamAccountId : undefined } : undefined;
+      if (ws !== except && canWsReceive(ws, item)) sendWs(ws, payload);
     }
   }
 
@@ -724,12 +900,6 @@ function createChatService(options: ChatServiceOptions = {}) {
 
   function requireLegacyOrSession(req: IncomingMessage): AppSession | null {
     if (sessionManager) return sessionManager.requireSession(req);
-    if (!legacyAuth.isAuthorized(req)) throw Object.assign(new Error('Unauthorized'), { statusCode: 401, legacyChallenge: true });
-    return null;
-  }
-
-  function requireAdminSession(req: IncomingMessage): AppSession | null {
-    if (sessionManager) return sessionManager.requireAdmin(req);
     if (!legacyAuth.isAuthorized(req)) throw Object.assign(new Error('Unauthorized'), { statusCode: 401, legacyChallenge: true });
     return null;
   }
@@ -755,7 +925,9 @@ function createChatService(options: ChatServiceOptions = {}) {
     return {
       needsSetup: authStore?.requiresSetup?.() ?? false,
       user: session?.user || null,
-      permissions: session && authStore ? authStore.permissionsForRole(session.user.role) : [],
+      ok: true,
+      permissions: session && authStore ? authStore.effectivePermissions(session.user) : [],
+      permissionDetails: session && authStore ? authStore.permissionDetails(session.user.id) : [],
       steam: steamStatusForSession(session),
       config: clientConfig()
     };
@@ -772,7 +944,8 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (req.method === 'POST' && pathname === '/api/auth/setup') {
       const body = await readJsonBody(req);
       const user = authStore.createInitialAdmin(body);
-      jsonResponse(res, 200, { ok: true, user, permissions: authStore.permissionsForRole(user.role), steam: steamStatusForSession(null) }, {
+      jsonResponse(res, 200, { ok: true, user, permissions: authStore.effectivePermissions(user), permissionDetails: authStore.permissionDetails(user.id),
+        steam: steamStatusForSession({ user }) }, {
         'Set-Cookie': sessionManager.createSetCookie(user, req)
       });
       return true;
@@ -782,7 +955,8 @@ function createChatService(options: ChatServiceOptions = {}) {
       const body = await readJsonBody(req);
       const user = authStore.authenticate(body.username, body.password, requestContext(req));
       if (!user) throw Object.assign(new Error('Invalid username or password'), { statusCode: 401 });
-      jsonResponse(res, 200, { ok: true, user, permissions: authStore.permissionsForRole(user.role), steam: steamStatusForSession(null) }, {
+      jsonResponse(res, 200, { ok: true, user, permissions: authStore.effectivePermissions(user), permissionDetails: authStore.permissionDetails(user.id),
+        steam: steamStatusForSession({ user }) }, {
         'Set-Cookie': sessionManager.createSetCookie(user, req)
       });
       return true;
@@ -802,16 +976,16 @@ function createChatService(options: ChatServiceOptions = {}) {
 
     if (req.method === 'POST' && pathname === '/api/auth/logout-all') {
       const session = sessionManager.requireSession(req);
-      sessionManager.revokeUserSessions(session.user.id, session.user.id);
-      recordAudit(session, req, 'session.logout_all', 'user', session.user.id);
-      jsonResponse(res, 200, { ok: true }, {
-        'Set-Cookie': sessionManager.createClearCookie(req)
-      });
+      const body = await readJsonBody(req);
+      const keepCurrentSession = body.keepCurrentSession === true;
+      const revoked = sessionManager.revokeUserSessions(session.user.id, session.user.id, keepCurrentSession ? session.sessionId : undefined);
+      recordAudit(session, req, 'session.logout_all', 'user', session.user.id, { keepCurrentSession, revoked });
+      jsonResponse(res, 200, { ok: true, revoked, keepCurrentSession }, keepCurrentSession ? {} : { 'Set-Cookie': sessionManager.createClearCookie(req) });
       return true;
     }
 
     if (req.method === 'POST' && pathname === '/api/auth/password') {
-      const session = sessionManager.requireSession(req);
+      const session = requirePermission(req, 'self.password.change')!;
       const body = await readJsonBody(req);
       const user = authStore.changeOwnPassword(session.user.id, body.oldPassword, body.newPassword);
       recordAudit(session, req, 'user.password.change_self', 'user', session.user.id);
@@ -828,25 +1002,44 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (!authStore || !sessionManager) return false;
     const pathname = url.pathname;
     if (pathname === '/api/users') {
-      const session = requirePermission(req, 'user.manage');
       if (req.method === 'GET') {
+        requirePermission(req, 'user.view');
         jsonResponse(res, 200, {
           users: authStore.listUsers({
             query: url.searchParams.get('query'),
-            role: url.searchParams.get('role'),
+            roleId: url.searchParams.get('roleId') || url.searchParams.get('role'),
             status: url.searchParams.get('status')
           })
         });
         return true;
       }
       if (req.method === 'POST') {
-        const body = await readJsonBody(req);
+        const session = requirePermission(req, 'user.manage');
+        const body = await readManagementBody(req);
         const user = authStore.createUser({ ...body, createdBy: session?.user.id });
-        recordAudit(session, req, 'user.create', 'user', user.id, { username: user.username, role: user.role, steamAccountIds: body.steamAccountIds });
+        recordAudit(session, req, 'user.create', 'user', user.id, { username: user.username, roleId: user.roleId, steamAccountIds: body.steamAccountIds, steamGrants: body.steamGrants });
         jsonResponse(res, 201, { ok: true, user });
         return true;
       }
       return false;
+    }
+
+    const permissionsMatch = /^\/api\/users\/(\d+)\/(permissions|permission-overrides)$/.exec(pathname);
+    if (permissionsMatch) {
+      if (req.method === 'GET' && permissionsMatch[2] === 'permissions') {
+        requirePermission(req, 'user.view');
+        jsonResponse(res, 200, userPermissions(permissionsMatch[1]));
+        return true;
+      }
+      if (req.method === 'PUT' && permissionsMatch[2] === 'permission-overrides') {
+        const session = requirePermission(req, 'role.manage');
+        requireUser(permissionsMatch[1]);
+        const body = await readManagementBody(req);
+        authStore.setPermissionOverrides(permissionsMatch[1], body.overrides, session?.user.id);
+        const after = userPermissions(permissionsMatch[1]);
+        jsonResponse(res, 200, { ok: true, ...after });
+        return true;
+      }
     }
 
     const sessionsMatch = pathname.match(/^\/api\/users\/(\d+)\/sessions$/);
@@ -875,16 +1068,22 @@ function createChatService(options: ChatServiceOptions = {}) {
 
     const steamAccountsMatch = pathname.match(/^\/api\/users\/(\d+)\/steam-accounts$/);
     if (steamAccountsMatch) {
-      const session = requirePermission(req, 'steam.account.manage');
       if (req.method === 'GET') {
-        jsonResponse(res, 200, { steamAccounts: authStore.listUserSteamAccounts(steamAccountsMatch[1]) });
+        requirePermission(req, 'user.view');
+        jsonResponse(res, 200, userGrants(steamAccountsMatch[1]));
         return true;
       }
       if (req.method === 'PUT') {
-        const body = await readJsonBody(req);
-        const steamAccounts = authStore.replaceUserSteamAccounts(steamAccountsMatch[1], body.steamAccountIds, session?.user.id);
-        recordAudit(session, req, 'steam_account.grant_replace', 'user', steamAccountsMatch[1], { steamAccountIds: body.steamAccountIds });
-        jsonResponse(res, 200, { ok: true, steamAccounts });
+        const session = requirePermission(req, 'steam.grant.manage');
+        const body = await readManagementBody(req);
+        requireUser(steamAccountsMatch[1]);
+        if (Object.hasOwn(body, 'grants')) {
+          authStore.replaceUserSteamGrants(steamAccountsMatch[1], body.grants, session?.user.id);
+        } else {
+          if (!Array.isArray(body.steamAccountIds)) throw Object.assign(new Error('steamAccountIds or grants is required'), { statusCode: 400 });
+          authStore.replaceUserSteamAccounts(steamAccountsMatch[1], body.steamAccountIds, session?.user.id);
+        }
+        jsonResponse(res, 200, { ok: true, ...userGrants(steamAccountsMatch[1]) });
         return true;
       }
     }
@@ -893,7 +1092,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (passwordMatch && req.method === 'POST') {
       const session = requirePermission(req, 'user.manage');
       const body = await readJsonBody(req);
-      const user = authStore.setPassword(passwordMatch[1], body.password, { forcePasswordChange: body.forcePasswordChange });
+      const user = authStore.setPassword(passwordMatch[1], body.password, { forcePasswordChange: body.forcePasswordChange, actorId: session?.user.id });
       recordAudit(session, req, 'user.password.reset', 'user', user.id, { forcePasswordChange: body.forcePasswordChange });
       jsonResponse(res, 200, { ok: true, user });
       return true;
@@ -901,11 +1100,16 @@ function createChatService(options: ChatServiceOptions = {}) {
 
     const userMatch = pathname.match(/^\/api\/users\/(\d+)$/);
     if (userMatch) {
+      if (req.method === 'GET') {
+        requirePermission(req, 'user.view');
+        const { passwordHash: _passwordHash, ...user } = requireUser(userMatch[1]) as PublicUser & { passwordHash?: string };
+        jsonResponse(res, 200, { user });
+        return true;
+      }
       const session = requirePermission(req, 'user.manage');
       if (req.method === 'PATCH') {
-        const body = await readJsonBody(req);
-        const user = authStore.updateUser(userMatch[1], body);
-        recordAudit(session, req, 'user.update', 'user', user.id, body);
+        const body = await readManagementBody(req);
+        const user = authStore.updateUser(userMatch[1], body, session?.user.id);
         jsonResponse(res, 200, { ok: true, user });
         return true;
       }
@@ -1044,6 +1248,8 @@ function createChatService(options: ChatServiceOptions = {}) {
         actorUserId: url.searchParams.get('actorUserId'),
         from: url.searchParams.get('from'),
         to: url.searchParams.get('to'),
+        category: url.searchParams.get('category'),
+        query: url.searchParams.get('query'),
         limit: url.searchParams.get('limit')
       })
     });
@@ -1069,6 +1275,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     try {
       return await operation();
     } catch (error) {
+      if (isRecord(error) && [401, 403].includes(Number(error.statusCode))) throw error;
       if (isSessionExpiredError(error) && !(needsWebSession && isRecord(error) && error.imageUploadPhase === 'commit')) {
         logger.warn?.('Steam web session rejected; refreshing before one retry');
         await refreshSharedWebSession();
@@ -1095,11 +1302,15 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
   }
 
-  function httpSendAuthorization(req: IncomingMessage, access: SteamAccessContext, requested: unknown): () => void {
+  function httpSendAuthorization(req: IncomingMessage, access: SteamAccessContext, requested: unknown, level: SteamLevel, peer: unknown): (required?: SteamLevel) => void {
     checkAccountPrecondition(access, requested);
+    requireLevel(access, level);
+    requirePeer(access, peer);
     // Capture the pre-body account, and recheck access at every actual send attempt.
-    return () => {
+    return (required = level) => {
       const current = requireSteamAccountAccess(req, true);
+      requireLevel(current, required);
+      requirePeer(current, peer);
       checkAccountPrecondition(current, requested);
       if (access.steamAccountId !== current.steamAccountId) {
         throw Object.assign(new Error('Steam account changed before sending'), { statusCode: 409 });
@@ -1116,13 +1327,68 @@ function createChatService(options: ChatServiceOptions = {}) {
     return access.steamAccountId;
   }
 
+  // Storage cursors contain index keys (including peer IDs). Restricted readers
+  // receive authenticated opaque tokens so empty filtered pages disclose no peers.
+  function conversationCursorBinding(access: SteamAccessContext) {
+    return Buffer.from(`${access.session?.user.id || ''}|${access.steamAccountId || ''}`);
+  }
+
+  function sealConversationCursor(access: SteamAccessContext, cursor: unknown): string | undefined {
+    if (typeof cursor !== 'string' || !cursor) return undefined;
+    if (access.grant?.scope !== 'some') return cursor;
+    const iv = randomBytes(12);
+    const cipher = createCipheriv('aes-256-gcm', conversationCursorKey, iv);
+    cipher.setAAD(conversationCursorBinding(access));
+    const encrypted = Buffer.concat([cipher.update(cursor, 'utf8'), cipher.final()]);
+    return `sc1.${Buffer.concat([iv, cipher.getAuthTag(), encrypted]).toString('base64url')}`;
+  }
+
+  function openConversationCursor(access: SteamAccessContext, cursor: unknown): string | undefined {
+    if (cursor == null || cursor === '') return undefined;
+    const value = String(cursor);
+    if (!value.startsWith('sc1.')) return value; // Existing browser pagination remains usable.
+    try {
+      if (value.length > 8192) throw new Error('cursor too long');
+      const bytes = Buffer.from(value.slice(4), 'base64url');
+      const decipher = createDecipheriv('aes-256-gcm', conversationCursorKey, bytes.subarray(0, 12));
+      decipher.setAuthTag(bytes.subarray(12, 28)); decipher.setAAD(conversationCursorBinding(access));
+      return Buffer.concat([decipher.update(bytes.subarray(28)), decipher.final()]).toString('utf8');
+    } catch { throw Object.assign(new Error('Invalid conversation cursor; reload the conversation list'), { statusCode: 400 }); }
+  }
+
   function historyQuery(access: SteamAccessContext, input: UnknownRecord) {
     const steamAccountId = historyAccount(access, input.steamAccountId);
     if (!input.id) throw Object.assign(new Error('id is required'), { statusCode: 400 });
+    requirePeer(access, input.id);
     return { steamAccountId, id: String(input.id), limit: input.limit == null ? undefined : Number(input.limit),
       before: input.before == null ? undefined : String(input.before),
       after: input.after == null ? undefined : String(input.after),
       at: input.at == null ? undefined : Number(input.at) };
+  }
+
+  async function storageHistory(access: SteamAccessContext, input: UnknownRecord) {
+    if (input.id) return historyStorage!.history(historyQuery(access, input));
+    const steamAccountId = historyAccount(access, input.steamAccountId);
+    if (input.before || input.after || input.at != null) {
+      throw Object.assign(new Error('id is required for paginated history'), { statusCode: 400 });
+    }
+    if (access.grant?.scope === 'some' && access.grant.peers.size === 0) return { items: [] as HistoryItem[] };
+    const limit = limitFrom(input.limit);
+    const conversations: ConversationSummary[] = [];
+    let before: string | undefined;
+    // At most `limit` visible conversations can contribute to the latest `limit` messages.
+    do {
+      const page = await historyStorage!.conversations({ steamAccountId, limit, before });
+      conversations.push(...filterPeers(access, page.items));
+      if (!page.nextCursor || page.nextCursor === before) break;
+      before = page.nextCursor;
+    } while (conversations.length < limit);
+    const items: HistoryItem[] = [];
+    for (const conversation of conversations.slice(0, limit)) {
+      const page = await historyStorage!.history({ steamAccountId, id: conversation.id, limit });
+      items.push(...page.items);
+    }
+    return { items: items.sort((a, b) => a.date.localeCompare(b.date)).slice(-limit) };
   }
 
   function checkSend(steamAccountId?: string) {
@@ -1157,7 +1423,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
   }
 
-  async function sendTextMessage(id: unknown, msg: unknown, steamAccountId?: string, authorize?: () => void): Promise<HistoryItem> {
+  async function sendTextMessage(id: unknown, msg: unknown, steamAccountId?: string, authorize?: (level?: SteamLevel) => void): Promise<HistoryItem> {
     rejectGroupRecipient(id);
     steamAccountId = steamAccountId || ensureActiveSteamAccount()?.steamId || currentSteamStatus().steamId || undefined;
     checkSend(steamAccountId);
@@ -1169,8 +1435,11 @@ function createChatService(options: ChatServiceOptions = {}) {
       throw new Error('Steam chat sender is unavailable');
     }
     const message = String(msg);
+    // Resolve the text classification before any waiter or retry can yield to a grant change.
+    const level: SteamLevel = requiresFullLevel(message) ? 'full' : 'chat';
+    authorize?.(level);
     const result = await withSteamRetry(() => {
-      authorize?.();
+      authorize?.(level);
       checkSend(steamAccountId);
       const sender = steamUser.chat?.sendFriendMessage || steamUser.sendFriendMessage;
       const context = steamUser.chat?.sendFriendMessage ? steamUser.chat : steamUser;
@@ -1224,10 +1493,32 @@ function createChatService(options: ChatServiceOptions = {}) {
       throw Object.assign(new Error('img or url is required'), { statusCode: 400 });
     }
     const imageArgs = steamCommunity.sendImageToUser.length >= 4 ? [id, imageBuffer, {}] : [id, imageBuffer];
-    const result = await withSteamRetry(() => sendSteamImage(steamCommunity,
-      receiver => callMaybeCallback(steamCommunity.sendImageToUser!, receiver, imageArgs), {
-        authorize: () => { authorize?.(); checkSend(steamAccountId); }, logger
-      }), true);
+    let authorizationError: unknown;
+    const guard = () => {
+      try { authorize?.(); checkSend(steamAccountId); }
+      catch (error) { authorizationError = error; throw error; }
+    };
+    // Keep the installed SDK and its retry/uncertainty handling, but guard each
+    // begin/PUT/commit on a private receiver so concurrent uploads stay isolated.
+    const community: SteamCommunityLike = Object.create(steamCommunity);
+    for (const key of ['httpRequest', 'httpRequestPost'] as const) {
+      const original = steamCommunity[key];
+      if (!original) continue;
+      community[key] = (...args: unknown[]) => {
+        try { guard(); }
+        catch (error) {
+          if (typeof args[1] === 'function') return args[1](error);
+          throw error;
+        }
+        return original.apply(steamCommunity, args);
+      };
+    }
+    const result = await withSteamRetry(async () => {
+      try {
+        return await sendSteamImage(community,
+          receiver => callMaybeCallback(community.sendImageToUser!, receiver, imageArgs), { authorize: guard, logger });
+      } catch (error) { throw authorizationError || error; }
+    }, true);
     if (typeof result === 'string' && result) message = result;
     else if (isRecord(result) && typeof result.url === 'string' && result.url) message = result.url;
     const record: HistoryRecordInput = {
@@ -1282,13 +1573,15 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (!sessionManager || !authStore) throw Object.assign(new Error('Session authentication required'), { statusCode: 401 });
     requirePermission(req, 'chat.use');
     const access = requireSteamAccountAccess(req, false);
+    requireLevel(access, 'full');
     if (!access.session || !access.steamAccountId) throw steamAccountUnavailable();
     return { userId: access.session.user.id, sessionId: access.session.sessionId, account: access.steamAccountId };
   }
 
-  function sendAuthorization(req: IncomingMessage, owner: SendOwner) {
+  function sendAuthorization(req: IncomingMessage, owner: SendOwner, peerId: string) {
     return () => {
       const live = sendOwner(req);
+      requirePeer(requireSteamAccountAccess(req, false), peerId);
       if (live.account !== owner.account || live.sessionId !== owner.sessionId || live.userId !== owner.userId) {
         throw Object.assign(new Error('原账号或登录会话已改变。'), { statusCode: 409 });
       }
@@ -1319,9 +1612,9 @@ function createChatService(options: ChatServiceOptions = {}) {
     if ((url.pathname === '/api/send-operations' || upload) && req.method === 'POST') {
       if (currentSteamStatus().status !== 'online') throw Object.assign(new Error('Steam 尚未在线，暂不能创建发送任务。'), { statusCode: 503 });
       const body = await readJsonBody(req);
-      const authorize = sendAuthorization(req, owner);
-      authorize();
       if (body.kind !== 'image' || typeof body.id !== 'string' || !/^\d{17}$/.test(body.id)) throw Object.assign(new Error('Invalid image recipient'), { statusCode: 400 });
+      const authorize = sendAuthorization(req, owner, body.id);
+      authorize();
       rejectGroupRecipient(body.id);
       validateAccountPrecondition(body.steamAccountId);
       if (body.steamAccountId !== undefined && body.steamAccountId !== owner.account) throw Object.assign(new Error('Steam account changed'), { statusCode: 409 });
@@ -1348,7 +1641,10 @@ function createChatService(options: ChatServiceOptions = {}) {
     const match = /^\/api\/send-operations\/([a-f0-9]{32})(?:\/(start|retry|expedite|cancel|image))?$/.exec(url.pathname);
     if (!match) throw Object.assign(new Error('Not found'), { statusCode: 404 });
     const [, id, action] = match;
-    if (req.method === 'GET' && !action) jsonResponse(res, 200, sendOperations.get(id, owner), { 'Cache-Control': 'no-store' });
+    const operation = sendOperations.get(id, owner);
+    const authorize = sendAuthorization(req, owner, operation.peerId);
+    authorize();
+    if (req.method === 'GET' && !action) jsonResponse(res, 200, operation, { 'Cache-Control': 'no-store' });
     else if (req.method === 'GET' && action === 'image') {
       const buffer = sendOperations.image(id, owner);
       const size = require('image-size').imageSize(buffer);
@@ -1356,7 +1652,6 @@ function createChatService(options: ChatServiceOptions = {}) {
     } else if (req.method === 'POST' && action === 'start') {
       const started = await sendOperations.loadAndStart(id, owner, async () => {
         const body = await readJsonBody(req);
-        const authorize = sendAuthorization(req, owner);
         authorize();
         const buffer = await operationImage(body);
         authorize();
@@ -1366,7 +1661,6 @@ function createChatService(options: ChatServiceOptions = {}) {
     } else if (req.method === 'POST' && action) {
       sendOperations.get(id, owner);
       const body = await readJsonBody(req);
-      const authorize = sendAuthorization(req, owner);
       authorize();
       if (action === 'cancel') jsonResponse(res, 200, sendOperations.cancel(id, owner), { 'Cache-Control': 'no-store' });
       else if (action === 'retry' || action === 'expedite') {
@@ -1379,6 +1673,7 @@ function createChatService(options: ChatServiceOptions = {}) {
 
   async function handleHttpRequest(req: IncomingMessage, res: ServerResponse) {
     const url = new URL(req.url, `http://${req.headers.host || 'localhost'}`);
+    if (url.pathname.startsWith('/api/')) res.setHeader('Cache-Control', 'no-store');
     try {
       if (stopping) {
         jsonResponse(res, 503, { error: 'Service is stopping' });
@@ -1398,6 +1693,7 @@ function createChatService(options: ChatServiceOptions = {}) {
       }
 
       if (await handleAuthApi(req, res, url.pathname)) return;
+      if (await handleRolesApi(req, res, url)) return;
       if (await handleSteamApi(req, res, url)) return;
       if (await handleUsersApi(req, res, url)) return;
       if (await handleAuditApi(req, res, url)) return;
@@ -1427,9 +1723,9 @@ function createChatService(options: ChatServiceOptions = {}) {
           return;
         }
         if (req.method === 'POST' && url.pathname === '/api/image-emotes') {
-          requireAdminSession(req);
+          requirePermission(req, 'emote.manage');
           const body = await readJsonBody(req);
-          requireAdminSession(req);
+          requirePermission(req, 'emote.manage');
           const result = await imageEmotes.mutate(body);
           jsonResponse(res, 200, result);
           return;
@@ -1444,7 +1740,7 @@ function createChatService(options: ChatServiceOptions = {}) {
         const access = requireSteamAccountAccess(req, true);
         if (!steamUser || !access.steamAccountId) throw Object.assign(new Error('Steam is not online'), { statusCode: 503 });
         if (req.method === 'GET') {
-          const authorize = httpSendAuthorization(req, access, url.searchParams.get('steamAccountId') || undefined);
+          const authorize = httpSendAuthorization(req, access, url.searchParams.get('steamAccountId') || undefined, 'read', url.searchParams.get('id'));
           authorize();
           const result = await readMessageReactions(steamUser, access.steamAccountId, url.searchParams.get('id') || '', url.searchParams.get('before'));
           authorize();
@@ -1453,7 +1749,7 @@ function createChatService(options: ChatServiceOptions = {}) {
         }
         if (req.method === 'POST') {
           const body = await readJsonBody(req);
-          const authorize = httpSendAuthorization(req, access, body.steamAccountId);
+          const authorize = httpSendAuthorization(req, access, body.steamAccountId, 'full', body.id);
           authorize();
           const result = await updateMessageReaction(steamUser, body);
           authorize();
@@ -1479,7 +1775,7 @@ function createChatService(options: ChatServiceOptions = {}) {
             limit: url.searchParams.has('limit') ? Number(url.searchParams.get('limit')) : undefined });
           const current = requireSteamAccountAccess(req, false);
           historyAccount(current, steamAccountId);
-          jsonResponse(res, 200, page, { 'Cache-Control': 'no-store' });
+          jsonResponse(res, 200, { ...page, items: filterPeers(current, page.items) }, { 'Cache-Control': 'no-store' });
           return;
         }
         if (url.pathname === '/api/config') {
@@ -1487,22 +1783,26 @@ function createChatService(options: ChatServiceOptions = {}) {
           return;
         }
         if (url.pathname === '/api/emoticons') {
-          requireSteamAccountAccess(req, true);
+          const access = requireSteamAccountAccess(req, true);
           const data = await getEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession });
+          recheckReadAccess(req, access, true);
           jsonResponse(res, 200, data);
           return;
         }
         if (url.pathname === '/api/friends') {
-          requireSteamAccountAccess(req, true);
-          jsonResponse(res, 200, await listFriends(steamUser));
+          const access = requireSteamAccountAccess(req, true);
+          const friends = await listFriends(steamUser);
+          jsonResponse(res, 200, filterPeers(recheckReadAccess(req, access, true), friends));
           return;
         }
         if (url.pathname === '/api/groups') {
-          requireSteamAccountAccess(req, true);
-          jsonResponse(res, 200, await listGroups(steamUser));
+          const access = requireSteamAccountAccess(req, true);
+          const groups = access.grant?.scope === 'some' ? [] : await listGroups(steamUser);
+          jsonResponse(res, 200, recheckReadAccess(req, access, true).grant?.scope === 'some' ? [] : groups);
           return;
         }
         if (url.pathname === '/api/history/status') {
+          requirePermission(req, 'chat.use');
           if (!historyStorage) throw Object.assign(new Error('History storage unavailable'), { statusCode: 503 });
           const { jsonl, rocksdb } = historyStorage.status();
           const { lastError: _jsonlError, ...safeJsonl } = jsonl;
@@ -1514,38 +1814,49 @@ function createChatService(options: ChatServiceOptions = {}) {
           const access = requireSteamAccountAccess(req, false);
           const input = Object.fromEntries(url.searchParams);
           const page = url.pathname.endsWith('/history')
-            ? await historyStorage.history(historyQuery(access, input))
+            ? await storageHistory(access, input)
             : await historyStorage.conversations({ steamAccountId: historyAccount(access, input.steamAccountId),
-              limit: input.limit == null ? undefined : Number(input.limit), before: input.before });
-          jsonResponse(res, 200, url.pathname.startsWith('/api/') ? page : page.items);
+              limit: input.limit == null ? undefined : Number(input.limit), before: openConversationCursor(access, input.before) });
+          const current = requireSteamAccountAccess(req, false);
+          historyAccount(current, access.steamAccountId);
+          if (url.pathname.endsWith('/history') && input.id) requirePeer(current, input.id);
+          const filtered = { ...page, items: page.items.filter(item => peerAllowed(current, item.id)) };
+          if (!url.pathname.endsWith('/history')) filtered.nextCursor = sealConversationCursor(current, page.nextCursor);
+          jsonResponse(res, 200, url.pathname.startsWith('/api/') ? filtered : filtered.items);
           return;
         }
-        if (url.pathname === '/history') {
+        if (url.pathname === '/history' || url.pathname === '/api/history') {
           const access = requireSteamAccountAccess(req, false);
-          jsonResponse(res, 200, await readHistory({
+          const id = url.searchParams.get('id');
+          if (id) requirePeer(access, id);
+          const items = await readHistory({
             logPath,
             id: url.searchParams.get('id'),
             limit: url.searchParams.get('limit'),
             steamAccountId: access.steamAccountId,
             includeLegacy: access.includeLegacy,
             logger
-          }));
+          });
+          const current = recheckReadAccess(req, access);
+          if (id) requirePeer(current, id);
+          jsonResponse(res, 200, filterPeers(current, items));
           return;
         }
-        if (url.pathname === '/conversations') {
+        if (url.pathname === '/conversations' || url.pathname === '/api/conversations') {
           const access = requireSteamAccountAccess(req, false);
-          jsonResponse(res, 200, await buildConversations({
+          const items = await buildConversations({
             logPath,
             limit: url.searchParams.get('limit'),
             steamAccountId: access.steamAccountId,
             includeLegacy: access.includeLegacy,
             getUserInfo,
             logger
-          }));
+          });
+          jsonResponse(res, 200, filterPeers(recheckReadAccess(req, access), items));
           return;
         }
         if (url.pathname.startsWith('/proxy/sticker/')) {
-          requireSteamAccountAccess(req, false);
+          const access = requireSteamAccountAccess(req, false);
           const type = decodeURIComponent(url.pathname.slice('/proxy/sticker/'.length));
           let sticker;
           try {
@@ -1556,13 +1867,15 @@ function createChatService(options: ChatServiceOptions = {}) {
             if (!canonical || canonical === type) throw error;
             sticker = await loadOrDownloadSticker(canonical, { fetchImpl });
           }
+          recheckReadAccess(req, access);
           textResponse(res, 200, sticker.buffer, { 'Content-Type': sticker.contentType, 'Cache-Control': 'public, max-age=86400' });
           return;
         }
         if (url.pathname === '/proxy/image') {
-          requireSteamAccountAccess(req, false);
+          const access = requireSteamAccountAccess(req, false);
           const source = url.searchParams.get('url') || '';
           const image = await loadOrDownloadRemoteImage(source, { fetchImpl });
+          recheckReadAccess(req, access);
           textResponse(res, 200, image.buffer, { 'Content-Type': image.contentType, 'Cache-Control': 'public, max-age=86400' });
           return;
         }
@@ -1574,7 +1887,7 @@ function createChatService(options: ChatServiceOptions = {}) {
       if (req.method === 'POST' && (url.pathname === '/' || url.pathname === '/message')) {
         const access = requireSteamAccountAccess(req, true);
         const body = await readJsonBody(req);
-        const authorize = httpSendAuthorization(req, access, body.steamAccountId);
+        const authorize = httpSendAuthorization(req, access, body.steamAccountId, requiresFullLevel(body.msg) ? 'full' : 'chat', body.id);
         authorize();
         const item = await sendTextMessage(body.id, body.msg, access.steamAccountId, authorize);
         jsonResponse(res, 200, { ok: true, item });
@@ -1584,7 +1897,7 @@ function createChatService(options: ChatServiceOptions = {}) {
       if (req.method === 'POST' && (url.pathname === '/image' || url.pathname === '/img')) {
         const access = requireSteamAccountAccess(req, true);
         const body = await readJsonBody(req);
-        const authorize = httpSendAuthorization(req, access, body.steamAccountId);
+        const authorize = httpSendAuthorization(req, access, body.steamAccountId, 'full', body.id);
         authorize();
         const item = await sendImageMessage(body.id, body, access.steamAccountId, authorize);
         jsonResponse(res, 200, { ok: true, item });
@@ -1613,7 +1926,16 @@ function createChatService(options: ChatServiceOptions = {}) {
     const reply = (message: UnknownRecord) => {
       if (sessionManager && message.type !== 'error') {
         if (!liveWsSession(ws)) return;
-        if (responseAccount) historyAccount(wsAccessContext(ws, false), responseAccount);
+        if (responseAccount) {
+          const access = wsAccessContext(ws, false);
+          historyAccount(access, responseAccount);
+          if (typeof payload.id === 'string') requirePeer(access, payload.id);
+          if (Array.isArray(message.items)) message.items = filterPeers(access, message.items as HistoryItem[]);
+          if (Array.isArray(message.conversations)) message.conversations = filterPeers(access, message.conversations as ConversationSummary[]);
+          if (Array.isArray(message.friends)) message.friends = filterPeers(access, message.friends as FriendSummary[]);
+          if (Array.isArray(message.groups) && access.grant?.scope === 'some') message.groups = [];
+          if (message.type === 'conversations_page') message.nextCursor = sealConversationCursor(access, message.nextCursor);
+        }
       }
       sendWs(ws, requestId ? { requestId, ...message } : message);
     };
@@ -1623,25 +1945,43 @@ function createChatService(options: ChatServiceOptions = {}) {
         reply({ type: 'pong' });
         return;
       }
+      if (type === 'get_steam_status' || type === 'steam_status') {
+        const session = liveWsSession(ws);
+        reply({ type: 'steam_status', ...steamStatusForSession(session),
+          permissions: session && authStore ? authStore.effectivePermissions(session.user) : [],
+          permissionDetails: session && authStore ? authStore.permissionDetails(session.user.id) : [] });
+        return;
+      }
       if (sessionManager) responseAccount = wsAccessContext(ws, false).steamAccountId;
       if (type === 'send_message' || type === 'msg') {
         const access = wsAccessContext(ws, true);
+        const text = payload.msg || payload.message || '';
+        const level = requiresFullLevel(text) ? 'full' : 'chat';
         checkAccountPrecondition(access, payload.steamAccountId);
-        const item = await sendTextMessage(payload.id, payload.msg || payload.message || '', access.steamAccountId,
-          () => {
-            if (payload.steamAccountId !== undefined) checkAccountPrecondition(wsAccessContext(ws, true), payload.steamAccountId);
-            if (sessionManager) historyAccount(wsAccessContext(ws, true), access.steamAccountId);
-          });
+        requireLevel(access, level);
+        requirePeer(access, payload.id);
+        const item = await sendTextMessage(payload.id, text, access.steamAccountId, (required = level) => {
+          const current = wsAccessContext(ws, true);
+          requireLevel(current, required);
+          requirePeer(current, payload.id);
+          checkAccountPrecondition(current, payload.steamAccountId);
+          if (sessionManager) historyAccount(current, access.steamAccountId);
+        });
         reply({ type: 'message_sent', item });
         return;
       }
       if (type === 'send_image' || type === 'img') {
         const access = wsAccessContext(ws, true);
+        requireLevel(access, 'full');
+        requirePeer(access, payload.id);
         checkAccountPrecondition(access, payload.steamAccountId);
         const item = await sendImageMessage(payload.id, payload, access.steamAccountId,
           () => {
-            if (payload.steamAccountId !== undefined) checkAccountPrecondition(wsAccessContext(ws, true), payload.steamAccountId);
-            if (sessionManager) historyAccount(wsAccessContext(ws, true), access.steamAccountId);
+            const current = wsAccessContext(ws, true);
+            requireLevel(current, 'full');
+            requirePeer(current, payload.id);
+            checkAccountPrecondition(current, payload.steamAccountId);
+            if (sessionManager) historyAccount(current, access.steamAccountId);
           });
         reply({ type: 'image_sent', item });
         return;
@@ -1650,10 +1990,10 @@ function createChatService(options: ChatServiceOptions = {}) {
         const access = wsAccessContext(ws, false);
         const isHistory = String(type).includes('history');
         const page = isHistory
-          ? await historyStorage.history(historyQuery(access, payload))
+          ? await storageHistory(access, payload)
           : await historyStorage.conversations({ steamAccountId: historyAccount(access, payload.steamAccountId),
             limit: payload.limit == null ? undefined : Number(payload.limit),
-            before: payload.before == null ? undefined : String(payload.before) });
+            before: openConversationCursor(access, payload.before) });
         reply(String(type).endsWith('_page')
           ? { type: isHistory ? 'history_page' : 'conversations_page', ...page }
           : isHistory ? { type: 'history', items: page.items } : { type: 'conversations', conversations: page.items });
@@ -1661,16 +2001,17 @@ function createChatService(options: ChatServiceOptions = {}) {
       }
       if (type === 'get_history' || type === 'history') {
         const access = wsAccessContext(ws, false);
+        if (payload.id) requirePeer(access, payload.id);
         reply({
           type: 'history',
-          items: await readHistory({
+          items: filterPeers(access, await readHistory({
             logPath,
             id: payload.id,
             limit: payload.limit,
             steamAccountId: access.steamAccountId,
             includeLegacy: access.includeLegacy,
             logger
-          })
+          }))
         });
         return;
       }
@@ -1678,14 +2019,14 @@ function createChatService(options: ChatServiceOptions = {}) {
         const access = wsAccessContext(ws, false);
         reply({
           type: 'conversations',
-          conversations: await buildConversations({
+          conversations: filterPeers(access, await buildConversations({
             logPath,
             limit: payload.limit,
             steamAccountId: access.steamAccountId,
             includeLegacy: access.includeLegacy,
             getUserInfo,
             logger
-          })
+          }))
         });
         return;
       }
@@ -1695,13 +2036,13 @@ function createChatService(options: ChatServiceOptions = {}) {
         return;
       }
       if (type === 'get_friends' || type === 'friends') {
-        wsAccessContext(ws, true);
-        reply({ type: 'friends', friends: await listFriends(steamUser) });
+        const access = wsAccessContext(ws, true);
+        reply({ type: 'friends', friends: filterPeers(access, await listFriends(steamUser)) });
         return;
       }
       if (type === 'get_groups' || type === 'groups') {
-        wsAccessContext(ws, true);
-        reply({ type: 'groups', groups: await listGroups(steamUser) });
+        const access = wsAccessContext(ws, true);
+        reply({ type: 'groups', groups: access.grant?.scope === 'some' ? [] : await listGroups(steamUser) });
         return;
       }
       reply({ type: 'error', error: `Unsupported WebSocket type: ${type || 'unknown'}` });
@@ -1781,12 +2122,7 @@ function createChatService(options: ChatServiceOptions = {}) {
 
   const disposeStorageMessages = historyStorage?.onMessage((item) => {
     for (const ws of clients) {
-      if (sessionManager && authStore) {
-        const session = liveWsSession(ws);
-        if (!session) continue;
-        const account = authStore.listSteamAccountsForUser(session.user.id).find((account) => account.steamId === item.steamAccountId);
-        if (!account || !authStore.canAccessSteamAccount(session.user.id, account.id)) continue;
-      }
+      if (!canWsReceive(ws, item)) continue;
       sendWs(ws, { type: 'message', ...item });
     }
   });
@@ -1795,10 +2131,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     // Sync is session-only even when the service also supports legacy Web access.
     if (!sessionManager || !authStore) return;
     for (const ws of clients) {
-      const session = liveWsSession(ws);
-      const active = authStore.getActiveSteamAccount(false);
-      if (!session || !active || active.steamId !== item.steamAccountId ||
-          !authStore.canAccessSteamAccount(session.user.id, active.id)) continue;
+      if (!canWsReceive(ws, item)) continue;
       sendWs(ws, { type: 'sync_available', steamAccountId: item.steamAccountId });
     }
   });
