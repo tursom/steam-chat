@@ -23,6 +23,27 @@ function fails(statusCode: number, code?: string) {
   return (error: { statusCode?: number; code?: string }) => error.statusCode === statusCode && (!code || error.code === code);
 }
 
+test('delegated Steam grants cannot widen peers or expiry, including self grants and onward delegation', (t: TestContext) => {
+  const { store, admin, user } = fixture(t);
+  const target = store.createUser({ username: 'delegate', password: 'password123' }, admin.id);
+  const account = store.upsertSteamAccount({ steamId: '76561198000000000' });
+  const peer = '76561198040000001';
+  const expiresAt = new Date(Date.now() + 86400000).toISOString();
+  store.setPermissionOverrides(user.id, [{ permission: 'steam.grant.manage', effect: 'grant' }], admin.id);
+  const limited = { steamAccountId: account.id, level: 'chat', scope: 'some', peers: [peer], expiresAt };
+  store.replaceUserSteamGrants(user.id, [limited], admin.id);
+  for (const recipient of [user.id, target.id]) {
+    assert.throws(() => store.replaceUserSteamGrants(recipient, [{ ...limited, scope: 'all', peers: [] }], user.id), fails(403));
+    assert.throws(() => store.replaceUserSteamGrants(recipient, [{ ...limited, peers: [peer, '76561198040000002'] }], user.id), fails(403));
+    assert.throws(() => store.replaceUserSteamGrants(recipient, [{ ...limited, expiresAt: null }], user.id), fails(403));
+    assert.throws(() => store.replaceUserSteamGrants(recipient, [{ ...limited, expiresAt: new Date(Date.now() + 2 * 86400000).toISOString() }], user.id), fails(403));
+  }
+  store.replaceUserSteamGrants(target.id, [{ ...limited, level: 'read' }], user.id);
+  assert.deepEqual([...store.getSteamGrant(target.id, account.id).peers], [peer]);
+  assert.equal(store.getSteamGrant(target.id, account.id).expiresAt, expiresAt);
+  assert.deepEqual([...store.getSteamGrant(user.id, account.id).peers], [peer]);
+});
+
 function request(cookie: string): IncomingMessage {
   return { headers: { cookie: cookie.split(';')[0] }, socket: {} } as IncomingMessage;
 }

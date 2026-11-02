@@ -1337,7 +1337,15 @@ function createAuthStore(options: AuthStoreOptions = {}) {
       if (actor.roleId !== 'super') {
         const own = getSteamGrant(actor.id, grant.steamAccountId);
         // account.all grants full authority even when chat.use is not enabled.
-        if (!hasPermission(actor.id, 'steam.account.all') && !levelAtLeast(own, grant.level)) throw httpError(403, 'Cannot assign a higher Steam grant than your own');
+        if (!hasPermission(actor.id, 'steam.account.all')) {
+          if (!levelAtLeast(own, grant.level)) throw httpError(403, 'Cannot assign a higher Steam grant than your own');
+          if (own!.scope === 'some' && (grant.scope !== 'some' || grant.peers.some(peer => !own!.peers.has(peer)))) {
+            throw httpError(403, '授权的好友范围不能超出你自己的授权范围');
+          }
+          if (own!.expiresAt && (!grant.expiresAt || Date.parse(grant.expiresAt) > Date.parse(own!.expiresAt))) {
+            throw httpError(403, '授权有效期不能超过你自己的授权有效期');
+          }
+        }
       }
     }
     return transaction(() => {
