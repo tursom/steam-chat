@@ -40,4 +40,4 @@ NODE_PATH=<含 Playwright 的 node_modules> node test/browser/web-redesign.cjs
 
 浏览器回归使用模拟 API/WS，验证三种权限身份、403 授权刷新、控制台与草稿、快捷键、主题以及 390/960/1440 宽度。Lighthouse 的可访问性检查同样使用本地模拟数据，不能代替真实内容和辅助设备的人工检查。
 
-本次验证结果：`npm run typecheck` 通过；`npm test` 513/513 通过；14 个浏览器脚本全部通过，其中新增改版回归 23/23 通过。休眠恢复脚本使用真实本地 HTTP、WebSocket、JSONL 和 RocksDB，验证桌面/手机 622 条离线增量、分页重试、账户隔离、阅读位置、视频 iframe 与日期窗口保留。七个主页面的 Lighthouse 可访问性评分均为 100，未报告失败项。构建目录不含三个原型目录，前端不再使用 `role === 'admin'` 或原生 `prompt/confirm`。
+本次验证结果：`npm run typecheck` 通过；从 Git 导出的已提交版本独立运行 `npm test`，502/502 通过；与工作区原有存储改动一起运行时，513/513 通过。14 个浏览器脚本全部通过，其中新增改版回归 23/23 通过。休眠恢复脚本使用真实本地 HTTP、WebSocket、JSONL 和 RocksDB，验证桌面/手机 622 条离线增量、分页重试、账户隔离、阅读位置、视频 iframe 与日期窗口保留。七个主页面的 Lighthouse 可访问性评分均为 100，未报告失败项。构建目录不含三个原型目录，前端不再使用 `role === 'admin'` 或原生 `prompt/confirm`。
