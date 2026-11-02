@@ -1,12 +1,13 @@
 'use strict';
 
 import type { IncomingMessage } from 'node:http';
-import type { PublicUser, PublicUserSession } from './store';
+import type { PublicUser, PublicUserSession, UserPermission } from './store';
 import { isRecord } from '../types';
 
 const crypto = require('node:crypto');
 
 type AuthStoreLike = {
+  hasPermission: (user: PublicUser, permission: UserPermission) => boolean;
   createSession: (userId: unknown, input: { expiresAt: string; ip?: string | null; userAgent?: string | null }) => PublicUserSession;
   getOrCreateSessionSecret: () => string;
   getUserById: (id: unknown) => (PublicUser & { passwordHash?: string }) | null;
@@ -18,7 +19,7 @@ type AuthStoreLike = {
 type SessionPayload = {
   sid: string;
   uid: number;
-  role: 'admin' | 'user';
+  role?: 'admin' | 'user';
   sv: number;
   iat: number;
   exp: number;
@@ -134,7 +135,6 @@ function createSessionManager(options: SessionManagerOptions) {
       const payload: SessionPayload = {
         sid: typeof parsed.sid === 'string' ? parsed.sid : '',
         uid: Number(parsed.uid || 0),
-        role: parsed.role === 'admin' ? 'admin' : 'user',
         sv: Number(parsed.sv || 0),
         iat: Number(parsed.iat || 0),
         exp: Number(parsed.exp || 0)
@@ -151,7 +151,7 @@ function createSessionManager(options: SessionManagerOptions) {
     const payload = decode(raw);
     if (!payload || payload.exp <= Date.now()) return null;
     const user = store.getUserById(payload.uid);
-    if (!user || user.disabled || user.sessionVersion !== payload.sv || user.role !== payload.role) return null;
+    if (!user || user.disabled || user.sessionVersion !== payload.sv) return null;
     const session = store.touchSession(payload.sid, user.id, requestContext(req, getRequestClientIp));
     if (!session) return null;
     return { payload, sessionId: session.id, user: userToPublic(user) };
@@ -167,7 +167,6 @@ function createSessionManager(options: SessionManagerOptions) {
     const payload: SessionPayload = {
       sid: session.id,
       uid: user.id,
-      role: user.role,
       sv: user.sessionVersion,
       iat,
       exp
@@ -203,9 +202,9 @@ function createSessionManager(options: SessionManagerOptions) {
     return session;
   }
 
-  function requireAdmin(req: IncomingMessage): AppSession {
+  function requirePermission(req: IncomingMessage, permission: UserPermission): AppSession {
     const session = requireSession(req);
-    if (session.user.role !== 'admin') throw Object.assign(new Error('Forbidden'), { statusCode: 403 });
+    if (!store.hasPermission(session.user, permission)) throw Object.assign(new Error('Forbidden'), { statusCode: 403 });
     return session;
   }
 
@@ -217,7 +216,7 @@ function createSessionManager(options: SessionManagerOptions) {
     encode,
     getSession,
     maxAgeMs,
-    requireAdmin,
+    requirePermission,
     requireSession,
     revokeCurrentSession,
     revokeUserSessions

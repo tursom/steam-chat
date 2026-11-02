@@ -41,8 +41,8 @@ test('auth setup creates the first admin once and login rejects bad or disabled 
 
   assert.equal(store.authenticate('admin', 'wrong'), null);
   assert.equal(store.authenticate('admin', 'password123').username, 'admin');
-  const user = store.createUser({ username: 'worker', password: 'password123', role: 'user' });
-  store.updateUser(user.id, { disabled: true });
+  const user = store.createUser({ username: 'worker', password: 'password123', role: 'user' }, admin.id);
+  store.updateUser(user.id, { disabled: true }, admin.id);
   assert.equal(store.authenticate('worker', 'password123'), null);
 });
 
@@ -60,7 +60,7 @@ test('session cookies reject tampering, expiry, and stale session_version', (t: 
   const expired = cookiePair(expiredSessions.createSetCookie(admin));
   assert.equal(expiredSessions.getSession(requestWithCookie(expired)), null);
 
-  store.setPassword(admin.id, 'password456');
+  store.setPassword(admin.id, 'password456', { actorId: admin.id });
   assert.equal(sessions.getSession(requestWithCookie(cookie)), null);
 });
 
@@ -68,15 +68,15 @@ test('user management protects the current user and the last enabled admin', (t:
   const store = createAuthStore({ dbPath: tempDbPath() });
   t.after(() => store.close());
   const admin = store.createInitialAdmin({ username: 'admin', password: 'password123' });
-  const user = store.createUser({ username: 'worker', password: 'password123', role: 'user' });
+  const user = store.createUser({ username: 'worker', password: 'password123', role: 'user' }, admin.id);
 
-  assert.throws(() => store.updateUser(admin.id, { role: 'user' }), /last enabled admin/);
-  assert.throws(() => store.updateUser(admin.id, { disabled: true }), /last enabled admin/);
-  assert.throws(() => store.deleteUser(admin.id, user.id), /last enabled admin/);
+  assert.throws(() => store.updateUser(admin.id, { role: 'user' }, admin.id), (error: { code?: string }) => error.code === 'self_escalation');
+  assert.throws(() => store.updateUser(admin.id, { disabled: true }, admin.id), /last enabled admin/);
+  assert.throws(() => store.deleteUser(admin.id, user.id), /Forbidden/);
   assert.throws(() => store.deleteUser(admin.id, admin.id), /current user/);
 
-  const admin2 = store.createUser({ username: 'admin2', password: 'password123', role: 'admin' });
-  store.updateUser(admin.id, { role: 'user' });
+  const admin2 = store.createUser({ username: 'admin2', password: 'password123', role: 'admin' }, admin.id);
+  store.updateUser(admin.id, { role: 'user' }, admin2.id);
   assert.equal(store.getUserById(admin.id).role, 'user');
   store.deleteUser(admin.id, admin2.id);
   assert.equal(store.getUserById(admin.id), null);
@@ -106,7 +106,7 @@ test('enhanced users support profile fields, permissions, login locking, session
   assert.equal(store.listUsers({ status: 'locked' })[0].username, 'worker');
   assert.throws(() => store.authenticate('worker', 'password123'), /temporarily locked/);
 
-  store.setPassword(user.id, 'password456', { forcePasswordChange: true });
+  store.setPassword(user.id, 'password456', { forcePasswordChange: true, actorId: admin.id });
   const updated = store.getUserById(user.id);
   assert.equal(updated.forcePasswordChange, true);
 
@@ -135,7 +135,7 @@ test('steam accounts keep refresh tokens private and enforce explicit user grant
   const store = createAuthStore({ dbPath: tempDbPath() });
   t.after(() => store.close());
   const admin = store.createInitialAdmin({ username: 'admin', password: 'password123' });
-  const user = store.createUser({ username: 'worker', password: 'password123', role: 'user' });
+  const user = store.createUser({ username: 'worker', password: 'password123', role: 'user' }, admin.id);
   const account = store.upsertSteamAccount({
     steamId: '76561198000000000',
     label: 'Support',
