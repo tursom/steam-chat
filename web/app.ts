@@ -1,17 +1,23 @@
 type Role = 'admin' | 'user';
-type View = 'steam' | 'chat' | 'users' | 'steamAccounts' | 'audit' | 'account' | 'imageEmotes';
+type View = 'chat' | 'accounts' | 'users' | 'roles' | 'audit' | 'settings' | 'emotes';
 type Tone = 'muted' | 'ok' | 'warn' | 'error';
-type ChatListTab = 'recent' | 'friends' | 'groups';
+type ChatListTab = 'recent' | 'unread' | 'friends' | 'groups';
 type ChatPanel = 'list' | 'thread';
 type ChatIconName = 'arrow-left' | 'image' | 'link' | 'paperclip' | 'plus' | 'search' | 'send' | 'smile' | 'x'
-  | 'panel-right' | 'panel-left-close' | 'panel-left-open' | 'messages-square' | 'gamepad-2' | 'users' | 'settings-2' | 'shield' | 'scroll-text' | 'log-out' | 'external-link' | 'copy';
+  | 'panel-right' | 'panel-left-close' | 'panel-left-open' | 'messages-square' | 'gamepad-2' | 'users' | 'settings-2' | 'shield' | 'scroll-text' | 'log-out' | 'external-link' | 'copy'
+  | 'clock' | 'circle-alert' | 'circle-help' | 'refresh-cw';
 type Permission =
+  | 'user.view'
   | 'user.manage'
+  | 'role.manage'
   | 'session.manage'
   | 'audit.view'
   | 'steam.manage'
   | 'steam.account.manage'
+  | 'steam.grant.manage'
+  | 'steam.account.all'
   | 'chat.use'
+  | 'emote.manage'
   | 'self.password.change';
 
 type User = {
@@ -20,6 +26,10 @@ type User = {
   displayName: string;
   note: string;
   role: Role;
+  roleId?: string;
+  roleName?: string;
+  overrideCount?: number;
+  steamGrantSummary?: Array<{ steamAccountId: number; level: string; scope: string; peerCount: number; expiresAt: string | null }>;
   disabled: boolean;
   forcePasswordChange: boolean;
   sessionVersion: number;
@@ -82,6 +92,8 @@ type SteamStatus = {
   steamId: string | null;
   activeAccount?: Pick<SteamAccount, 'id' | 'steamId' | 'label'> | null;
   accessAllowed?: boolean;
+  accessRevision?: string;
+  steamGrant?: { level: 'read' | 'chat' | 'full'; scope: 'all' | 'some'; peerCount?: number; peers?: string[]; expiresAt?: string | null; via?: string } | null;
   qrLogin?: { imageDataUrl: string | null; scanned: boolean; expiresAt: number } | null;
 };
 
@@ -89,6 +101,7 @@ type MeResponse = {
   needsSetup: boolean;
   user: User | null;
   permissions: Permission[];
+  permissionDetails?: Array<{ permission: Permission; effective: boolean; source: string }>;
   steam: SteamStatus;
   config?: { wsPath?: string; sendOperations?: boolean; imageOperationUpload?: boolean };
 };
@@ -148,6 +161,7 @@ let imageEmoteLoading = false;
 let imageEmoteBusy = false;
 let imageEmoteError = '';
 let imageEmoteGroup = '';
+let imageEmoteMobileDetail = false;
 let customImageEmoteGroup = '';
 const emoteFileUrl = (id: string) => `/api/image-emotes/file/${encodeURIComponent(id)}`;
 
@@ -172,6 +186,8 @@ type AppState = {
   me: User | null;
   needsSetup: boolean;
   permissions: Permission[];
+  permissionDetails: Array<{ permission: Permission; effective: boolean; source: string }>;
+  unreadCounts: Record<string, number>;
   steam: SteamStatus;
   view: View;
   users: User[];
@@ -229,6 +245,8 @@ const state: AppState = {
   me: null,
   needsSetup: false,
   permissions: [],
+  permissionDetails: [],
+  unreadCounts: {},
   steam: defaultSteamStatus,
   view: normalizeView(localStorage.getItem('steam-chat.view')),
   users: [],
@@ -244,7 +262,7 @@ const state: AppState = {
   effects: [],
   activeId: localStorage.getItem('steam-chat.target') || '',
   activeName: '',
-  chatListTab: 'recent',
+  chatListTab: (['recent', 'unread', 'friends', 'groups'].includes(localStorage.getItem('steam-chat.list-tab') || '') ? localStorage.getItem('steam-chat.list-tab') : 'recent') as ChatListTab,
   chatQuery: '',
   chatPanel: 'list',
   friendDetailsOpen: false,
@@ -266,7 +284,7 @@ const state: AppState = {
 };
 
 type OutgoingState = 'sending' | 'sent' | 'failed' | 'unknown';
-type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string };
+type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string; retryText?: string };
 type ImageOperation = { id: string; peerId: string; steamAccountId: string; state: string; version: number;
   attempts: number; maxAttempts: number; nextRetryAt: number; phase: string; error?: string; retryable: boolean; hasImage: boolean; item?: MessageItem; cooldownUntil?: number; replacementId?: string };
 type ImageOperationEntry = OutgoingMessage & { operation?: ImageOperation; imagePayload?: Record<string, string>; transfer?: ImageTransfer;
@@ -319,7 +337,8 @@ let historyFromCache = false;
 
 function cacheScope() {
   const account = state.steam.activeAccount?.steamId || state.steam.steamId;
-  return state.me && account && steamAccessAllowed() ? `${state.me.id}:${state.me.sessionVersion || 0}:${account}` : '';
+  if (state.steam.steamGrant?.scope === 'some' && !state.steam.accessRevision) return '';
+  return state.me && account && steamAccessAllowed() ? `${state.me.id}:${state.me.sessionVersion || 0}:${account}${state.steam.accessRevision ? `:${state.steam.accessRevision}` : ''}` : '';
 }
 
 function openChatCache(): Promise<IDBDatabase | null> {
@@ -438,7 +457,7 @@ async function restoreChatCache() {
       top: typeof entry.top === 'number' ? entry.top : 0, following: entry.following === true, savedAt: entry.savedAt, rebase: true });
   }
   updateChatLists();
-  if (!historyLoaded && !historyItems.length && state.view === 'chat') restoreThread();
+  if (!historyLoaded && !historyItems.length && document.querySelector('#chatLayout')) restoreThread();
 }
 
 function chatContext() {
@@ -539,8 +558,8 @@ function clampLimit(value: unknown): number {
 }
 
 function normalizeView(value: unknown): View {
-  const view = String(value || '');
-  return view === 'steam' || view === 'chat' || view === 'users' || view === 'steamAccounts' || view === 'audit' || view === 'account' || view === 'imageEmotes' ? view : 'chat';
+  const view = ({ steam: 'accounts', steamAccounts: 'accounts', account: 'settings', imageEmotes: 'emotes' } as Record<string, string>)[String(value)] || String(value || '');
+  return ['chat', 'accounts', 'users', 'roles', 'audit', 'settings', 'emotes'].includes(view) ? view as View : 'chat';
 }
 
 function asListEntries(value: unknown): ListEntry[] {
@@ -567,7 +586,7 @@ function setFeedback(text: string, tone: Tone = 'muted') {
     else node.textContent = text;
     node.dataset.tone = tone;
     node.setAttribute('aria-live', tone === 'error' ? 'assertive' : 'polite');
-    if (state.view === 'chat') presentChatFeedback(node, tone);
+    presentChatFeedback(node, tone);
   }
 }
 
@@ -603,7 +622,20 @@ function steamOnline() {
 }
 
 function steamAccessAllowed() {
-  return state.steam.accessAllowed !== false;
+  return hasPermission('chat.use') && state.steam.accessAllowed !== false;
+}
+
+function currentSteamGrant() {
+  // Older servers did not send a level; their account grants were always full.
+  return state.steam.steamGrant === undefined && steamAccessAllowed()
+    ? { level: 'full' as const, scope: 'all' as const, peerCount: 0, expiresAt: null }
+    : state.steam.steamGrant;
+}
+
+function grantAtLeast(level: 'read' | 'chat' | 'full') {
+  const grant = currentSteamGrant();
+  return steamAccessAllowed() && !!grant && ['none', 'read', 'chat', 'full'].indexOf(grant.level) >= ['none', 'read', 'chat', 'full'].indexOf(level)
+    && (!grant.expiresAt || Date.parse(grant.expiresAt) > Date.now());
 }
 
 function hasPermission(permission: Permission) {
@@ -641,7 +673,9 @@ function steamStatusSignature(status = state.steam) {
     status.error || '',
     status.steamId || '',
     status.activeAccount?.id || '',
-    status.accessAllowed
+    status.accessAllowed,
+    status.accessRevision,
+    JSON.stringify(status.steamGrant)
   ].join('|');
 }
 
@@ -650,11 +684,13 @@ function updateSteamStatus(status: SteamStatus) {
   const previousLoginMode = steamLoginMode();
   const wasOnline = steamOnline();
   const previousAccess = steamAccessAllowed();
+  const previousGrant = JSON.stringify([state.steam.steamGrant, state.steam.accessRevision]);
   const previousAccount = `${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}`;
   state.steam = { ...defaultSteamStatus, ...status };
   if (steamOnline() || state.steam.status === 'waiting_qr') steamQrError = '';
   const accountChanged = previousAccount !== `${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}`;
-  if (accountChanged || !steamAccessAllowed()) {
+  const grantChanged = previousGrant !== JSON.stringify([state.steam.steamGrant, state.steam.accessRevision]);
+  if (accountChanged || !steamAccessAllowed() || grantChanged) {
     invalidateChat(previousAccount !== '|' || !steamAccessAllowed());
     stopWebSocket();
     state.activeName = '';
@@ -685,15 +721,20 @@ function updateSteamStatus(status: SteamStatus) {
     syncFriendDetails();
   }
   updateChatAvailability();
-  if ((accountChanged || previousAccess !== steamAccessAllowed()) && state.me && state.view === 'chat' && document.querySelector('#chatLayout')) {
+  updateChatScopeNote();
+  if (grantChanged) {
+    updateChatTabs(); refreshReactionBars();
+    if (document.querySelector('#chatLayout')) void refreshChatData();
+  }
+  if ((accountChanged || previousAccess !== steamAccessAllowed()) && state.me && document.querySelector('#chatLayout')) {
     updateChatLists();
     void loadHistory();
     ensureWebSocket();
   }
-  if ((accountChanged || previousAccess !== steamAccessAllowed()) && state.sendOperations && state.me && steamAccessAllowed()) restoreImageOperations();
+  if ((accountChanged || grantChanged || previousAccess !== steamAccessAllowed()) && state.sendOperations && state.me && grantAtLeast('full')) restoreImageOperations();
   const steamView = document.querySelector<HTMLElement>('#steamConnectionView');
   if (steamView && (previousLoginMode !== steamLoginMode()
-    || (state.me?.role !== 'admin' && previousSignature !== steamStatusSignature()))) steamView.replaceWith(renderSteamView());
+    || (!hasPermission('steam.manage') && previousSignature !== steamStatusSignature()))) steamView.replaceWith(renderSteamView());
   const summaryStatus = document.querySelector<HTMLElement>('#steamSummaryStatus');
   if (summaryStatus) summaryStatus.textContent = steamLabel();
   const summaryDetail = document.querySelector<HTMLElement>('#steamSummaryDetail');
@@ -716,6 +757,10 @@ async function api(path: string, options: RequestInit = {}, onUploadProgress?: (
       : await fetch(path, { ...options, headers, credentials: 'same-origin' });
     const payload: unknown = await response.json().catch((): null => null);
     if (!response.ok) {
+      if (response.status === 403 && isRecord(payload) && ['steam_grant_insufficient', 'steam_peer_out_of_scope'].includes(String(payload.code))) {
+        if (!authorizationRefresh) await refreshMyAuthorization();
+        setFeedback(typeof payload.error === 'string' ? payload.error : 'Steam 授权已调整，请联系管理员。', 'error');
+      }
       if (context === chatContext() && response.status === 401 && !path.startsWith('/api/auth/me') && !path.startsWith('/api/auth/login')) {
         stopWebSocket();
         state.me = null;
@@ -723,7 +768,7 @@ async function api(path: string, options: RequestInit = {}, onUploadProgress?: (
         state.needsSetup = false;
         renderLogin();
       }
-      if (context === chatContext() && response.status === 403 && /^\/api\/(history|conversations|messages\/sync)(?:\?|$)/.test(path)) {
+      if (context === chatContext() && response.status === 403 && !(isRecord(payload) && ['steam_grant_insufficient', 'steam_peer_out_of_scope'].includes(String(payload.code))) && /^\/api\/(history|conversations|messages\/sync)(?:\?|$)/.test(path)) {
         invalidateChat();
         state.conversations = []; state.friends = []; state.groups = [];
         state.steam.accessAllowed = false;
@@ -775,9 +820,10 @@ function authPage(title: string, subtitle: string, form: HTMLElement, purgePersi
   stopStatusPolling();
   stopWebSocket();
   clear(root);
-  const page = create('main', 'auth-page');
+  const page = create('section', 'auth-page');
   const panel = create('section', 'auth-panel');
-  panel.append(create('h1', '', title), create('p', 'muted', subtitle), form);
+  const logo = create('div', 'auth-logo'); logo.append(chatIcon('messages-square'));
+  panel.append(logo, create('h1', '', title), create('p', 'muted', subtitle), form);
   page.append(panel);
   root.append(page);
 }
@@ -786,16 +832,20 @@ function renderSetup() {
   const form = create('form', 'stack-form') as HTMLFormElement;
   form.innerHTML = `
     <label>管理员账号<input name="username" autocomplete="username" minlength="3" maxlength="64" required></label>
+    <label>昵称<input name="displayName" autocomplete="nickname" maxlength="80" required></label>
     <label>后台密码<input name="password" type="password" autocomplete="new-password" minlength="8" required></label>
-    <button type="submit">初始化后台</button>
+    <label>确认密码<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required></label>
+    <button type="submit">创建管理员</button>
     <p class="form-error" id="setupError"></p>
   `;
   form.addEventListener('submit', async (event) => {
     event.preventDefault();
     const errorNode = form.querySelector<HTMLElement>('#setupError');
     try {
+      if (formValue(form, 'password') !== formValue(form, 'confirmPassword')) throw new Error('两次输入的密码不一致');
       await api('/api/auth/setup', jsonBody({
         username: formValue(form, 'username'),
+        displayName: formValue(form, 'displayName'),
         password: formValue(form, 'password')
       }));
       await bootstrap();
@@ -803,7 +853,7 @@ function renderSetup() {
       if (errorNode) errorNode.textContent = errorMessage(error);
     }
   });
-  authPage('初始化 Steam Chat 后台', '创建第一个管理员后，再进入工作台连接 Steam。', form);
+  authPage('创建管理员', '这个账号将成为超级管理员，拥有全部权限。', form);
 }
 
 function renderLogin() {
@@ -811,7 +861,7 @@ function renderLogin() {
   form.innerHTML = `
     <label>账号<input name="username" autocomplete="username" required></label>
     <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
-    <button type="submit">登录后台</button>
+    <button type="submit">登录</button>
     <p class="form-error" id="loginError"></p>
   `;
   form.addEventListener('submit', async (event) => {
@@ -827,17 +877,29 @@ function renderLogin() {
       if (errorNode) errorNode.textContent = errorMessage(error);
     }
   });
-  authPage('Steam Chat 后台登录', '登录后可使用已连接的 Steam 会话聊天，管理员可管理用户和 Steam 登录。', form);
+  authPage('登录 Steam Chat', '登录后继续你的 Steam 会话。', form);
+}
+
+function renderForcedPassword() {
+  const form = create('form', 'stack-form');
+  form.innerHTML = '<label>当前密码<input name="oldPassword" type="password" autocomplete="current-password" required></label><label>新密码<input name="newPassword" type="password" autocomplete="new-password" minlength="8" required></label><label>确认新密码<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required></label><p class="form-error" role="alert"></p><button type="submit">设置新密码</button>';
+  form.addEventListener('submit', async event => {
+    event.preventDefault();
+    try {
+      if (formValue(form, 'newPassword') !== formValue(form, 'confirmPassword')) throw new Error('两次输入的密码不一致');
+      await api('/api/auth/password', jsonBody({ oldPassword: formValue(form, 'oldPassword'), newPassword: formValue(form, 'newPassword') }));
+      await bootstrap();
+    } catch (error) { form.querySelector('.form-error')!.textContent = errorMessage(error); }
+  });
+  authPage('设置新密码', '为保障账号安全，请修改密码后继续。', form, false);
 }
 
 function navButton(view: View, label: string) {
-  const icons: Record<View, ChatIconName> = { steam: 'gamepad-2', chat: 'messages-square', users: 'users', steamAccounts: 'shield', audit: 'scroll-text', account: 'settings-2', imageEmotes: 'image' };
+  const icons: Record<View, ChatIconName> = { accounts: 'gamepad-2', chat: 'messages-square', users: 'users', roles: 'shield', audit: 'scroll-text', settings: 'settings-2', emotes: 'image' };
   const button = chatIconButton(icons[view], label, state.view === view ? 'is-active' : '');
   button.append(create('span', 'nav-label', label));
   button.addEventListener('click', () => {
-    state.view = view;
-    localStorage.setItem('steam-chat.view', view);
-    renderShell();
+    openConsole(view);
   });
   return button;
 }
@@ -855,87 +917,35 @@ function renderShell() {
     renderLogin();
     return;
   }
-  if (state.me.role !== 'admin' && ['users', 'steamAccounts', 'audit', 'imageEmotes'].includes(state.view)) state.view = 'steam';
+  if (state.me.forcePasswordChange) { renderForcedPassword(); return; }
+  if (!canOpenView(state.view)) state.view = 'chat';
   clear(root);
-  const shell = create('div', `admin-shell${state.view === 'chat' ? ' is-chat' : ''}`);
-  const sidebar = create('aside', 'admin-sidebar');
-  const brand = create('div', 'brand');
-  brand.title = `Steam Chat · ${state.me.username}`;
-  brand.append(chatIcon('gamepad-2'), create('strong', '', 'Steam Chat'), create('span', '', state.me.username));
-  const nav = create('nav');
-  nav.append(navButton('steam', 'Steam 连接'), navButton('chat', '聊天'));
-  if (hasPermission('user.manage')) nav.append(navButton('users', '用户管理'));
-  if (hasPermission('steam.account.manage')) nav.append(navButton('steamAccounts', 'Steam 账户'));
-  if (hasPermission('audit.view')) nav.append(navButton('audit', '审计日志'));
-  if (state.me.role === 'admin') nav.append(navButton('imageEmotes', '图片表情'));
-  nav.append(navButton('account', '设置'));
-  sidebar.append(brand, nav);
-  if (state.view === 'chat') {
-    const railLogout = chatIconButton('log-out', '退出后台', 'rail-logout');
-    railLogout.addEventListener('click', () => logoutApp());
-    sidebar.append(railLogout);
-  }
-
-  const main = create('main', 'workspace');
-  const top = create('header', 'topbar');
-  const title = create('div');
-  const heading = create('h1', '', pageTitle());
-  const subtitle = create('p', 'muted', pageSubtitle());
-  subtitle.id = 'pageSubtitle';
-  title.append(heading, subtitle);
-  const status = create('div', 'top-actions');
-  const badge = create('span', 'steam-badge', steamLabel());
-  badge.id = 'steamBadge';
-  badge.dataset.status = state.steam.status;
-  const hint = create('span', 'top-hint', state.steam.error || (state.steam.steamId ? `SteamID ${state.steam.steamId}` : '后台服务已启动'));
-  hint.id = 'steamHint';
-  const logout = create('button', 'ghost-btn', '退出后台');
-  logout.type = 'button';
-  logout.addEventListener('click', () => logoutApp());
-  status.append(badge, hint, logout);
-  top.append(title, status);
-  const content = create('section', `content${state.view === 'chat' ? ' chat-content' : ''}`);
-  content.append(renderCurrentView());
-  const feedback = create('div', `feedback${state.view === 'chat' ? ' chat-toast' : ''}`);
+  root.append(renderChatView());
+  const feedback = create('div', 'feedback chat-toast toast');
   feedback.id = 'feedback';
   feedback.dataset.tone = state.feedbackTone;
+  feedback.setAttribute('role', 'status');
   feedback.setAttribute('aria-live', state.feedbackTone === 'error' ? 'assertive' : 'polite');
   const feedbackText = create('span', '', state.feedback);
   feedbackText.id = 'feedbackText';
   feedback.append(feedbackText);
-  if (state.view === 'chat') {
-    const dismiss = chatIconButton('x', '关闭提示', 'toast-close');
-    dismiss.addEventListener('click', () => dismissChatFeedback(feedback));
-    feedback.append(dismiss);
-    feedback.hidden = state.feedbackTone === 'muted';
-  }
-  main.append(top, content, feedback);
-  shell.append(sidebar, main);
-  root.append(shell);
+  const dismiss = chatIconButton('x', '关闭提示', 'toast-close');
+  dismiss.addEventListener('click', () => dismissChatFeedback(feedback));
+  feedback.append(dismiss);
+  feedback.hidden = state.feedbackTone === 'muted';
+  root.append(feedback);
   syncSteamLoginUi();
-  if (state.view === 'chat') {
-    void refreshChatData(Boolean(durableSyncCursor));
-    requestDurableSync();
-  }
-  if (state.view === 'imageEmotes') void loadImageEmotes();
-  if (state.view === 'users' && hasPermission('user.manage')) {
-    void loadSteamAccounts();
-    void loadUsers();
-  }
-  if (state.view === 'steamAccounts') void loadSteamAccounts();
-  if (state.view === 'audit') void loadAuditLogs();
+  void refreshChatData();
+  if (state.activeId) void loadHistory();
+  requestDurableSync();
+  if (state.view !== 'chat') renderConsole(state.view);
+  if (state.view === 'chat' && hasPermission('steam.manage')) void loadSteamAccounts();
   ensureWebSocket();
   startStatusPolling();
 }
 
 function pageTitle() {
-  if (state.view === 'chat') return '聊天';
-  if (state.view === 'users') return '用户管理';
-  if (state.view === 'steamAccounts') return 'Steam 账户';
-  if (state.view === 'audit') return '审计日志';
-  if (state.view === 'imageEmotes') return '图片表情';
-  if (state.view === 'account') return '设置';
-  return 'Steam 连接';
+  return consolePages.find(([view]) => view === state.view)?.[1] || '聊天';
 }
 
 function pageSubtitle() {
@@ -944,21 +954,247 @@ function pageSubtitle() {
     return steamAccessAllowed() ? '好友、群组、历史和实时消息' : '当前后台用户未被授权访问活动 Steam 账户';
   }
   if (state.view === 'users') return '后台用户、会话、角色、资料和 Steam 授权';
-  if (state.view === 'steamAccounts') return 'Steam 账户资料、连接状态和授权计数';
+  if (state.view === 'accounts') return 'Steam 账户资料、连接状态和授权';
   if (state.view === 'audit') return '关键管理动作和敏感字段脱敏记录';
-  if (state.view === 'imageEmotes') return '管理共享图片表情、分组和素材';
-  if (state.view === 'account') return '管理通知偏好、账号安全和服务配置';
-  return state.me?.role === 'admin' ? '管理员在这里完成 Steam 登录和 Guard 验证' : '等待管理员连接 Steam';
+  if (state.view === 'emotes') return '管理共享图片表情、分组和素材';
+  if (state.view === 'settings') return '通知偏好、我的权限与账号安全';
+  return '角色、权限和个人覆盖';
 }
 
 function renderCurrentView() {
   if (state.view === 'chat') return renderChatView();
-  if (state.view === 'users' && hasPermission('user.manage')) return renderUsersView();
-  if (state.view === 'steamAccounts' && hasPermission('steam.account.manage')) return renderSteamAccountsView();
+  if (state.view === 'users' && hasPermission('user.view')) return renderUsersView();
+  if (state.view === 'accounts') return renderSteamAccountsView();
+  if (state.view === 'roles') return renderRolesView();
   if (state.view === 'audit' && hasPermission('audit.view')) return renderAuditView();
-  if (state.view === 'imageEmotes' && state.me?.role === 'admin') return renderImageEmotesView();
-  if (state.view === 'account') return renderSettingsView();
-  return renderSteamView();
+  if (state.view === 'emotes' && hasPermission('emote.manage')) return renderImageEmotesView();
+  return renderSettingsView();
+}
+
+const consolePages: Array<[View, string]> = [['accounts', 'Steam 账户'], ['users', '用户'], ['roles', '角色与权限'], ['audit', '审计日志'], ['emotes', '图片表情'], ['settings', '设置']];
+let consoleOpener: HTMLElement | null = null;
+let consoleDirty = false;
+let consoleSave: (() => Promise<void>) | undefined;
+let consoleUndo: (() => void) | undefined;
+let consoleFocusDispose: (() => void) | null = null;
+
+function canOpenView(view: View) {
+  if (view === 'accounts') return ['steam.manage', 'steam.account.manage', 'steam.grant.manage'].some(p => hasPermission(p as Permission));
+  if (view === 'users') return hasPermission('user.view');
+  if (view === 'roles') return hasPermission('role.manage') || hasPermission('user.view');
+  if (view === 'audit') return hasPermission('audit.view');
+  if (view === 'emotes') return hasPermission('emote.manage');
+  return true;
+}
+
+function trapDialogFocus(dialog: HTMLElement, onClose: () => void) {
+  const onKey = (event: KeyboardEvent) => {
+    const dialogs = [...document.querySelectorAll<HTMLElement>('[aria-modal="true"]')].filter(node => !node.hidden);
+    if (dialogs.at(-1) !== dialog) return;
+    if (event.key === 'Escape') { event.preventDefault(); event.stopImmediatePropagation(); onClose(); }
+    if (event.key !== 'Tab') return;
+    const items = [...dialog.querySelectorAll<HTMLElement>('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],[tabindex="0"]')]
+      .filter(node => node.getClientRects().length && !node.closest('[hidden]'));
+    if (!items.length) { event.preventDefault(); dialog.focus(); return; }
+    const index = items.indexOf(document.activeElement as HTMLElement);
+    if (event.shiftKey && index <= 0) { event.preventDefault(); items.at(-1)!.focus(); }
+    if (!event.shiftKey && (index === items.length - 1 || index < 0)) { event.preventDefault(); items[0].focus(); }
+  };
+  dialog.tabIndex = -1;
+  document.addEventListener('keydown', onKey, true);
+  queueMicrotask(() => (dialog.querySelector<HTMLElement>('input:not(:disabled),button:not(:disabled)') || dialog).focus());
+  return () => document.removeEventListener('keydown', onKey, true);
+}
+
+function openDialog(title: string, content: HTMLElement, onSave?: () => void | Promise<void>, saveLabel = '保存') {
+  const opener = document.activeElement as HTMLElement | null;
+  const scrim = create('div', 'modal-scrim');
+  const modal = create('section', 'modal');
+  modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true'); modal.setAttribute('aria-label', title);
+  const head = create('header'); head.append(create('h2', '', title));
+  const x = chatIconButton('x', '关闭弹窗'); head.append(x);
+  const body = create('div', 'modal-body'); body.append(content);
+  const foot = create('footer'); const cancel = create('button', 'ghost-btn', onSave ? '取消' : '关闭');
+  const error = create('p', 'form-error'); error.setAttribute('role', 'alert'); body.append(error);
+  let busy = false;
+  const close = () => { if (busy) return; dispose(); scrim.remove(); modal.remove(); if (opener?.isConnected) opener.focus(); };
+  x.addEventListener('click', close); cancel.addEventListener('click', close); scrim.addEventListener('click', close); foot.append(cancel);
+  if (onSave) {
+    const save = create('button', 'primary-btn', saveLabel);
+    const submit = async () => {
+      if (busy) return;
+      const form = content instanceof HTMLFormElement ? content : content.querySelector('form');
+      if (form && !form.reportValidity()) return;
+      busy = true; save.disabled = true; error.textContent = '';
+      try { await onSave(); busy = false; close(); }
+      catch (failure) { error.textContent = errorMessage(failure); }
+      finally { busy = false; save.disabled = false; }
+    };
+    save.addEventListener('click', () => void submit());
+    content.addEventListener('submit', event => { event.preventDefault(); void submit(); }); foot.append(save);
+  }
+  modal.append(head, body, foot); root.append(scrim, modal);
+  const dispose = trapDialogFocus(modal, close);
+  return close;
+}
+
+function confirmDialog(message: string): Promise<boolean> {
+  return new Promise(resolve => {
+    const close = openDialog('确认操作', create('p', '', message), () => { resolve(true); }, '确认');
+    const modal = root.querySelector<HTMLElement>('.modal:last-child')!;
+    const finish = () => resolve(false);
+    modal.querySelector('header button')?.addEventListener('click', finish);
+    modal.querySelector('footer button')?.addEventListener('click', finish);
+    modal.previousElementSibling?.addEventListener('click', finish);
+    const observer = new MutationObserver(() => { if (!modal.isConnected) { observer.disconnect(); resolve(false); } });
+    observer.observe(root, { childList: true });
+    void close;
+  });
+}
+
+function setConsoleDirty(dirty: boolean, onSave?: () => Promise<void>, onUndo?: () => void) {
+  consoleDirty = dirty; consoleSave = onSave; consoleUndo = onUndo;
+  document.querySelector('.savebar')?.remove();
+  if (!dirty) return;
+  const bar = create('div', 'savebar'); bar.append(create('span', '', '有未保存的更改'));
+  const undo = create('button', 'ghost-btn', '撤销');
+  undo.addEventListener('click', () => { const reset = consoleUndo; setConsoleDirty(false); reset?.(); });
+  const save = create('button', 'primary-btn', '保存');
+  save.addEventListener('click', async () => {
+    save.disabled = true;
+    try { await consoleSave?.(); setConsoleDirty(false); setFeedback('已保存，已写入审计日志', 'ok'); }
+    catch (error) { setFeedback(errorMessage(error), 'error'); }
+    finally { save.disabled = false; }
+  });
+  bar.append(undo, save); document.querySelector('.sheet-main')?.append(bar);
+}
+
+async function discardConsoleDraft() {
+  if (!consoleDirty) return true;
+  if (!await confirmDialog('放弃未保存的更改？')) return false;
+  const undo = consoleUndo; setConsoleDirty(false); undo?.(); return true;
+}
+
+async function openConsole(page: View) {
+  if (state.me?.forcePasswordChange) return;
+  if (!canOpenView(page)) page = 'chat';
+  if (!await discardConsoleDraft()) return;
+  if (state.view === 'chat') consoleOpener = document.activeElement as HTMLElement | null;
+  state.view = page; localStorage.setItem('steam-chat.view', page);
+  if (page === 'chat') { closeConsoleElements(); consoleOpener?.focus(); return; }
+  renderConsole(page);
+}
+
+function closeConsoleElements() {
+  consoleFocusDispose?.(); consoleFocusDispose = null;
+  document.querySelector('.sheet')?.remove(); document.querySelector('.sheet-scrim')?.remove();
+}
+
+function renderConsole(page: View) {
+  closeConsoleElements();
+  const scrim = create('div', 'sheet-scrim');
+  const sheet = create('section', 'sheet'); sheet.setAttribute('role', 'dialog'); sheet.setAttribute('aria-modal', 'true'); sheet.setAttribute('aria-label', '控制台');
+  const links = create('nav', 'sheet-links'); links.setAttribute('aria-label', '控制台页面');
+  links.append(create('strong', 'sheet-brand', '控制台'));
+  for (const [view, label] of consolePages) if (canOpenView(view)) links.append(navButton(view, label));
+  const main = create('div', 'sheet-main');
+  const header = create('header', 'sheet-head');
+  const copy = create('div'); copy.append(create('h1', '', pageTitle()), create('p', 'muted', pageSubtitle()));
+  const close = chatIconButton('x', '关闭控制台'); close.addEventListener('click', () => void openConsole('chat'));
+  header.append(copy, close);
+  const content = create('div', 'sheet-content'); content.append(renderCurrentView());
+  main.append(header, content); sheet.append(links, main); root.append(scrim, sheet);
+  scrim.addEventListener('click', () => void openConsole('chat'));
+  consoleFocusDispose = trapDialogFocus(sheet, () => void openConsole('chat'));
+  if (page === 'users') { void loadUsers(); void loadSteamAccounts(); void loadRoles(); }
+  if (page === 'roles') { void loadRoles(); void loadUsers(); }
+  if (page === 'accounts') void loadSteamAccounts();
+  if (page === 'audit') void loadAuditLogs();
+  if (page === 'emotes') void loadImageEmotes();
+  if (page === 'settings') void loadStorageHealth();
+}
+
+let authorizationRefresh: Promise<void> | null = null;
+function refreshMyAuthorization(): Promise<void> {
+  if (authorizationRefresh) return authorizationRefresh;
+  authorizationRefresh = (async () => {
+    const payload = await api('/api/auth/me') as MeResponse;
+    state.me = payload.user; state.permissions = payload.permissions || []; state.permissionDetails = payload.permissionDetails || [];
+    // Purge cached content when a peer scope changes, including changes that keep accessAllowed true.
+    invalidateChat(); state.conversations = []; state.friends = []; state.groups = [];
+    updateSteamStatus(payload.steam || defaultSteamStatus);
+    if (!canOpenView(state.view)) void openConsole('chat');
+    updateChatLists(); updateChatAvailability(); refreshReactionBars();
+    await refreshChatData();
+    if (currentSteamGrant()?.scope === 'some' && state.activeId && ![...state.conversations, ...state.friends].some(item => item.id === state.activeId)) deselectConversation();
+  })().catch(() => {}).finally(() => { authorizationRefresh = null; });
+  return authorizationRefresh;
+}
+
+function setTheme(theme: 'auto' | 'light' | 'dark') {
+  localStorage.setItem('steam-chat.theme', theme);
+  if (theme === 'auto') document.documentElement.removeAttribute('data-theme');
+  else document.documentElement.dataset.theme = theme;
+}
+
+function openMeMenu(anchor: HTMLElement) {
+  document.querySelector('.me-menu')?.remove();
+  const menu = create('div', 'me-menu menu');
+  menu.append(create('strong', 'menu-head', displayName(state.me!)), create('p', 'muted', `@${state.me!.username} · ${state.me!.roleName || '成员'}`));
+  const add = (label: string, run: () => void) => { const button = create('button', '', label); button.addEventListener('click', () => { close(); run(); }); menu.append(button); };
+  if (hasPermission('steam.manage')) {
+    for (const account of state.steamAccounts.filter(item => item.enabled)) add(`切换至 ${account.label || account.steamId}`, () => void connectSteamAccount(account.id));
+    if (!state.steamAccounts.length) void loadSteamAccounts().then(() => { if (menu.isConnected && state.steamAccounts.length) { close(); openMeMenu(anchor); } });
+  }
+  for (const [theme, label] of [['auto', '跟随系统'], ['light', '浅色'], ['dark', '深色']] as const) add(`主题 · ${label}`, () => setTheme(theme));
+  add('控制台', () => void openConsole(hasPermission('steam.manage') ? 'accounts' : 'settings'));
+  add('退出登录', () => void logoutApp());
+  const close = () => { menu.remove(); document.removeEventListener('pointerdown', outside); document.removeEventListener('keydown', key); };
+  const outside = (event: PointerEvent) => { if (!menu.contains(event.target as Node) && !anchor.contains(event.target as Node)) close(); };
+  const key = (event: KeyboardEvent) => { if (event.key === 'Escape') { close(); anchor.focus(); } };
+  anchor.parentElement!.append(menu); document.addEventListener('pointerdown', outside); document.addEventListener('keydown', key);
+  menu.querySelector('button')?.focus();
+}
+
+function openPalette() {
+  if (!state.me || state.me.forcePasswordChange) return;
+  if (document.querySelector('.palette')) return;
+  const opener = document.activeElement as HTMLElement | null;
+  const scrim = create('div', 'modal-scrim'); const palette = create('section', 'palette');
+  palette.setAttribute('role', 'dialog'); palette.setAttribute('aria-modal', 'true'); palette.setAttribute('aria-label', '快速跳转');
+  const input = create('input'); input.placeholder = '搜索会话、页面和命令'; input.setAttribute('aria-label', '快速跳转');
+  input.setAttribute('role', 'combobox'); input.setAttribute('aria-expanded', 'true'); input.setAttribute('aria-controls', 'paletteResults'); input.setAttribute('aria-autocomplete', 'list');
+  const results = create('div', 'palette-results'); results.id = 'paletteResults'; results.setAttribute('role', 'listbox');
+  let selected = 0; let actions: Array<() => void> = [];
+  const close = () => { dispose(); palette.remove(); scrim.remove(); opener?.focus(); };
+  const mark = () => { [...results.querySelectorAll<HTMLElement>('[role="option"]')].forEach((node, index) => { node.classList.toggle('is-on', index === selected); node.setAttribute('aria-selected', String(index === selected)); if (index === selected) input.setAttribute('aria-activedescendant', node.id); }); };
+  const fill = () => {
+    clear(results); actions = []; selected = 0;
+    const query = input.value.trim().toLocaleLowerCase();
+    const add = (label: string, action: () => void) => {
+      if (query && !label.toLocaleLowerCase().includes(query)) return;
+      const index = actions.length; actions.push(action);
+      const button = create('button', '', label); button.tabIndex = -1; button.id = `palette-result-${index}`; button.setAttribute('role', 'option');
+      button.addEventListener('pointerdown', event => event.preventDefault()); button.addEventListener('click', () => { close(); action(); }); results.append(button);
+    };
+    const conversations = new Map([...state.conversations, ...state.friends].map(item => [item.id, resolvedChatEntry(item)]));
+    results.append(create('h3', '', '会话'));
+    [...conversations.values()].filter(item => [item.name, item.nickname, item.id].some(value => String(value || '').toLocaleLowerCase().includes(query))).slice(0, 8)
+      .forEach(item => add(`${item.name || item.id} ${item.nickname || ''} ${item.id}`, () => { void openConsole('chat').then(() => openConversation(item.id, item.name)); }));
+    results.append(create('h3', '', '页面'));
+    consolePages.filter(([view]) => canOpenView(view)).forEach(([view, label]) => add(label, () => void openConsole(view)));
+    results.append(create('h3', '', '命令'));
+    if (steamAccessAllowed() && currentSteamGrant()?.scope !== 'some') add('新建会话', () => document.querySelector<HTMLButtonElement>('.new-chat-btn')?.click());
+    add('切换主题', () => setTheme(document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark'));
+    add('退出登录', () => void logoutApp()); mark();
+  };
+  input.addEventListener('input', fill);
+  input.addEventListener('keydown', event => {
+    if (event.key === 'ArrowDown' || event.key === 'ArrowUp') { event.preventDefault(); selected = (selected + (event.key === 'ArrowDown' ? 1 : -1) + actions.length) % Math.max(1, actions.length); mark(); }
+    if (event.key === 'Enter') { event.preventDefault(); const action = actions[selected]; if (action) { close(); action(); } }
+  });
+  palette.append(input, results); root.append(scrim, palette); scrim.addEventListener('click', close);
+  const dispose = trapDialogFocus(palette, close); fill(); input.focus();
 }
 
 let steamLoginRequest: 'qr' | 'cancel' | 'password' | null = null;
@@ -1095,7 +1331,7 @@ async function submitSteamPassword(form: HTMLFormElement, path: string) {
     const status = await api(path, body);
     updateSteamStatus(status as SteamStatus);
     form.reset();
-    if (state.view === 'steamAccounts') await loadSteamAccounts();
+    if (state.view === 'accounts') await loadSteamAccounts();
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   } finally {
@@ -1116,7 +1352,7 @@ function renderSteamView() {
   summary.append(statusText, detail);
   view.append(summary);
 
-  if (state.me?.role !== 'admin') {
+  if (!hasPermission('steam.manage')) {
     const access = panel('访问状态', 'status-note-panel');
     const accessDenied = steamOnline() && !steamAccessAllowed();
     const accessText = !steamOnline()
@@ -1194,218 +1430,40 @@ function renderSteamView() {
 }
 
 function renderUsersView() {
-  const view = create('div', 'users-view');
-  const filterPanel = panel('筛选', 'toolbar-panel');
-  const filters = create('form', 'inline-form user-filters') as HTMLFormElement;
-  filters.innerHTML = `
-    <label>搜索<input name="query" value="${state.userQuery}" placeholder="账号、昵称、备注"></label>
-    <label>角色<select name="role"><option value="">全部</option><option value="admin">管理员</option><option value="user">普通用户</option></select></label>
-    <label>状态<select name="status"><option value="">全部</option><option value="enabled">启用</option><option value="disabled">禁用</option><option value="locked">锁定</option></select></label>
-    <button type="submit">筛选</button>
-  `;
-  (filters.elements.namedItem('role') as HTMLSelectElement).value = state.userRole;
-  (filters.elements.namedItem('status') as HTMLSelectElement).value = state.userStatus;
-  filters.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    state.userQuery = formValue(filters, 'query');
-    state.userRole = formValue(filters, 'role');
-    state.userStatus = formValue(filters, 'status');
-    await loadUsers();
-  });
-  filterPanel.append(filters);
-  const createPanel = panel('新增用户', 'toolbar-panel');
-  const form = create('form', 'inline-form user-create') as HTMLFormElement;
-  form.innerHTML = `
-    <label>账号<input name="username" minlength="3" maxlength="64" required></label>
-    <label>昵称<input name="displayName" maxlength="80"></label>
-    <label>密码<input name="password" type="password" minlength="8" required></label>
-    <label>角色<select name="role"><option value="user">普通用户</option><option value="admin">管理员</option></select></label>
-    <label>备注<input name="note" maxlength="500"></label>
-    <button type="submit">新增用户</button>
-  `;
-  form.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    try {
-      await api('/api/users', jsonBody({
-        username: formValue(form, 'username'),
-        displayName: formValue(form, 'displayName'),
-        password: formValue(form, 'password'),
-        role: formValue(form, 'role') || 'user',
-        note: formValue(form, 'note')
-      }));
-      form.reset();
-      await loadUsers();
-    } catch (error) {
-      setFeedback(errorMessage(error), 'error');
-    }
-  });
-  createPanel.append(form);
-  const listPanel = panel('用户列表', 'list-panel');
-  const table = create('div', 'user-table');
-  table.id = 'userTable';
-  listPanel.append(table);
-  view.append(filterPanel, createPanel, listPanel);
-  renderUserTable(table);
-  return view;
+  return consoleRenderUsersView();
 }
 
 function renderUserTable(container: HTMLElement) {
-  clear(container);
-  if (!state.users.length) {
-    container.append(create('div', 'empty', '暂无用户'));
-    return;
-  }
-  for (const user of state.users) {
-    const row = create('article', 'user-row');
-    const info = create('div');
-    const status = user.locked ? '锁定' : user.disabled ? '已禁用' : '启用';
-    info.append(
-      create('strong', '', `${displayName(user)} (${user.username})`),
-      create('span', 'muted', `${user.role === 'admin' ? '管理员' : '普通用户'} · ${status} · 授权 ${user.steamAccountCount || 0} 个 Steam 账户`),
-      create('span', 'muted', `最近登录 ${dateTime(user.lastLoginAt)} · IP ${user.lastLoginIp || '无'} · 活跃 ${dateTime(user.lastSeenAt)}`),
-      create('span', 'muted', user.note ? `备注：${user.note}` : '无备注')
-    );
-    const actions = create('div', 'row-actions');
-    const profile = create('button', 'ghost-btn', '编辑资料');
-    profile.type = 'button';
-    profile.addEventListener('click', () => editUserProfile(user));
-    const role = create('button', 'ghost-btn', user.role === 'admin' ? '降为用户' : '设为管理员');
-    role.type = 'button';
-    role.disabled = user.id === state.me?.id;
-    role.addEventListener('click', () => patchUser(user.id, { role: user.role === 'admin' ? 'user' : 'admin' }));
-    const disabled = create('button', 'ghost-btn', user.disabled ? '启用' : '禁用');
-    disabled.type = 'button';
-    disabled.disabled = user.id === state.me?.id;
-    disabled.addEventListener('click', () => patchUser(user.id, { disabled: !user.disabled }));
-    const password = create('button', 'ghost-btn', '重置密码');
-    password.type = 'button';
-    password.addEventListener('click', () => resetUserPassword(user.id));
-    const forcePassword = create('button', 'ghost-btn', user.forcePasswordChange ? '取消强制改密' : '要求改密');
-    forcePassword.type = 'button';
-    forcePassword.addEventListener('click', () => patchUser(user.id, { forcePasswordChange: !user.forcePasswordChange }));
-    const sessions = create('button', 'ghost-btn', '会话');
-    sessions.type = 'button';
-    sessions.addEventListener('click', () => loadUserSessions(user.id));
-    const grants = create('button', 'ghost-btn', '授权');
-    grants.type = 'button';
-    grants.addEventListener('click', () => loadUserSteamAccounts(user.id));
-    const remove = create('button', 'danger-btn', '删除');
-    remove.type = 'button';
-    remove.disabled = user.id === state.me?.id;
-    remove.addEventListener('click', () => deleteUser(user.id));
-    actions.append(profile, role, disabled, password, forcePassword, sessions, grants, remove);
-    row.append(info, actions);
-    const detail = renderUserDetail(user);
-    if (detail) row.append(detail);
-    container.append(row);
-  }
+  consoleRenderUserTable(container);
 }
 
 function renderUserDetail(user: User): HTMLElement | null {
-  const sessions = state.userSessions[user.id];
-  const grants = state.userSteamAccounts[user.id];
-  if (!sessions && !grants) return null;
-  const detail = create('div', 'user-detail');
-  if (sessions) {
-    const block = create('section', 'detail-block');
-    const revokeAll = create('button', 'danger-btn', '踢下线全部会话');
-    revokeAll.type = 'button';
-    revokeAll.addEventListener('click', () => revokeUserSessions(user.id));
-    block.append(create('h3', '', '会话'), revokeAll);
-    if (!sessions.length) block.append(create('div', 'empty small', '暂无活动会话'));
-    for (const session of sessions) {
-      const row = create('div', 'session-row');
-      row.append(create('span', '', `${dateTime(session.lastSeenAt)} · ${session.ip || '未知 IP'}`), create('span', 'muted', session.userAgent || '无 User-Agent'));
-      const revoke = create('button', 'danger-btn', '踢下线');
-      revoke.type = 'button';
-      revoke.addEventListener('click', () => revokeSession(user.id, session.id));
-      row.append(revoke);
-      block.append(row);
-    }
-    detail.append(block);
-  }
-  if (grants) {
-    const form = create('form', 'grant-grid') as HTMLFormElement;
-    form.append(create('h3', '', 'Steam 授权'));
-    if (!state.steamAccounts.length) form.append(create('div', 'empty small', '暂无 Steam 账户'));
-    for (const account of state.steamAccounts) {
-      const label = create('label', 'check-row');
-      const input = create('input') as HTMLInputElement;
-      input.type = 'checkbox';
-      input.name = 'steamAccountIds';
-      input.value = String(account.id);
-      input.checked = grants.some((item) => item.id === account.id);
-      label.append(input, create('span', '', `${account.label || account.steamId} · ${account.enabled ? '启用' : '禁用'}`));
-      form.append(label);
-    }
-    const save = create('button', 'primary-btn', '保存授权');
-    save.type = 'submit';
-    form.append(save);
-    form.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      const ids = [...form.querySelectorAll<HTMLInputElement>('input[name="steamAccountIds"]:checked')].map((input) => Number(input.value));
-      await saveUserSteamAccounts(user.id, ids);
-    });
-    detail.append(form);
-  }
-  return detail;
+  return consoleRenderUserDetail(user);
 }
 
 async function loadUsers() {
-  if (!hasPermission('user.manage')) return;
-  try {
-    const params = new URLSearchParams();
-    if (state.userQuery) params.set('query', state.userQuery);
-    if (state.userRole) params.set('role', state.userRole);
-    if (state.userStatus) params.set('status', state.userStatus);
-    const payload = await api(`/api/users${params.size ? `?${params}` : ''}`);
-    state.users = isRecord(payload) && Array.isArray(payload.users) ? payload.users as User[] : [];
-    const table = document.querySelector<HTMLElement>('#userTable');
-    if (table) renderUserTable(table);
-  } catch (error) {
-    setFeedback(errorMessage(error), 'error');
-  }
+  await consoleLoadUsers();
 }
 
 async function editUserProfile(user: User) {
-  const display = window.prompt('昵称', user.displayName);
-  if (display === null) return;
-  const note = window.prompt('备注', user.note);
-  if (note === null) return;
-  await patchUser(user.id, { displayName: display, note });
+  consoleEditUser(user);
 }
 
 async function patchUser(id: number, patch: Record<string, unknown>) {
   try {
-    await api(`/api/users/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch)
-    });
-    await loadUsers();
+    await consolePatchUser(id, patch);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
 }
 
 async function resetUserPassword(id: number) {
-  const password = window.prompt('输入新密码，至少 8 位');
-  if (!password) return;
-  const forcePasswordChange = window.confirm('要求该用户下次登录后修改密码？');
-  try {
-    await api(`/api/users/${id}/password`, jsonBody({ password, forcePasswordChange }));
-    setFeedback('密码已重置', 'ok');
-    await loadUsers();
-  } catch (error) {
-    setFeedback(errorMessage(error), 'error');
-  }
+  consoleResetPassword(id);
 }
 
 async function loadUserSessions(id: number) {
   try {
-    const payload = await api(`/api/users/${id}/sessions`);
-    state.userSessions[id] = isRecord(payload) && Array.isArray(payload.sessions) ? payload.sessions as UserSession[] : [];
-    renderShell();
+    await consoleLoadSessions(id);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
@@ -1413,8 +1471,7 @@ async function loadUserSessions(id: number) {
 
 async function revokeSession(userId: number, sessionId: string) {
   try {
-    await api(`/api/users/${userId}/sessions/${encodeURIComponent(sessionId)}`, { method: 'DELETE' });
-    await loadUserSessions(userId);
+    await consoleRevokeSession(userId, sessionId);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
@@ -1422,8 +1479,7 @@ async function revokeSession(userId: number, sessionId: string) {
 
 async function revokeUserSessions(userId: number) {
   try {
-    await api(`/api/users/${userId}/sessions`, { method: 'DELETE' });
-    await loadUserSessions(userId);
+    await consoleRevokeSession(userId);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
@@ -1431,10 +1487,7 @@ async function revokeUserSessions(userId: number) {
 
 async function loadUserSteamAccounts(id: number) {
   try {
-    await loadSteamAccounts();
-    const payload = await api(`/api/users/${id}/steam-accounts`);
-    state.userSteamAccounts[id] = isRecord(payload) && Array.isArray(payload.steamAccounts) ? payload.steamAccounts as SteamAccount[] : [];
-    renderShell();
+    await consoleLoadUserGrants(id);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
@@ -1442,136 +1495,47 @@ async function loadUserSteamAccounts(id: number) {
 
 async function saveUserSteamAccounts(id: number, steamAccountIds: number[]) {
   try {
-    const payload = await api(`/api/users/${id}/steam-accounts`, {
-      method: 'PUT',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ steamAccountIds })
-    });
-    state.userSteamAccounts[id] = isRecord(payload) && Array.isArray(payload.steamAccounts) ? payload.steamAccounts as SteamAccount[] : [];
-    setFeedback('授权已保存', 'ok');
-    await loadUsers();
+    await consoleSaveLegacyGrants(id, steamAccountIds);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
 }
 
 async function deleteUser(id: number) {
-  if (!window.confirm('确认删除该后台用户？')) return;
   try {
-    await api(`/api/users/${id}`, { method: 'DELETE' });
-    await loadUsers();
+    await consoleDeleteUser(id);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
 }
 
 function renderSteamAccountsView() {
-  const view = create('div', 'steam-accounts-view');
-  if (hasPermission('steam.manage')) {
-    view.append(renderSteamQrLogin());
-    const loginPanel = panel('登录新账户', 'toolbar-panel');
-    const loginForm = create('form', 'inline-form steam-account-login steam-password-login') as HTMLFormElement;
-    loginForm.innerHTML = `
-      <label>显示名称<input name="label" maxlength="80"></label>
-      <label>Steam 账号<input name="accountName" autocomplete="username" required></label>
-      <label>Steam 密码<input name="password" type="password" autocomplete="current-password" required></label>
-      <label>Logon ID<input name="logonID" inputmode="numeric"></label>
-      <button type="submit">登录新账户</button>
-    `;
-    loginForm.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      await submitSteamPassword(loginForm, '/api/steam/accounts/login');
-    });
-    loginPanel.append(loginForm);
-    view.append(loginPanel);
-  }
-  const listPanel = panel('账户列表', 'list-panel');
-  const list = create('div', 'account-table');
-  list.id = 'steamAccountTable';
-  listPanel.append(list);
-  view.append(listPanel);
-  renderSteamAccountTable(list);
-  return view;
+  return consoleRenderSteamAccountsView();
 }
 
 function renderSteamAccountTable(container: HTMLElement) {
-  clear(container);
-  if (!state.steamAccounts.length) {
-    container.append(create('div', 'empty', '暂无 Steam 账户'));
-    return;
-  }
-  for (const account of state.steamAccounts) {
-    const row = create('article', 'account-row');
-    const info = create('div');
-    info.append(
-      create('strong', '', account.label || account.steamId),
-      create('span', 'muted', `${account.steamId} · ${account.active ? '当前活动' : '未连接'} · ${account.enabled ? '启用' : '禁用'} · 授权 ${account.authorizedUserCount || 0} 人`),
-      create('span', 'muted', `最近登录 ${dateTime(account.lastLoginAt)} · 活跃 ${dateTime(account.lastActiveAt)} · token ${dateTime(account.refreshTokenUpdatedAt)}`),
-      create('span', 'muted', account.accountNameHint ? `账号提示：${account.accountNameHint}` : '无账号提示')
-    );
-    const actions = create('div', 'row-actions');
-    const connect = create('button', 'ghost-btn steam-account-connect', '连接');
-    connect.type = 'button';
-    connect.dataset.unavailable = String(account.active || !account.enabled);
-    connect.disabled = account.active || !account.enabled || steamLoginBlocked();
-    connect.addEventListener('click', () => connectSteamAccount(account.id));
-    const edit = create('button', 'ghost-btn', '编辑');
-    edit.type = 'button';
-    edit.addEventListener('click', () => editSteamAccount(account));
-    const toggle = create('button', 'ghost-btn', account.enabled ? '禁用' : '启用');
-    toggle.type = 'button';
-    toggle.addEventListener('click', () => patchSteamAccount(account.id, { enabled: !account.enabled }));
-    const logout = create('button', 'ghost-btn', '退出');
-    logout.type = 'button';
-    logout.disabled = !account.active;
-    logout.addEventListener('click', () => logoutSteamAccount(account.id));
-    const remove = create('button', 'danger-btn', '删除');
-    remove.type = 'button';
-    remove.addEventListener('click', () => deleteSteamAccount(account.id));
-    actions.append(connect, edit, toggle, logout, remove);
-    row.append(info, actions);
-    container.append(row);
-  }
+  consoleRenderSteamAccountTable(container);
 }
 
 async function loadSteamAccounts() {
-  try {
-    const payload = await api('/api/steam/accounts');
-    state.steamAccounts = isRecord(payload) && Array.isArray(payload.steamAccounts) ? payload.steamAccounts as SteamAccount[] : [];
-    const table = document.querySelector<HTMLElement>('#steamAccountTable');
-    if (table) renderSteamAccountTable(table);
-  } catch (error) {
-    setFeedback(errorMessage(error), 'error');
-  }
+  await consoleLoadSteamAccounts();
 }
 
 async function connectSteamAccount(id: number) {
-  if (steamLoginBlocked()) return;
   try {
-    const status = await api(`/api/steam/accounts/${id}/connect`, { method: 'POST' });
-    updateSteamStatus(status as SteamStatus);
-    await loadSteamAccounts();
+    await consoleConnectSteamAccount(id);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
 }
 
 async function editSteamAccount(account: SteamAccount) {
-  const label = window.prompt('显示名称', account.label);
-  if (label === null) return;
-  const accountNameHint = window.prompt('账号提示', account.accountNameHint);
-  if (accountNameHint === null) return;
-  await patchSteamAccount(account.id, { label, accountNameHint });
+  consoleEditSteamAccount(account);
 }
 
 async function patchSteamAccount(id: number, patch: Record<string, unknown>) {
   try {
-    await api(`/api/steam/accounts/${id}`, {
-      method: 'PATCH',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(patch)
-    });
-    await loadSteamAccounts();
+    await consolePatchSteamAccount(id, patch);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
@@ -1579,78 +1543,30 @@ async function patchSteamAccount(id: number, patch: Record<string, unknown>) {
 
 async function logoutSteamAccount(id: number) {
   try {
-    const status = await api(`/api/steam/accounts/${id}/logout`, { method: 'POST' });
-    updateSteamStatus(status as SteamStatus);
-    await loadSteamAccounts();
+    await consoleLogoutSteamAccount(id);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
 }
 
 async function deleteSteamAccount(id: number) {
-  if (!window.confirm('确认删除该 Steam 账户资料和授权关系？')) return;
   try {
-    await api(`/api/steam/accounts/${id}`, { method: 'DELETE' });
-    await loadSteamAccounts();
+    await consoleDeleteSteamAccount(id);
   } catch (error) {
     setFeedback(errorMessage(error), 'error');
   }
 }
 
 function renderAuditView() {
-  const view = create('div', 'audit-view');
-  const filterPanel = panel('筛选', 'toolbar-panel');
-  const filters = create('form', 'inline-form audit-filters') as HTMLFormElement;
-  filters.innerHTML = `
-    <label>动作<input name="action" value="${state.auditAction}" placeholder="例如 user.update"></label>
-    <label>目标类型<input name="targetType" value="${state.auditTargetType}" placeholder="user / steam_account"></label>
-    <button type="submit">筛选</button>
-  `;
-  filters.addEventListener('submit', async (event) => {
-    event.preventDefault();
-    state.auditAction = formValue(filters, 'action');
-    state.auditTargetType = formValue(filters, 'targetType');
-    await loadAuditLogs();
-  });
-  filterPanel.append(filters);
-  const listPanel = panel('日志列表', 'list-panel');
-  const table = create('div', 'audit-table');
-  table.id = 'auditTable';
-  listPanel.append(table);
-  view.append(filterPanel, listPanel);
-  renderAuditTable(table);
-  return view;
+  return consoleRenderAuditView();
 }
 
 function renderAuditTable(container: HTMLElement) {
-  clear(container);
-  if (!state.auditLogs.length) {
-    container.append(create('div', 'empty', '暂无审计日志'));
-    return;
-  }
-  for (const item of state.auditLogs) {
-    const row = create('article', 'audit-row');
-    row.append(
-      create('strong', '', `${dateTime(item.createdAt)} · ${item.action}`),
-      create('span', 'muted', `操作者 ${item.actorUsername || item.actorUserId || '系统'} · ${item.targetType}:${item.targetId} · ${item.ip || '无 IP'}`),
-      create('code', '', compactJson(item.detail))
-    );
-    container.append(row);
-  }
+  consoleRenderAuditTable(container);
 }
 
 async function loadAuditLogs() {
-  try {
-    const params = new URLSearchParams();
-    if (state.auditAction) params.set('action', state.auditAction);
-    if (state.auditTargetType) params.set('targetType', state.auditTargetType);
-    const payload = await api(`/api/audit-logs${params.size ? `?${params}` : ''}`);
-    state.auditLogs = isRecord(payload) && Array.isArray(payload.auditLogs) ? payload.auditLogs as AuditLog[] : [];
-    const table = document.querySelector<HTMLElement>('#auditTable');
-    if (table) renderAuditTable(table);
-  } catch (error) {
-    setFeedback(errorMessage(error), 'error');
-  }
+  await consoleLoadAuditLogs();
 }
 
 type AppInstallEvent = Event & {
@@ -1686,6 +1602,8 @@ function updateAppInstallation(installed = false) {
     || (navigator as Navigator & { standalone?: boolean }).standalone;
   button.textContent = standalone ? '已在应用窗口中打开' : pendingAppInstall ? '安装 Steam Chat' : '查看安装方法';
   button.disabled = Boolean(standalone);
+  const card = button.closest<HTMLElement>('.panel');
+  if (card) card.hidden = Boolean(standalone) || !pendingAppInstall;
 }
 
 function appInstallationPanel() {
@@ -1714,9 +1632,7 @@ function appInstallationPanel() {
 }
 
 function renderSettingsView() {
-  // Keep the persisted account view key compatible with existing bookmarks/preferences.
   const view = create('div', 'account-view settings-view');
-  view.append(appInstallationPanel());
   const notifications = panel('消息通知', 'form-panel');
   notifications.append(
     create('p', 'muted', '开启后，网页在后台或正在查看其他会话时，新消息会触发桌面通知。点击通知可打开对应会话。'),
@@ -1725,28 +1641,24 @@ function renderSettingsView() {
     create('p', 'muted', '此偏好仅保存在当前浏览器。需要允许浏览器和系统通知，并保持网页打开。通知不显示消息正文。')
   );
   view.append(notifications);
-  const configuration = panel('服务配置', 'form-panel');
-  const links = create('div', 'settings-links');
-  const entries: Array<[View, string, string]> = [
-    ['steam', 'Steam 连接', '查看连接状态和管理 Steam 登录']
-  ];
-  if (hasPermission('steam.account.manage')) entries.push(['steamAccounts', 'Steam 账户', '管理 Steam 账户和活动账号']);
-  if (hasPermission('user.manage')) entries.push(['users', '用户管理', '管理后台用户、权限和账号授权']);
-  if (state.me?.role === 'admin') entries.push(['imageEmotes', '图片表情', '管理共享图片素材和分组']);
-  for (const [target, title, description] of entries) {
-    const row = create('div', 'settings-link');
-    const button = create('button', 'ghost-btn', title);
-    button.type = 'button';
-    button.addEventListener('click', () => {
-      state.view = target;
-      localStorage.setItem('steam-chat.view', target);
-      renderShell();
-    });
-    row.append(button, create('span', 'muted', description));
-    links.append(row);
+  const backgroundOnly = create('input'); backgroundOnly.type = 'checkbox';
+  backgroundOnly.checked = localStorage.getItem('steam-chat.notify-background-only') === 'true';
+  backgroundOnly.addEventListener('change', () => localStorage.setItem('steam-chat.notify-background-only', String(backgroundOnly.checked)));
+  const backgroundLabel = create('label', 'check-label'); backgroundLabel.append(backgroundOnly, create('span', '', '仅在页面不在前台时提醒')); notifications.append(backgroundLabel);
+  const permissions = panel('我的权限', 'form-panel');
+  permissions.append(create('span', 'badge accent', state.me?.roleName || '成员'));
+  const tags = create('div', 'chips');
+  const sources: Record<string, string> = { super: '超级管理员', role: '来自角色', grant: '个人授予', revoke: '个人收回', implied: '由管理用户权限赋予' };
+  for (const permission of state.permissions) {
+    const detail = state.permissionDetails.find(item => item.permission === permission);
+    const tag = create('span', 'badge mono', `${detail?.source === 'grant' ? '+ ' : ''}${permission}`);
+    tag.title = sources[detail?.source || 'role'] || '来自角色'; tags.append(tag);
   }
-  configuration.append(links);
-  view.append(configuration);
+  permissions.append(tags);
+  const grant = currentSteamGrant();
+  if (grant) permissions.append(create('p', '', `${chatAccountName()} · ${{ read: '只读', chat: '聊天', full: '完整' }[grant.level]} · ${grant.scope === 'some' ? `仅 ${grant.peerCount || 0} 位指定好友` : '全部会话'} · ${grant.expiresAt ? `至 ${new Date(grant.expiresAt).toLocaleDateString('zh-CN')}` : '永久'}`));
+  else permissions.append(create('p', 'muted', '当前活动账户暂无 Steam 授权'));
+  view.append(permissions);
   const accountPanel = panel('账号安全 · 修改密码', 'form-panel');
   const form = create('form', 'stack-form narrow-form') as HTMLFormElement;
   form.innerHTML = `
@@ -1767,147 +1679,175 @@ function renderSettingsView() {
       setFeedback(errorMessage(error), 'error');
     }
   });
-  accountPanel.append(form);
+  if (hasPermission('self.password.change')) accountPanel.append(form);
+  else accountPanel.append(create('p', 'muted', '你没有修改自己密码的权限'));
+  const logoutOthers = create('button', 'ghost-btn', '退出其他设备');
+  logoutOthers.addEventListener('click', async () => {
+    if (!await confirmDialog('退出其他设备？其他设备需要重新登录。')) return;
+    try {
+      await api('/api/auth/logout-all', jsonBody({ keepCurrentSession: true }));
+      setFeedback('其他设备已退出登录', 'ok');
+    } catch (error) { setFeedback(errorMessage(error), 'error'); }
+  });
+  accountPanel.append(logoutOthers);
   view.append(accountPanel);
+  view.append(appInstallationPanel());
+  const storage = panel('消息存储', 'form-panel');
+  const detail = create('p', 'muted', storageHealthText(storageHealth)); detail.id = 'storageDetails';
+  const refresh = create('button', 'ghost-btn', '刷新状态'); refresh.addEventListener('click', () => void loadStorageHealth());
+  storage.append(detail, refresh); view.append(storage);
   return view;
 }
 
 function renderChatView() {
-  const view = create('div', 'chat-layout');
+  for (const close of activeChatFloatingPanels) close();
+  closeThreadDatePopover?.();
+  document.removeEventListener('pointerdown', dismissFriendDetailsFromPointer, true);
+  document.removeEventListener('keydown', dismissFriendDetailsFromKey, true);
+  const view = create('div', 'shell chat-layout');
   view.id = 'chatLayout';
+  view.dataset.mobile = state.chatPanel;
   view.dataset.mobilePanel = state.chatPanel;
   view.dataset.hasConversation = String(Boolean(state.activeId));
-  const lists = create('aside', 'chat-lists');
+  const lists = create('aside', 'clist chat-lists');
   lists.setAttribute('aria-label', '会话列表');
 
-  const listHead = create('header', 'chat-list-head');
-  const account = create('button', 'chat-account');
-  account.type = 'button';
-  account.title = 'Steam 连接';
-  const accountCopy = create('span', 'chat-account-copy');
-  const accountName = create('strong', '', chatAccountName());
-  accountName.id = 'chatAccountName';
-  const accountStatus = create('span');
-  accountStatus.id = 'chatAccountStatus';
-  accountStatus.textContent = chatAccountLabel();
-  accountStatus.dataset.status = state.steam.status;
-  accountCopy.append(accountName, accountStatus);
-  account.append(chatIcon('gamepad-2'), accountCopy);
-  account.addEventListener('click', () => {
-    state.view = 'steam';
-    localStorage.setItem('steam-chat.view', 'steam');
-    renderShell();
-  });
-  const titleRow = create('div', 'chat-list-title');
-  titleRow.append(create('h2', '', '消息'));
-  const newConversation = create('button', 'new-chat-btn');
-  newConversation.type = 'button';
-  newConversation.title = '新建会话';
-  newConversation.append(chatIcon('plus'), create('span', '', '新建'));
-  const collapseToggle = create('button', 'chat-list-toggle');
-  collapseToggle.id = 'chatListToggle';
-  collapseToggle.type = 'button';
-  collapseToggle.setAttribute('aria-controls', 'chatListSections');
-  collapseToggle.addEventListener('click', () => setChatListCollapsed(!state.chatListCollapsed));
-  titleRow.append(newConversation, collapseToggle);
+  const listHead = create('header', 'ctop');
+  const me = create('button', 'me-btn');
+  me.type = 'button';
+  me.title = '我的账号与控制台';
+  me.setAttribute('aria-label', me.title);
+  me.setAttribute('aria-haspopup', 'menu');
+  me.append(renderAvatar(null, state.me ? displayName(state.me) : '?', 'av avatar sm'));
+  me.addEventListener('click', () => openMeMenu(me));
+  const search = create('button', 'jump');
+  search.type = 'button';
+  search.title = '搜索会话与页面（Ctrl/⌘ K）';
+  search.setAttribute('aria-label', '搜索或跳转 ⌘ K');
+  search.append(chatIcon('search'), create('span', '', '搜索或跳转'), create('kbd', '', '⌘ K'));
+  search.addEventListener('click', () => openPalette());
+  const newConversation = chatIconButton('plus', '新建会话', 'icon-btn new-chat-btn');
+  newConversation.dataset.newConversation = '';
+  newConversation.hidden = currentSteamGrant()?.scope === 'some';
+  newConversation.disabled = !grantAtLeast('read');
+  if (newConversation.disabled) newConversation.title = '当前账户没有聊天访问授权';
+  newConversation.addEventListener('click', openNewConversationDialog);
+  listHead.append(me, search, newConversation);
 
-  const search = create('label', 'chat-search');
-  search.append(chatIcon('search'));
-  const searchInput = create('input') as HTMLInputElement;
-  searchInput.type = 'search';
-  searchInput.placeholder = '搜索会话';
-  searchInput.value = state.chatQuery;
-  searchInput.setAttribute('aria-label', '搜索当前分类');
-  searchInput.addEventListener('input', () => {
-    state.chatQuery = searchInput.value;
-    updateChatLists();
-  });
-  search.append(searchInput);
-
-  const tabList = create('div', 'chat-tabs');
+  const tabList = create('div', 'conv-tabs chat-tabs');
   tabList.setAttribute('role', 'tablist');
-  const tabLabels: Array<[ChatListTab, string]> = [['recent', '最近'], ['friends', '好友'], ['groups', '群组']];
+  tabList.setAttribute('aria-label', '会话分类');
+  const tabLabels: Array<[ChatListTab, string]> = [['recent', '全部'], ['unread', '未读'], ['friends', '好友'], ['groups', '群组']];
+  if (currentSteamGrant()?.scope === 'some' && state.chatListTab === 'groups') state.chatListTab = 'recent';
   for (const [tab, label] of tabLabels) {
-    const button = create('button', state.chatListTab === tab ? 'is-active' : '', label);
+    const button = create('button', state.chatListTab === tab ? 'is-active is-on' : '', label);
     button.type = 'button';
     button.dataset.chatTab = tab;
+    button.hidden = tab === 'groups' && currentSteamGrant()?.scope === 'some';
     button.setAttribute('role', 'tab');
     button.setAttribute('aria-controls', 'chatListSections');
     button.setAttribute('aria-selected', String(state.chatListTab === tab));
+    button.tabIndex = state.chatListTab === tab ? 0 : -1;
     button.addEventListener('click', () => {
       state.chatListTab = tab;
+      localStorage.setItem('steam-chat.list-tab', tab);
       updateChatTabs();
       updateChatLists();
     });
+    button.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const tabs = Array.from(tabList.querySelectorAll<HTMLButtonElement>('[data-chat-tab]')).filter(item => !item.hidden);
+      const index = tabs.indexOf(button);
+      const next = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+        : (index + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length;
+      tabs[next]?.click();
+      tabs[next]?.focus();
+    });
     tabList.append(button);
   }
-  listHead.append(account, titleRow, search, tabList);
 
-  const listBody = create('div', 'conversation-list');
+  const scope = create('div', 'scope-note');
+  scope.id = 'chatScopeNote';
+  scope.setAttribute('role', 'status');
+  const listBody = create('div', 'conv-list conversation-list');
   listBody.id = 'chatListSections';
   listBody.setAttribute('role', 'tabpanel');
   renderChatListSections(listBody);
 
-  const dialog = create('dialog', 'new-chat-dialog') as HTMLDialogElement;
-  const targetInput = create('input') as HTMLInputElement;
-  targetInput.name = 'target';
-  targetInput.inputMode = 'numeric';
-  targetInput.autocomplete = 'off';
-  targetInput.placeholder = 'SteamID64';
-  targetInput.pattern = '[0-9]+';
-  targetInput.required = true;
-  const dialogHead = create('div', 'dialog-head');
-  dialogHead.append(create('h2', '', '新建会话'));
-  const closeDialog = chatIconButton('x', '关闭', 'dialog-close');
-  closeDialog.addEventListener('click', () => dialog.close());
-  dialogHead.append(closeDialog);
-  const openForm = create('form', 'new-chat-form') as HTMLFormElement;
-  const targetLabel = create('label', '', 'SteamID64');
-  targetLabel.append(targetInput);
-  const openButton = create('button', 'primary-btn', '打开会话');
-  openButton.type = 'submit';
-  openForm.append(targetLabel, openButton);
-  openForm.addEventListener('submit', (event) => {
-    event.preventDefault();
-    dialog.close();
-    openConversation(formValue(openForm, 'target'));
-  });
-  dialog.append(dialogHead, openForm);
-  dialog.addEventListener('click', (event) => {
-    if (event.target === dialog) dialog.close();
-  });
-  newConversation.addEventListener('click', () => {
-    targetInput.value = '';
-    dialog.showModal();
-    targetInput.focus();
-  });
-  lists.append(listHead, listBody, dialog);
+  const account = create('button', 'cstatus chat-account');
+  account.type = 'button';
+  account.title = '打开控制台';
+  const statusDot = create('span', 'dot status-dot');
+  statusDot.dataset.status = state.steam.status;
+  statusDot.setAttribute('aria-hidden', 'true');
+  const accountStatus = create('span', 'sr-only');
+  accountStatus.id = 'chatAccountStatus';
+  accountStatus.textContent = chatAccountLabel();
+  accountStatus.title = chatAccountLabel();
+  accountStatus.setAttribute('aria-label', chatAccountLabel());
+  accountStatus.dataset.status = state.steam.status;
+  const accountCopy = create('span', 'chat-account-copy');
+  const accountName = create('strong', '', chatAccountName());
+  accountName.id = 'chatAccountName';
+  accountCopy.append(accountName, accountStatus);
+  account.append(statusDot, accountCopy, create('span', 'console-link', '控制台 ›'));
+  account.addEventListener('click', () => openConsole(hasPermission('steam.manage') ? 'accounts' : 'settings'));
+  lists.append(listHead, tabList, scope, listBody, account);
 
-  const thread = create('section', 'thread');
+  const thread = create('main', 'cthread thread');
+  thread.setAttribute('role', 'region'); thread.setAttribute('aria-label', '会话区');
   const head = create('header', 'thread-head');
   head.id = 'threadHead';
   renderThreadHeader(head);
   const messages = create('div', 'messages');
   messages.id = 'messages';
+  messages.setAttribute('role', 'log');
   messages.setAttribute('aria-live', 'polite');
+  messages.setAttribute('aria-relevant', 'additions');
+  messages.setAttribute('aria-label', '聊天消息');
+  const health = create('div', 'banner-warn storage-health');
+  health.id = 'storageHealth';
+  health.hidden = true;
+  health.tabIndex = 0;
+  health.title = '查看消息存储详情';
+  health.setAttribute('role', 'status');
+  health.setAttribute('aria-live', 'polite');
+  const healthCopy = create('span', 'storage-health-copy');
+  const healthDetails = create('button', '', '详情');
+  healthDetails.type = 'button';
+  healthDetails.title = '查看消息存储详情';
+  health.append(healthCopy, healthDetails);
+  health.addEventListener('click', () => openConsole('settings'));
+  health.addEventListener('keydown', event => {
+    if (event.key === 'Enter' || event.key === ' ') { event.preventDefault(); openConsole('settings'); }
+  });
   const composer = renderComposer();
-  thread.append(head, renderHistoryTools(), messages, composer);
-  const detailsBackdrop = create('button', 'friend-details-backdrop');
-  detailsBackdrop.id = 'friendDetailsBackdrop';
-  detailsBackdrop.type = 'button';
-  detailsBackdrop.hidden = true;
-  detailsBackdrop.setAttribute('aria-label', '关闭会话资料');
-  detailsBackdrop.addEventListener('click', () => setFriendDetailsOpen(false));
-  const details = create('aside', 'friend-details');
-  details.id = 'friendDetails';
-  details.setAttribute('aria-label', '会话资料');
-  details.hidden = true;
-  view.append(lists, thread, detailsBackdrop, details);
+  const drop = create('div', 'drop-overlay');
+  drop.hidden = true;
+  drop.append(chatIcon('image'), create('strong', '', '释放发送图片'), create('span', '', `发送给 ${state.activeName || state.activeId}`));
+  let dragDepth = 0;
+  const canDrop = () => grantAtLeast('full') && steamOnline() && Boolean(state.activeId) && !isCommunityGroup();
+  thread.addEventListener('dragenter', event => {
+    if (!event.dataTransfer?.types.includes('Files') || !canDrop()) return;
+    event.preventDefault();
+    dragDepth += 1;
+    drop.hidden = false;
+    const recipient = drop.querySelector('span:last-child');
+    if (recipient) recipient.textContent = `发送给 ${state.activeName || state.activeId}`;
+  });
+  thread.addEventListener('dragleave', () => { dragDepth = Math.max(0, dragDepth - 1); if (!dragDepth) drop.hidden = true; });
+  thread.addEventListener('dragover', event => {
+    if (!event.dataTransfer?.types.includes('Files') || !canDrop()) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'copy';
+  });
+  thread.addEventListener('drop', () => { dragDepth = 0; drop.hidden = true; });
+  thread.append(head, health, messages, renderHistoryTools(), composer, drop);
+  view.append(lists, thread);
   syncChatListCollapsed(view);
-  renderFriendDetails(details);
+  updateChatScopeNote(scope);
   view.dataset.detailsOpen = String(state.friendDetailsOpen && Boolean(state.activeId));
-  details.hidden = !state.friendDetailsOpen || !state.activeId;
-  detailsBackdrop.hidden = details.hidden;
   setTimeout(() => {
     if (state.activeId) {
       const restored = restoreThread();
@@ -1916,11 +1856,53 @@ function renderChatView() {
     }
     else renderHistory([]);
     updateChatAvailability();
+    syncFriendDetails();
     updateHistoryControls();
     updateStorageHealth();
     void loadStorageHealth();
   }, 0);
   return view;
+}
+
+const activeChatFloatingPanels = new Set<() => void>();
+
+function openNewConversationDialog() {
+  if (!grantAtLeast('read') || currentSteamGrant()?.scope === 'some') return;
+  const content = create('form', 'stack-form new-chat-form');
+  const label = create('label', '', 'SteamID64');
+  const target = create('input');
+  target.name = 'target';
+  target.inputMode = 'numeric';
+  target.autocomplete = 'off';
+  target.placeholder = 'SteamID64';
+  target.pattern = '[0-9]{17,18}';
+  target.required = true;
+  label.append(target);
+  const friends = create('div', 'new-chat-friends');
+  for (const friend of state.friends) {
+    const choice = create('button', 'conv list-item', friend.name || friend.id);
+    choice.type = 'button';
+    choice.addEventListener('click', () => { close(); openConversation(friend.id, friend.name || friend.id); });
+    friends.append(choice);
+  }
+  content.append(label, create('p', 'hint', '输入 SteamID64，或从好友中选择。'), friends);
+  const close = openDialog('新建会话', content, () => {
+    openConversation(target.value.trim());
+  }, '打开会话');
+  target.focus();
+}
+
+function updateChatScopeNote(note = document.querySelector<HTMLElement>('#chatScopeNote')) {
+  const statusDot = document.querySelector<HTMLElement>('.cstatus > .status-dot');
+  if (statusDot) statusDot.dataset.status = state.steam.status;
+  if (!note) return;
+  const grant = currentSteamGrant();
+  const expiry = grant?.expiresAt ? Date.parse(grant.expiresAt) : NaN;
+  const expiring = Number.isFinite(expiry) && expiry - Date.now() < 7 * 86400000;
+  note.hidden = !grant || (grant.level === 'full' && grant.scope === 'all' && !expiring);
+  note.classList.toggle('is-warning', expiring);
+  const levels = { read: '只读', chat: '聊天', full: '完整' };
+  note.textContent = grant ? `${chatAccountName()}：${levels[grant.level]} · ${grant.scope === 'some' ? `仅 ${grant.peerCount || 0} 位指定好友` : '全部会话'}${grant.expiresAt ? ` · 至 ${new Date(grant.expiresAt).toLocaleDateString('zh-CN')}` : ''}` : '';
 }
 
 function renderChatListSections(container: HTMLElement) {
@@ -1929,16 +1911,27 @@ function renderChatListSections(container: HTMLElement) {
   const desired: HTMLElement[] = [];
   const items = filterChatEntries(chatEntriesForActiveTab(), state.chatQuery);
   if (!items.length) {
-    desired.push(create('div', 'conversation-empty', state.chatQuery.trim() ? '没有匹配的会话' : '暂无会话'));
+    const empty = create('div', 'conversation-empty empty-state');
+    empty.append(create('strong', '', !grantAtLeast('read') ? '此账号尚无聊天访问权限'
+      : state.chatQuery.trim() ? '没有匹配的会话' : state.chatListTab === 'unread' ? '没有未读会话' : '还没有会话'));
+    if (!grantAtLeast('read')) empty.append(create('span', '', '请联系管理员分配 Steam 授权。'));
+    else if (!state.chatQuery.trim() && state.chatListTab === 'recent' && currentSteamGrant()?.scope !== 'some') {
+      const start = create('button', 'btn primary', '新建会话');
+      start.type = 'button';
+      start.addEventListener('click', openNewConversationDialog);
+      empty.append(start);
+    }
+    desired.push(empty);
   }
   for (const item of items) {
     const signature = JSON.stringify([item.name, item.avatar, item.preview, item.updatedAt, item.gameName,
-      item.clanId, item.clanid, item.online, state.chatListCollapsed, formatConversationTime(item.updatedAt)]);
+      item.clanId, item.clanid, item.online, item.personaState, state.unreadCounts[item.id] || 0, state.chatListTab,
+      state.chatListCollapsed, formatConversationTime(item.updatedAt)]);
     let row = existing.get(item.id);
     if (!row || row.dataset.signature !== signature) {
       row = renderListItem(item); row.dataset.peerId = item.id; row.dataset.signature = signature;
     }
-    row.className = `list-item${item.id === state.activeId ? ' is-active' : ''}`;
+    row.className = `conv list-item${item.id === state.activeId ? ' is-active' : ''}`;
     row.setAttribute('aria-current', String(item.id === state.activeId));
     desired.push(row);
   }
@@ -1957,7 +1950,7 @@ function renderChatListSections(container: HTMLElement) {
 function filterChatEntries(items: ListEntry[], query: string): ListEntry[] {
   const normalized = query.trim().toLocaleLowerCase('zh-CN');
   if (!normalized) return items;
-  return items.filter((item) => [item.name, item.id, item.preview]
+  return items.filter((item) => [item.name, item.id, item.preview, item.nickname]
     .some((value) => String(value || '').toLocaleLowerCase('zh-CN').includes(normalized)));
 }
 
@@ -1970,10 +1963,15 @@ function resolvedChatEntry(entry: ListEntry): ListEntry {
 }
 
 function chatEntriesForActiveTab() {
-  if (state.chatListTab === 'friends') return state.friends;
-  if (state.chatListTab === 'groups') return state.groups;
+  if (!grantAtLeast('read')) return [];
+  const grant = currentSteamGrant();
+  const allowed = (item: ListEntry) => grant?.scope !== 'some' || (!isCommunityGroup(item.id)
+    && (!grant.peers || grant.peers.includes(item.id)));
+  if (state.chatListTab === 'friends') return state.friends.filter(allowed);
+  if (state.chatListTab === 'groups') return grant?.scope === 'some' ? [] : state.groups;
   const closed = readClosedConversations();
-  return state.conversations.filter((entry) => !isConversationClosed(entry, closed)).map(resolvedChatEntry);
+  return state.conversations.filter((entry) => allowed(entry) && !isConversationClosed(entry, closed)
+    && (state.chatListTab !== 'unread' || state.unreadCounts[entry.id] > 0)).map(resolvedChatEntry);
 }
 
 // Closed recent conversations are a per-browser preference keyed by Steam account.
@@ -2043,7 +2041,7 @@ type ContextMenuAction = { label: string; danger?: boolean; run: () => void };
 
 function openContextMenu(event: MouseEvent, anchor: HTMLElement, actions: ContextMenuAction[]) {
   closeContextMenu?.();
-  const menu = create('div', 'context-menu');
+  const menu = create('div', 'ctx-menu context-menu');
   menu.setAttribute('role', 'menu');
   const items = actions.map((action) => {
     const item = create('button', `context-menu-item${action.danger ? ' is-danger' : ''}`, action.label);
@@ -2121,20 +2119,40 @@ function syncChatListCollapsed(layout: HTMLElement) {
 }
 
 function updateChatTabs() {
+  if (currentSteamGrant()?.scope === 'some' && state.chatListTab === 'groups') {
+    state.chatListTab = 'recent';
+    localStorage.setItem('steam-chat.list-tab', 'recent');
+  }
   document.querySelectorAll<HTMLButtonElement>('[data-chat-tab]').forEach((button) => {
     const active = button.dataset.chatTab === state.chatListTab;
     button.classList.toggle('is-active', active);
+    button.classList.toggle('is-on', active);
+    button.hidden = button.dataset.chatTab === 'groups' && currentSteamGrant()?.scope === 'some';
+    button.tabIndex = active ? 0 : -1;
     button.setAttribute('aria-selected', String(active));
   });
 }
 
 function updateChatLists() {
+  updateChatTabs();
+  updateChatScopeNote();
+  document.querySelectorAll<HTMLButtonElement>('[data-new-conversation]').forEach(button => {
+    button.hidden = currentSteamGrant()?.scope === 'some';
+    button.disabled = !grantAtLeast('read');
+    button.title = button.disabled ? '当前账户没有聊天访问授权' : '新建会话';
+  });
+  const layout = document.querySelector<HTMLElement>('#chatLayout');
+  if (layout) layout.dataset.mobile = state.chatPanel;
   const list = document.querySelector<HTMLElement>('#chatListSections');
   if (list) renderChatListSections(list);
 }
 
 function renderAvatar(item: ListEntry | null, name: string, className = 'avatar') {
   const avatar = create('span', className, String(name || '?').slice(0, 1).toUpperCase());
+  let hue = 0;
+  for (const char of item?.id || name || '?') hue = (Math.imul(hue, 31) + char.codePointAt(0)!) | 0;
+  avatar.setAttribute('style', `--h: ${((hue % 360) + 360) % 360}`);
+  avatar.dataset.presence = friendPresenceTone(item);
   if (item?.avatar) {
     const image = document.createElement('img');
     image.src = item.avatar;
@@ -2143,7 +2161,11 @@ function renderAvatar(item: ListEntry | null, name: string, className = 'avatar'
     image.alt = '';
     avatar.replaceChildren(image);
   }
-  if (item?.online) avatar.append(create('span', 'online-dot'));
+  if (item) {
+    const dot = create('span', `dot online-dot p-${friendPresenceTone(item)}`);
+    dot.setAttribute('aria-hidden', 'true');
+    avatar.append(dot);
+  }
   return avatar;
 }
 
@@ -2177,10 +2199,25 @@ function friendStatusLabel(item: ListEntry | null) {
 }
 
 function setFriendDetailsOpen(open: boolean, restoreFocus = true) {
+  if (open) closeThreadDatePopover?.();
   state.friendDetailsOpen = open && Boolean(state.activeId) && steamAccessAllowed();
   syncFriendDetails();
   if (state.friendDetailsOpen) document.querySelector<HTMLButtonElement>('#friendDetailsClose')?.focus();
   else if (restoreFocus) document.querySelector<HTMLButtonElement>('#friendDetailsToggle')?.focus();
+}
+
+function dismissFriendDetailsFromPointer(event: PointerEvent) {
+  if (!(event.target instanceof Node)) return;
+  const details = document.querySelector<HTMLElement>('#friendDetails');
+  const toggle = document.querySelector<HTMLElement>('#friendDetailsToggle');
+  if (!details?.contains(event.target) && !toggle?.contains(event.target)) setFriendDetailsOpen(false);
+}
+
+function dismissFriendDetailsFromKey(event: KeyboardEvent) {
+  if (event.key !== 'Escape') return;
+  event.preventDefault();
+  event.stopPropagation();
+  setFriendDetailsOpen(false);
 }
 
 function syncFriendDetails() {
@@ -2198,6 +2235,12 @@ function syncFriendDetails() {
   if (backdrop) backdrop.hidden = !open;
   const toggle = document.querySelector<HTMLButtonElement>('#friendDetailsToggle');
   if (toggle) toggle.setAttribute('aria-expanded', String(open));
+  document.removeEventListener('pointerdown', dismissFriendDetailsFromPointer, true);
+  document.removeEventListener('keydown', dismissFriendDetailsFromKey, true);
+  if (open) {
+    document.addEventListener('pointerdown', dismissFriendDetailsFromPointer, true);
+    document.addEventListener('keydown', dismissFriendDetailsFromKey, true);
+  }
 }
 
 type PresenceTone = 'game' | 'online' | 'away' | 'offline' | 'unknown';
@@ -2253,9 +2296,9 @@ function renderFriendDetails(container: HTMLElement) {
   const tone: PresenceTone = isGroup ? 'unknown' : friendPresenceTone(item);
 
   // Identity: avatar with presence ring, the same name the list shows, the account's nickname and status.
-  const profile = create('section', 'friend-profile');
+  const profile = create('section', 'profile-id friend-profile');
   profile.dataset.presence = tone;
-  const avatar = renderAvatar(item, name, 'friend-avatar');
+  const avatar = renderAvatar(item, name, 'av xl friend-avatar');
   avatar.querySelector('.online-dot')?.remove();
   profile.append(avatar, create('h3', '', name));
   if (nickname) profile.append(create('p', 'friend-persona', `备注：${nickname}`));
@@ -2271,7 +2314,7 @@ function renderFriendDetails(container: HTMLElement) {
 
   // Current game: Steam store art when the app is known, otherwise the reported name.
   if (tone === 'game' && item) {
-    const game = create('section', 'friend-game');
+    const game = create('section', 'game-card friend-game');
     if (item.gameAppId) {
       const art = document.createElement('img');
       art.className = 'friend-game-art';
@@ -2293,7 +2336,7 @@ function renderFriendDetails(container: HTMLElement) {
     container.append(game);
   }
 
-  const facts = create('dl', 'friend-facts');
+  const facts = create('dl', 'facts friend-facts');
   const fact = (label: string, value: string, action?: HTMLElement) => {
     const row = create('div', 'friend-fact');
     const detail = create('dd', '', value);
@@ -2304,28 +2347,77 @@ function renderFriendDetails(container: HTMLElement) {
   };
   fact('SteamID', state.activeId, copyButton('复制 SteamID', state.activeId)).className = 'is-mono';
   fact('关系', isGroup ? 'Steam 社区群组' : isFriend ? 'Steam 好友' : '会话联系人');
+  if (item?.nickname) fact('备注', item.nickname);
   if (tone === 'offline' && item?.lastOnline) fact('最后在线', new Date(item.lastOnline).toLocaleString('zh-CN', { month: 'long', day: 'numeric', hour: '2-digit', minute: '2-digit' }));
   if (state.steam.activeAccount) fact('当前账户', state.steam.activeAccount.label || state.steam.activeAccount.steamId);
+  const grant = currentSteamGrant();
+  fact('我的授权', grant ? `${({ read: '只读', chat: '聊天', full: '完整' })[grant.level]} · ${grant.scope === 'some' ? '指定好友' : '全部会话'}` : '无授权');
   container.append(facts);
 }
 
+let closeThreadDatePopover: (() => void) | null = null;
+
 function renderThreadHeader(container: HTMLElement) {
+  closeThreadDatePopover?.();
   clear(container);
-  const back = chatIconButton('arrow-left', '返回会话列表', 'thread-back');
-  back.addEventListener('click', showChatList);
+  const collapse = chatIconButton(state.chatListCollapsed ? 'panel-left-open' : 'panel-left-close', state.chatListCollapsed ? '展开会话列表' : '收起会话列表', 'icon-btn chat-list-toggle');
+  collapse.id = 'chatListToggle';
+  collapse.setAttribute('aria-controls', 'chatListSections');
+  collapse.setAttribute('aria-expanded', String(!state.chatListCollapsed));
+  collapse.addEventListener('click', () => setChatListCollapsed(!state.chatListCollapsed));
+  const back = chatIconButton('arrow-left', '返回会话列表', 'icon-btn thread-back mobile-only');
+  back.addEventListener('click', () => {
+    setFriendDetailsOpen(false, false);
+    showChatList();
+    const layout = document.querySelector<HTMLElement>('#chatLayout');
+    if (layout) layout.dataset.mobile = 'list';
+  });
   const item = activeChatEntry();
   const name = item?.name || state.activeName || state.activeId || '未选择会话';
-  const identity = create('div', 'thread-identity');
-  identity.append(create('strong', '', name), create('span', 'muted', state.activeId ? friendStatusLabel(item) : 'Steam Chat'));
+  const identity = create('button', 'thread-name thread-identity');
+  identity.type = 'button';
+  identity.id = 'friendDetailsToggle';
+  identity.title = state.activeId ? '查看会话资料' : '请先选择会话';
+  identity.disabled = !state.activeId || !steamAccessAllowed();
+  identity.setAttribute('aria-controls', 'friendDetails');
+  identity.setAttribute('aria-haspopup', 'dialog');
+  identity.setAttribute('aria-expanded', String(state.friendDetailsOpen));
+  identity.addEventListener('click', () => setFriendDetailsOpen(!state.friendDetailsOpen));
+  identity.append(create('strong', '', name), create('span', `presence-text p-${friendPresenceTone(item)}`, state.activeId ? friendStatusLabel(item) : 'Steam Chat'));
   const actions = create('div', 'thread-actions');
-  const toggle = chatIconButton('panel-right', '会话资料', 'icon-btn details-toggle');
-  toggle.id = 'friendDetailsToggle';
-  toggle.disabled = !state.activeId || !steamAccessAllowed();
-  toggle.setAttribute('aria-controls', 'friendDetails');
-  toggle.setAttribute('aria-expanded', String(state.friendDetailsOpen));
-  toggle.addEventListener('click', () => setFriendDetailsOpen(!state.friendDetailsOpen));
-  actions.append(toggle);
-  container.append(back, renderAvatar(item, name, 'thread-avatar'), identity, actions);
+  const date = create('button', 'date-chip');
+  date.id = 'dateChip';
+  date.type = 'button';
+  date.title = '跳转到日期';
+  date.setAttribute('aria-controls', 'datePopover');
+  date.disabled = !state.activeId || !grantAtLeast('read');
+  date.append(chatIcon('scroll-text'), create('span', '', messageDayLabel(historyAt ? new Date(historyAt).getTime() : Date.now())));
+  const popover = renderDatePopover();
+  const dateControls = bindFloatingPanel(date, popover);
+  closeThreadDatePopover = dateControls.close;
+  date.addEventListener('click', () => {
+    setFriendDetailsOpen(false, false);
+    dateControls.toggle();
+    if (!popover.hidden) popover.querySelector<HTMLInputElement>('#historyDate')?.focus();
+  });
+  actions.append(date, popover);
+  const detailsBackdrop = create('button', 'sr-only friend-details-backdrop');
+  detailsBackdrop.id = 'friendDetailsBackdrop';
+  detailsBackdrop.type = 'button';
+  detailsBackdrop.hidden = !state.friendDetailsOpen || !state.activeId;
+  detailsBackdrop.setAttribute('aria-label', '关闭会话资料');
+  detailsBackdrop.addEventListener('click', () => setFriendDetailsOpen(false));
+  const details = create('aside', 'popover profile-pop friend-details');
+  details.id = 'friendDetails';
+  details.setAttribute('role', 'dialog');
+  details.setAttribute('aria-label', '会话资料');
+  details.hidden = detailsBackdrop.hidden;
+  renderFriendDetails(details);
+  const older = create('button', 'ghost-btn sr-only history-older', '更早消息');
+  older.id = 'historyOlder';
+  older.type = 'button';
+  older.addEventListener('click', () => void loadHistory('older'));
+  container.append(back, collapse, renderAvatar(item, name, 'av thread-avatar'), identity, actions, older, detailsBackdrop, details);
 }
 
 function formatConversationTime(value: unknown) {
@@ -2340,40 +2432,81 @@ function formatConversationTime(value: unknown) {
 }
 
 function renderListItem(item: ListEntry) {
-  const button = create('button', `list-item${item.id === state.activeId ? ' is-active' : ''}`);
+  const button = create('button', `conv list-item${item.id === state.activeId ? ' is-active' : ''}`);
   button.type = 'button';
   button.setAttribute('aria-current', item.id === state.activeId ? 'true' : 'false');
   const name = item.name || item.id;
-  const body = create('span', 'item-body');
-  const title = create('span', 'item-title');
+  const body = create('span', 'conv-body item-body');
+  const title = create('span', 'conv-top item-title');
   title.append(create('strong', '', name), create('time', '', formatConversationTime(item.updatedAt)));
-  body.append(title, create('span', 'item-preview', item.preview || item.gameName || item.clanId || item.clanid || item.id));
-  button.append(renderAvatar(item, name), body);
+  const preview = String(item.preview || item.gameName || item.clanId || item.clanid || item.id)
+    .replace(/\[sticker\b[^\]]*\][\s\S]*?\[\/sticker\]/gi, '[贴纸]')
+    .replace(/\[(?:img|image)\b[^\]]*\][\s\S]*?\[\/(?:img|image)\]/gi, '[图片]');
+  const bottom = create('span', 'conv-bottom');
+  bottom.append(create('span', 'conv-preview item-preview', preview));
+  const unread = state.unreadCounts[item.id] || 0;
+  if (unread) {
+    const badge = create('span', 'unread-badge unread', unread > 99 ? '99+' : String(unread));
+    badge.setAttribute('aria-label', `${unread} 条未读消息`);
+    bottom.append(badge);
+  }
+  body.append(title, bottom);
+  button.append(renderAvatar(item, name, 'av avatar'), body);
   // The collapsed list shows avatars only; the body stays readable by assistive tech.
   if (state.chatListCollapsed) button.title = name;
-  button.addEventListener('click', () => openConversation(item.id, item.name || item.id));
-  button.addEventListener('contextmenu', (event) => {
-    if (state.chatListTab !== 'recent') return;
-    event.preventDefault();
-    openContextMenu(event, button, [
-      { label: '打开会话', run: () => openConversation(item.id, item.name || item.id) },
-      { label: '关闭会话', danger: true, run: () => closeConversation(item.id) }
-    ]);
+  const open = () => {
+    state.unreadCounts[item.id] = 0;
+    openConversation(item.id, item.name || item.id);
+  };
+  let longPressed = false;
+  button.addEventListener('click', event => {
+    if (longPressed) { event.preventDefault(); longPressed = false; return; }
+    open();
   });
+  const showMenu = (event: MouseEvent) => {
+    event.preventDefault();
+    const actions: ContextMenuAction[] = [{ label: '打开会话', run: open }];
+    if (state.unreadCounts[item.id]) actions.push({ label: '标为已读', run: () => { state.unreadCounts[item.id] = 0; updateChatLists(); } });
+    if (state.conversations.some(entry => entry.id === item.id)) actions.push({ label: '关闭会话', danger: true, run: () => closeConversation(item.id) });
+    openContextMenu(event, button, actions);
+  };
+  button.addEventListener('contextmenu', showMenu);
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let startX = 0;
+  let startY = 0;
+  const cancelPress = () => { if (timer) clearTimeout(timer); timer = null; };
+  button.addEventListener('pointerdown', event => {
+    cancelPress();
+    longPressed = false;
+    if (event.pointerType === 'mouse' || event.button !== 0) return;
+    startX = event.clientX;
+    startY = event.clientY;
+    timer = setTimeout(() => {
+      timer = null;
+      if (!button.isConnected) return;
+      longPressed = true;
+      showMenu(new MouseEvent('contextmenu', { clientX: startX, clientY: startY }));
+    }, 500);
+  });
+  button.addEventListener('pointermove', event => {
+    if (Math.hypot(event.clientX - startX, event.clientY - startY) > 10) cancelPress();
+  });
+  for (const type of ['pointerup', 'pointercancel', 'pointerleave']) button.addEventListener(type, cancelPress);
   return button;
 }
 
 function renderComposer() {
   const shell = create('footer', 'composer');
-  const disabledNote = create('div', 'offline-note', 'Steam 未在线，聊天发送和素材操作不可用。');
+  const disabledNote = create('div', 'composer-note offline-note', 'Steam 未在线，暂时不能发送。草稿会保留，连接恢复后可继续。');
   disabledNote.id = 'offlineNote';
-  const picker = create('div', 'picker');
+  const picker = create('div', 'popover picker');
   picker.id = 'picker';
   picker.hidden = true;
   picker.setAttribute('role', 'dialog');
   picker.setAttribute('aria-label', '表情和贴纸');
-  const row = create('div', 'compose-row');
-  const pickerButton = chatIconButton('smile', '表情和贴纸', 'composer-tool');
+  const box = create('div', 'composer-box');
+  const row = create('div', 'composer-row compose-row');
+  const pickerButton = chatIconButton('smile', '表情和贴纸', 'icon-btn tool composer-tool');
   pickerButton.id = 'pickerToggle';
   const pickerControls = bindFloatingPanel(pickerButton, picker);
   pickerButton.addEventListener('click', () => {
@@ -2383,9 +2516,9 @@ function renderComposer() {
   });
 
   const attachment = create('div', 'attachment-shell');
-  const attachmentButton = chatIconButton('paperclip', '添加图片', 'composer-tool');
+  const attachmentButton = chatIconButton('image', '添加图片（也可粘贴或拖入）', 'icon-btn tool composer-tool');
   attachmentButton.id = 'attachmentToggle';
-  const attachmentMenu = create('div', 'attachment-menu');
+  const attachmentMenu = create('div', 'popover attachment-menu');
   attachmentMenu.id = 'attachmentMenu';
   attachmentMenu.hidden = true;
   attachmentMenu.setAttribute('role', 'dialog');
@@ -2446,21 +2579,22 @@ function renderComposer() {
       void sendComposer();
     }
   });
-  const send = chatIconButton('send', '发送消息', 'send-btn');
+  const send = chatIconButton('send', '发送消息（Enter）', 'icon-btn send send-btn');
   send.id = 'sendButton';
   send.addEventListener('click', () => void sendComposer());
-  const tools = create('div', 'composer-tools');
-  tools.append(pickerButton, attachment);
   const drafts = create('div', 'image-drafts');
   drafts.id = 'imageDrafts';
   drafts.setAttribute('aria-label', '待发送图片');
-  row.append(drafts, input, tools, send);
+  row.append(pickerButton, attachment, input, send);
+  box.append(drafts, row);
   renderImageDrafts(drafts);
-  const transfers = create('div', 'image-transfers');
+  const transfers = create('div', 'transfers image-transfers');
   transfers.id = 'imageTransfers';
   transfers.setAttribute('aria-label', '图片发送进度');
   renderImageTransfers(transfers);
-  shell.append(disabledNote, picker, transfers, row);
+  const hint = create('p', 'composer-hint', '聊天授权：可发送文字与 Steam 表情；图片、贴纸、效果和回应需要「完整」授权。');
+  hint.hidden = currentSteamGrant()?.level !== 'chat';
+  shell.append(disabledNote, transfers, box, hint, picker);
   shell.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>('button, input, textarea').forEach((node) => {
     if (!['image-transfer-dismiss', 'image-draft-remove', 'image-draft-preview'].includes(node.className)) node.dataset.chatControl = '';
   });
@@ -2469,16 +2603,19 @@ function renderComposer() {
 
 function bindFloatingPanel(trigger: HTMLButtonElement, panel: HTMLElement) {
   const close = () => {
+    activeChatFloatingPanels.delete(close);
     panel.hidden = true;
     trigger.setAttribute('aria-expanded', 'false');
     document.removeEventListener('pointerdown', handlePointerDown);
-    document.removeEventListener('keydown', handleKeyDown);
+    document.removeEventListener('keydown', handleKeyDown, true);
   };
   const handlePointerDown = (event: PointerEvent) => {
     if (event.target instanceof Node && !panel.contains(event.target) && !trigger.contains(event.target)) close();
   };
   const handleKeyDown = (event: KeyboardEvent) => {
     if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
       close();
       trigger.focus();
     }
@@ -2489,9 +2626,10 @@ function bindFloatingPanel(trigger: HTMLButtonElement, panel: HTMLElement) {
       return;
     }
     panel.hidden = false;
+    activeChatFloatingPanels.add(close);
     trigger.setAttribute('aria-expanded', 'true');
     document.addEventListener('pointerdown', handlePointerDown);
-    document.addEventListener('keydown', handleKeyDown);
+    document.addEventListener('keydown', handleKeyDown, true);
   };
   trigger.setAttribute('aria-haspopup', 'dialog');
   trigger.setAttribute('aria-expanded', 'false');
@@ -2510,16 +2648,22 @@ function isCommunityGroup(id = state.activeId) {
 function updateChatAvailability() {
   const group = isCommunityGroup();
   const unavailable = !steamOnline() || !steamAccessAllowed();
-  const disabled = unavailable || group || !state.activeId;
+  const disabled = unavailable || group || !state.activeId || !grantAtLeast('chat');
   document.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>('[data-chat-control]').forEach((node) => {
     node.disabled = disabled;
   });
   const send = document.querySelector<HTMLButtonElement>('#sendButton');
   if (send) send.disabled = disabled || composerSending.has(`${chatContext()}|${state.activeId}`);
+  const box = document.querySelector<HTMLElement>('.composer-box');
+  if (box) box.hidden = steamAccessAllowed() && !grantAtLeast('chat');
+  const attachment = document.querySelector<HTMLButtonElement>('#attachmentToggle');
+  if (attachment) { attachment.disabled = disabled || !grantAtLeast('full'); attachment.title = grantAtLeast('full') ? '添加图片' : '图片需要「完整」授权'; }
+  const hint = document.querySelector<HTMLElement>('.composer-hint');
+  if (hint) { hint.hidden = !grantAtLeast('chat') || grantAtLeast('full'); hint.textContent = '聊天授权：可发送文字与 Steam 表情；图片、贴纸、效果和回应需要「完整」授权。'; }
   const note = document.querySelector<HTMLElement>('#offlineNote');
   if (note) {
-    note.textContent = group ? '这是 Steam 社区群组。当前尚未接入群聊频道，不能在此发送私聊消息；可从资料面板打开群组主页。' : !steamOnline() ? 'Steam 未在线，聊天发送和素材操作不可用。' : '当前账号未被授权访问活动 Steam 账户。';
-    note.hidden = !unavailable && !group;
+    note.textContent = !steamAccessAllowed() ? '此账号尚无聊天访问权限，请联系管理员分配 Steam 授权。' : !grantAtLeast('chat') ? `你在「${chatAccountName()}」上的授权为只读：可以浏览会话和历史，不能发送消息。` : group ? '这是 Steam 社区群组，尚未接入群聊频道。' : 'Steam 未在线，暂时不能发送。草稿会保留，连接恢复后可继续。';
+    note.hidden = !unavailable && !group && grantAtLeast('chat');
   }
 }
 
@@ -2565,7 +2709,7 @@ async function refreshChatData(includeConversations = true) {
       friendsRequest.then(friends => {
         if (context === chatContext() && request === listRequest) {
           state.friends = asListEntries(friends);
-          if (state.view === 'chat') {
+          if (document.querySelector('#chatLayout')) {
             updateChatLists();
             const head = document.querySelector<HTMLElement>('#threadHead');
             if (head) renderThreadHeader(head);
@@ -2587,7 +2731,7 @@ async function refreshChatData(includeConversations = true) {
       state.stickers = [];
     state.effects = [];
     }
-    if (state.view === 'chat') {
+    if (document.querySelector('#chatLayout')) {
       updateChatLists();
       if (!state.activeName) state.activeName = activeChatEntry()?.name || '';
       const head = document.querySelector<HTMLElement>('#threadHead');
@@ -2649,6 +2793,7 @@ function syncChatPanel() {
   const layout = document.querySelector<HTMLElement>('#chatLayout');
   if (!layout) return;
   layout.dataset.mobilePanel = state.chatPanel;
+  layout.dataset.mobile = state.chatPanel;
   layout.dataset.hasConversation = String(Boolean(state.activeId));
 }
 
@@ -2698,19 +2843,39 @@ async function loadConversations(more = false, signal?: AbortSignal) {
 }
 
 function renderHistoryTools() {
-  const tools = create('div', 'history-tools');
+  const tools = create('div', 'detached history-tools');
   tools.id = 'historyTools';
+  tools.hidden = !historyDetached;
+  tools.setAttribute('role', 'status');
+  const status = create('span');
+  status.id = 'historyStatus';
+  const newer = create('button', 'ghost-btn', '较新消息');
+  newer.id = 'historyNewer';
+  newer.type = 'button';
+  newer.addEventListener('click', () => void loadHistory('newer'));
+  const latest = create('button', 'ghost-btn', '回到最新 ↓');
+  latest.id = 'historyLatest';
+  latest.type = 'button';
+  latest.addEventListener('click', () => void loadHistory());
+  tools.append(status, newer, latest);
+  return tools;
+}
+
+function renderDatePopover() {
+  const popover = create('div', 'popover date-pop');
+  popover.id = 'datePopover';
+  popover.hidden = true;
+  popover.setAttribute('role', 'dialog');
+  popover.setAttribute('aria-label', '跳转到日期');
+  popover.append(create('strong', '', '跳转到日期'));
+  const quick = create('div', 'quick');
   const actions = create('form', 'history-actions');
-  const older = create('button', 'ghost-btn', '更早消息');
-  older.id = 'historyOlder';
-  older.type = 'button';
-  older.addEventListener('click', () => void loadHistory('older'));
   const date = create('input');
   date.type = 'datetime-local';
   date.id = 'historyDate';
   date.setAttribute('aria-label', '消息日期和时间');
   date.value = historyAt;
-  const jump = chatIconButton('search', '查询日期');
+  const jump = create('button', 'btn primary', '跳转');
   jump.id = 'historyJump';
   jump.type = 'submit';
   actions.addEventListener('submit', (event) => {
@@ -2719,23 +2884,34 @@ function renderHistoryTools() {
       setFeedback('请选择有效的日期和时间。', 'warn');
       return;
     }
+    closeThreadDatePopover?.();
+    document.querySelector<HTMLButtonElement>('#dateChip')?.focus();
     void loadHistory('date', date.value);
   });
-  const newer = create('button', 'ghost-btn', '较新消息');
-  newer.id = 'historyNewer';
-  newer.type = 'button';
-  newer.addEventListener('click', () => void loadHistory('newer'));
-  const latest = create('button', 'ghost-btn', '返回最新');
-  latest.id = 'historyLatest';
-  latest.type = 'button';
-  latest.addEventListener('click', () => void loadHistory());
-  actions.append(older, date, jump, newer, latest);
-  const health = create('div', 'storage-health');
-  health.id = 'storageHealth';
-  health.setAttribute('role', 'status');
-  health.setAttribute('aria-live', 'polite');
-  tools.append(actions, health);
-  return tools;
+  for (const label of ['昨天', '上周一', '一个月前']) {
+    const button = create('button', 'chip', label);
+    button.type = 'button';
+    button.addEventListener('click', () => {
+      const value = new Date();
+      value.setHours(0, 0, 0, 0);
+      if (label === '昨天') value.setDate(value.getDate() - 1);
+      else if (label === '上周一') value.setDate(value.getDate() - ((value.getDay() + 6) % 7) - 7);
+      else {
+        const day = value.getDate();
+        value.setDate(1);
+        value.setMonth(value.getMonth() - 1);
+        const last = new Date(value.getFullYear(), value.getMonth() + 1, 0).getDate();
+        value.setDate(Math.min(day, last));
+      }
+      const local = new Date(value.getTime() - value.getTimezoneOffset() * 60000);
+      date.value = local.toISOString().slice(0, 16);
+      actions.requestSubmit();
+    });
+    quick.append(button);
+  }
+  actions.append(date, jump);
+  popover.append(quick, actions, create('p', 'hint', '跳转后可继续向上或向下浏览，随时回到最新。'));
+  return popover;
 }
 
 function updateHistoryControls() {
@@ -2747,13 +2923,22 @@ function updateHistoryControls() {
   ] as Array<[string, boolean, boolean]>) {
     const button = document.querySelector<HTMLButtonElement>(`#${id}`);
     if (button) {
-      button.disabled = disabled || !state.activeId || !steamAccessAllowed();
+      button.disabled = disabled || !state.activeId || !grantAtLeast('read');
       button.hidden = hidden;
     }
   }
   const older = document.querySelector<HTMLElement>('#historyOlder');
   if (older) older.textContent = historyBusy ? (historyRefreshing ? '正在同步…' : '加载中…') : '更早消息';
-  document.querySelector('#historyTools')?.setAttribute('aria-busy', String(historyBusy));
+  const tools = document.querySelector<HTMLElement>('#historyTools');
+  if (tools) {
+    tools.hidden = !historyDetached;
+    tools.setAttribute('aria-busy', String(historyBusy));
+  }
+  const status = document.querySelector<HTMLElement>('#historyStatus');
+  const count = historyLive.length;
+  if (status) status.textContent = `正在查看${historyAt ? ` ${messageDayLabel(new Date(historyAt).getTime())} 的` : ''}历史${count ? ` · ${count} 条新消息` : ''}`;
+  const dateChip = document.querySelector<HTMLButtonElement>('#dateChip');
+  if (dateChip) dateChip.disabled = !state.activeId || !grantAtLeast('read');
 }
 
 function storageHealthText(payload: unknown): string {
@@ -2782,7 +2967,13 @@ function storageHealthy(payload: unknown): boolean {
 function updateStorageHealth() {
   const node = document.querySelector<HTMLElement>('#storageHealth');
   const text = storageHealthText(storageHealth);
-  if (node && node.textContent !== text) node.textContent = text;
+  if (node) {
+    const label = node.querySelector('.storage-health-copy');
+    if (label) label.textContent = text;
+    else node.textContent = text;
+  }
+  const detail = document.querySelector('#storageDetails');
+  if (detail) detail.textContent = text;
   // Only surface storage state when it needs attention.
   if (node) node.hidden = storageHealth === undefined || storageHealthy(storageHealth);
 }
@@ -2845,6 +3036,7 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
     const confirmed = new Set(items.map((item) => item.eventId).filter(Boolean));
     historyLive = historyLive.filter((item) => !item.eventId || !confirmed.has(item.eventId));
     if (mode === 'older' || mode === 'newer') {
+      messages.setAttribute('aria-live', 'off');
       const seen = new Set(historyItems.map((item) => item.eventId).filter(Boolean));
       const additions = items.filter((item) => !item.eventId || !seen.has(item.eventId));
       const top = messages.scrollTop;
@@ -2909,7 +3101,7 @@ function updateRecentConversation(item: MessageItem, render = true) {
   const name = friend?.name || previous?.name
     || (item.id === state.activeId ? state.activeName : '')
     || (!item.echo ? item.name : '') || item.id;
-  const preview = item.type === 'image' ? '[图片]' : (item.message || '').replace(/\s+/g, ' ').trim() || '[空消息]';
+  const preview = item.type === 'image' || /\[img\b/i.test(item.message || '') ? '[图片]' : /\[sticker\b|^\/sticker\b/i.test(item.message || '') ? '[贴纸]' : (item.message || '').replace(/\s+/g, ' ').trim() || '[空消息]';
   const conversation: ListEntry = { ...previous, id: item.id, name, updatedAt, preview,
     lastType: item.type || 'message', lastEcho: Boolean(item.echo) };
   recentConversationUpdates.set(item.id, conversation);
@@ -3021,6 +3213,7 @@ function notifyIncomingMessage(item: MessageItem) {
   }
   if (state.view === 'chat' && state.activeId === item.id && state.chatPanel === 'thread'
     && document.visibilityState === 'visible' && document.hasFocus()) return;
+  if (localStorage.getItem('steam-chat.notify-background-only') === 'true' && document.visibilityState === 'visible' && document.hasFocus()) return;
   void playNotificationSound();
   if (typeof Notification === 'undefined' || Notification.permission !== 'granted'
     || localStorage.getItem('steam-chat.desktop-notifications') !== 'true') return;
@@ -3031,24 +3224,28 @@ function notifyIncomingMessage(item: MessageItem) {
     const notification = new Notification(name, { body: item.type === 'image' ? '发来了一张图片' : '发来了一条新消息', tag: item.eventId });
     desktopNotifications.add(notification);
     notification.onclose = () => desktopNotifications.delete(notification);
-    notification.onclick = () => {
+    notification.onclick = async () => {
       notification.close();
       desktopNotifications.delete(notification);
       if (context !== chatContext() || !state.me || !steamAccessAllowed()) return;
       window.focus();
-      const previous = state.view;
-      state.view = 'chat';
-      localStorage.setItem('steam-chat.view', 'chat');
-      if (previous !== 'chat') renderShell();
+      await openConsole('chat');
+      if (state.view !== 'chat') return;
       openConversation(item.id, name);
     };
   } catch { /* Unsupported desktop delivery must never interrupt incoming messages. */ }
 }
 
+const unreadEvents = new Set<string>();
 function receiveHistoryMessage(item: MessageItem) {
   if (!item.id || !steamAccessAllowed()) return;
   const account = state.steam.activeAccount?.steamId || state.steam.steamId;
   if (item.steamAccountId && item.steamAccountId !== account) return;
+  const unreadKey = item.eventId || `${item.id}|${item.sentAt || item.date}|${item.message}`;
+  if (!item.echo && (item.id !== state.activeId || historyDetached || document.hidden) && !unreadEvents.has(unreadKey)) {
+    unreadEvents.add(unreadKey); if (unreadEvents.size > 2000) unreadEvents.delete(unreadEvents.values().next().value!);
+    state.unreadCounts[item.id] = (state.unreadCounts[item.id] || 0) + 1;
+  }
   updateRecentConversation(item);
   updateCachedMessage(item);
   scheduleChatCache();
@@ -3065,13 +3262,15 @@ function receiveHistoryMessage(item: MessageItem) {
   }
   if (item.id !== state.activeId) return;
   historyLive = uniqueMessages([...historyLive, item]).slice(-500);
-  if (historyDetached || (item.eventId && historyItems.some((entry) => entry.eventId === item.eventId))) return;
+  if (historyDetached) { updateHistoryControls(); return; }
+  if (item.eventId && historyItems.some((entry) => entry.eventId === item.eventId)) return;
   historyItems.push(item);
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages) return;
   const atBottom = historyScroll ? historyScroll.following()
     : messages.scrollHeight - messages.scrollTop - messages.clientHeight < 48;
   messages.querySelector('.thread-empty')?.remove();
+  messages.setAttribute('aria-live', 'polite');
   messages.append(renderMessage(item));
   markMessageRuns(messages, Math.max(0, messages.children.length - 1));
   if (atBottom) followHistoryBottom(messages);
@@ -3087,20 +3286,26 @@ function watchHistoryLayout(messages: HTMLElement, follow: boolean) {
   historyScroll?.dispose();
   if (typeof ResizeObserver === 'undefined') return;
   let frame = 0;
+  let disposed = false;
   const setFollowing = (value: boolean) => {
     follow = value && !historyDetached;
     messages.dataset.followBottom = String(follow);
   };
   setFollowing(follow);
   const settle = () => {
-    if (!follow || frame) return;
+    if (disposed || !follow || frame) return;
     frame = requestAnimationFrame(() => {
       frame = 0;
-      if (!messages.isConnected) { dispose(); return; }
+      if (disposed || !messages.isConnected) { dispose(); return; }
       if (follow && !historyDetached && messages.clientHeight > 0) messages.scrollTop = messages.scrollHeight;
     });
   };
   const onScroll = () => {
+    if (messages.scrollTop <= 24 && historyBefore && !historyBusy) void loadHistory('older');
+    const top = messages.getBoundingClientRect().top;
+    const first = [...messages.querySelectorAll<HTMLElement>('[data-sent-at]')].find(row => row.getBoundingClientRect().bottom >= top);
+    const chip = document.querySelector('#dateChip');
+    if (chip && first) chip.textContent = messageDayLabel(Number(first.dataset.sentAt));
     if (messages.scrollHeight - messages.scrollTop - messages.clientHeight < 2) setFollowing(true);
     else settle();
   };
@@ -3115,10 +3320,11 @@ function watchHistoryLayout(messages: HTMLElement, follow: boolean) {
   // Browser scroll anchoring and layout changes are not user scroll intent.
   // Settle after layout, and disable following only on actual interaction.
   const observer = new ResizeObserver(() => {
-    if (!messages.isConnected) { dispose(); return; }
+    if (disposed || !messages.isConnected) { dispose(); return; }
     settle();
   });
   const dispose = () => {
+    disposed = true;
     observer.disconnect();
     if (frame) cancelAnimationFrame(frame);
     messages.removeEventListener('scroll', onScroll);
@@ -3207,6 +3413,7 @@ const renderedHistoryRows = new WeakMap<MessageItem, HTMLElement>();
 function renderHistory(items: MessageItem[]) {
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages) return;
+  messages.setAttribute('aria-live', 'off');
   const existing = new Map(Array.from(messages.children).filter(row => (row as HTMLElement).dataset.eventId)
     .map(row => [(row as HTMLElement).dataset.eventId, row]));
   const desired: Element[] = [];
@@ -3214,8 +3421,9 @@ function renderHistory(items: MessageItem[]) {
   const historyRows = new Map<MessageItem, Element>();
   if (!items.length && !outgoing.length) {
     const empty = create('div', 'thread-empty');
-    if (state.activeId) empty.append(create('strong', '', '暂无消息'));
-    else empty.append(chatIcon('messages-square'), create('strong', '', '未选择会话'), create('span', 'muted', '从左侧选择一个会话，或新建会话开始聊天'));
+    if (!steamAccessAllowed()) empty.append(create('strong', '', '此账号尚无聊天访问权限'), create('p', 'muted', '请联系管理员分配 Steam 授权。'));
+    else if (state.activeId) empty.append(create('strong', '', '暂无消息'));
+    else empty.append(chatIcon('messages-square'), create('strong', '', '选择一个会话'), create('span', 'muted', '从左侧选择一个会话，或新建会话开始聊天'));
     desired.push(empty);
   } else {
     for (const item of items) {
@@ -3230,6 +3438,7 @@ function renderHistory(items: MessageItem[]) {
     const row = renderMessage(localImage ? { ...entry.item, message: '[图片]' } : entry.item);
     row.dataset.outgoingId = String(entry.localId);
     row.dataset.sendState = entry.state;
+    row.dataset.state = (entry as ImageOperationEntry).operation?.state || entry.state;
     if (localImage) {
       const content = row.querySelector('.message-content');
       const image = create('img', 'outgoing-image-preview');
@@ -3243,6 +3452,7 @@ function renderHistory(items: MessageItem[]) {
     const status = create('span', 'message-send-state');
     if (operationEntry.operation) status.append(create('span', 'outgoing-status-label', imageOperationLabel(operationEntry.operation, operationEntry.uploadRejection)));
     else status.textContent = labels[entry.state];
+    if (entry.state !== 'sent') status.prepend(chatIcon(operationEntry.operation?.state === 'retry_wait' ? 'refresh-cw' : entry.state === 'failed' ? 'circle-alert' : entry.state === 'unknown' ? 'circle-help' : 'clock'));
     status.setAttribute('role', 'status');
     if (entry.error) {
       status.title = entry.error;
@@ -3250,9 +3460,13 @@ function renderHistory(items: MessageItem[]) {
       status.append(create('span', 'outgoing-error', reason));
     }
     if (operationEntry.operationQueryError) status.append(create('span', 'outgoing-error', '暂时无法查询发送结果，连接恢复后会继续核对。'));
-    const bubble = row.querySelector('.bubble') || row;
+    const bubble = row.querySelector('.msg-foot') || row.querySelector('.bubble') || row;
     bubble.append(status);
     if (operationEntry.operation || operationEntry.operationCreatingFailed) appendImageOperationActions(bubble as HTMLElement, operationEntry);
+    if (entry.state === 'failed' && entry.retryText && !operationEntry.operation && !operationEntry.operationCreatingFailed && entry.item.type !== 'image' && grantAtLeast(requiresFullText(entry.retryText) ? 'full' : 'chat')) {
+      const retry = create('button', 'ghost-btn outgoing-retry', '重试');
+      retry.addEventListener('click', () => { outgoingMessages.delete(entry.localId); void sendText(entry.retryText, entry.item.message); }); bubble.append(retry);
+    }
     if (entry.state === 'failed' || entry.state === 'unknown') {
       const dismiss = create('button', 'ghost-btn outgoing-dismiss', '移除此提示');
       dismiss.type = 'button';
@@ -3330,11 +3544,12 @@ function markMessageRuns(messages: HTMLElement, start = 0) {
     const day = Number.isFinite(time) ? new Date(time).toDateString() : previousDay;
     if (day && day !== previousDay) row.dataset.day = messageDayLabel(time);
     else delete row.dataset.day;
-    const continued = sender === previousSender && day === previousDay
+    const continued = !row.dataset.state && sender === previousSender && day === previousDay
       && Number.isFinite(time) && Number.isFinite(previousTime) && time - previousTime < messageRunGapMs;
     if (continued) row.dataset.continued = 'true';
     else delete row.dataset.continued;
-    previousSender = sender;
+    row.classList.toggle('is-cont', continued);
+    previousSender = row.dataset.state ? '' : sender;
     previousTime = Number.isFinite(time) ? time : previousTime;
     previousDay = day;
   }
@@ -3393,11 +3608,11 @@ function renderReactionBar(bar: HTMLElement, item: MessageItem) {
   if (!key || !reactionSnapshots.has(key) || isCommunityGroup(item.id)) return;
   const reactions = reactionSnapshots.get(key)!;
   const account = state.steam.activeAccount?.steamId || state.steam.steamId;
-  const eligible = steamOnline() && steamAccessAllowed() && !reactionPending.has(key);
+  const eligible = steamOnline() && grantAtLeast('full') && !reactionPending.has(key);
   const reactorName = (id: string) => id === account ? '你' : state.friends.find(friend => friend.id === id)?.name || (id === item.id ? resolvedChatEntry({ id }).name : '') || id;
   const icon = (type: number, name: string) => type === 1 ? emoticonNode(name.replace(/^:|:$/g, '')) : stickerNode(name);
   const change = async (type: number, name: string, add: boolean) => {
-    if (reactionPending.has(key)) return;
+    if (!grantAtLeast('full') || reactionPending.has(key)) return;
     const context = chatContext();
     reactionGeneration++; reactionPending.add(key); renderReactionBar(bar, item);
     try {
@@ -3421,17 +3636,26 @@ function renderReactionBar(bar: HTMLElement, item: MessageItem) {
     button.type = 'button'; button.disabled = !eligible;
     button.setAttribute('aria-pressed', String(mine));
     button.title = `${reaction.users.map(reactorName).join('、')} 以 ${reaction.name} 回应`;
+    if (!grantAtLeast('full')) button.title = '表情回应需要「完整」授权';
     button.setAttribute('aria-label', button.title);
     button.append(icon(reaction.type, reaction.name), create('span', '', String(reaction.users.length)));
     button.addEventListener('click', () => void change(reaction.type, reaction.name, !mine));
     bar.append(button);
   }
   const add = create('button', 'reaction-add', '☺'); add.type = 'button'; add.disabled = !eligible;
-  add.title = '添加表情回应'; add.setAttribute('aria-label', '添加表情回应');
-  add.addEventListener('click', () => {
+  add.title = grantAtLeast('full') ? '添加表情回应' : '表情回应需要「完整」授权'; add.setAttribute('aria-label', '添加表情回应');
+  add.addEventListener('click', async () => {
     const existing = bar.querySelector('.reaction-picker');
     if (existing) { existing.remove(); return; }
+    const context = chatContext();
     const picker = create('div', 'reaction-picker');
+    picker.append(create('p', 'muted', '正在加载表情…')); bar.append(picker);
+    add.disabled = true;
+    await loadChatInventory();
+    if (context !== chatContext() || !bar.isConnected || !picker.isConnected) return;
+    add.disabled = !grantAtLeast('full');
+    if (!grantAtLeast('full')) { picker.remove(); return; }
+    clear(picker);
     const close = create('button', 'ghost-btn', '关闭'); close.type = 'button'; close.addEventListener('click', () => picker.remove());
     picker.append(close);
     const grid = create('div', 'picker-grid');
@@ -3453,20 +3677,23 @@ function renderReactionBar(bar: HTMLElement, item: MessageItem) {
 }
 
 function renderMessage(item: MessageItem) {
-  const row = create('article', `msg-row${item.echo ? ' is-self' : ''}`);
+  const row = create('article', `msg msg-row${item.echo ? ' is-self' : ''}`);
   if (item.eventId) row.dataset.eventId = item.eventId;
   row.dataset.sender = item.echo ? 'self' : String(item.id || item.name || '');
   const sentAt = new Date(String(item.sentAt || item.date || '').replace(' ', 'T')).getTime();
   if (Number.isFinite(sentAt)) row.dataset.sentAt = String(sentAt);
-  const bubble = create('div', 'bubble');
-  const meta = create('div', 'meta');
-  meta.append(create('span', '', item.name || (item.echo ? '我' : item.id)), create('span', '', formatTime(item.sentAt || item.date)));
+  const bubble = create('div', 'msg-main bubble');
+  const meta = create('header', 'msg-head meta');
+  meta.append(create('strong', '', item.echo ? state.me ? displayName(state.me) : '我' : item.name || item.id));
+  if (item.echo) meta.append(create('span', 'me-tag', '我'));
+  meta.append(create('time', '', formatTime(item.sentAt || item.date)));
   if (item.eventId && item.echo) {
     const unparsedSticker = /^\/(?:sticker|roomeffect)(?:\s|$)/i.test((item.message || '').trim());
     row.dataset.sendState = unparsedSticker ? 'unknown' : 'sent';
-    meta.append(create('span', 'message-send-state', unparsedSticker ? (/^\/roomeffect/i.test(item.message || '') ? '聊天效果结果未确认' : '贴纸结果未确认') : '已发送'));
+    if (unparsedSticker) row.dataset.state = 'unknown';
+    if (unparsedSticker) meta.append(create('span', 'message-send-state', /^\/roomeffect/i.test(item.message || '') ? '聊天效果结果未确认' : '贴纸结果未确认'));
   }
-  const content = create('div', 'message-content');
+  const content = create('div', 'msg-body message-content');
   const message = item.message || '';
   if (item.type === 'image') {
     if (isRemoteImageSource(message)) content.append(imageNode(message));
@@ -3476,7 +3703,7 @@ function renderMessage(item: MessageItem) {
   }
   bubble.append(meta, content);
   const reactions = create('div', 'message-reactions');
-  bubble.append(reactions);
+  const foot = create('div', 'msg-foot'); foot.append(reactions); bubble.append(foot);
   renderReactionBar(reactions, item);
   if (Number.isFinite(sentAt)) {
     // Shown beside the bubble on hover; the meta line already carries the time for assistive tech.
@@ -3485,7 +3712,16 @@ function renderMessage(item: MessageItem) {
     hoverTime.setAttribute('aria-hidden', 'true');
     bubble.append(hoverTime);
   }
-  row.append(bubble);
+  const avatar = renderAvatar(item.echo ? null : activeChatEntry(), item.echo ? state.me ? displayName(state.me) : '我' : item.name || item.id, 'msg-av avatar');
+  const tools = create('div', 'msg-tools');
+  const react = chatIconButton('smile', '添加表情回应'); react.disabled = !grantAtLeast('full') || !messageReactionKey(item);
+  if (!grantAtLeast('full')) react.title = '表情回应需要「完整」授权';
+  react.addEventListener('click', () => reactions.querySelector<HTMLButtonElement>('.reaction-add')?.click());
+  const copy = copyButton('复制消息', item.message || ''); tools.append(react, copy);
+  row.append(avatar, bubble, tools);
+  let press: ReturnType<typeof setTimeout> | null = null;
+  row.addEventListener('pointerdown', event => { if (event.pointerType !== 'mouse') press = setTimeout(() => row.classList.add('show-tools'), 500); });
+  for (const name of ['pointerup', 'pointercancel', 'pointermove']) row.addEventListener(name, () => { if (press) clearTimeout(press); press = null; });
   return row;
 }
 
@@ -4222,13 +4458,20 @@ function activeIdOrWarn() {
   return '';
 }
 
+function requiresFullText(text: string) {
+  return /^\s*\/(sticker|roomeffect)(\s|$)/i.test(text) || /\[(sticker|roomeffect)\b/i.test(text);
+}
+
 async function sendText(explicitMessage?: string, previewMessage?: string): Promise<boolean> {
+  if (!grantAtLeast('chat')) { setFeedback('当前授权不能发送消息', 'warn'); return false; }
   const id = activeIdOrWarn();
   const input = document.querySelector<HTMLTextAreaElement>('#messageInput');
   const draft = explicitMessage ?? input?.value ?? '';
   const msg = draft.trim();
   if (!id || !msg || isCommunityGroup(id)) return false;
+  if (requiresFullText(msg) && !grantAtLeast('full')) { setFeedback('贴纸和聊天效果需要「完整」授权', 'warn'); return false; }
   const outgoing = beginOutgoing(id, previewMessage ?? msg.replace(/\[/g, '\\['));
+  outgoing.retryText = msg;
   if (explicitMessage === undefined && input) { input.value = ''; resizeComposerInput(input); }
   try {
     const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId;
@@ -4507,6 +4750,7 @@ async function resendImageOperation(entry: ImageOperationEntry) {
   finally { entry.operationBusy = false; }
 }
 function appendImageOperationActions(bubble: HTMLElement, entry: ImageOperationEntry) {
+  if (!grantAtLeast('full')) return;
   const action = (label: string, run: () => unknown) => {
     const button = create('button', 'ghost-btn image-operation-action', label); button.type = 'button';
     button.disabled = label === '立即重试' && (entry.operation?.cooldownUntil || 0) > Date.now();
@@ -4671,7 +4915,7 @@ async function sendImage(payload: Record<string, string>, existing?: ImageTransf
 }
 
 function canSendImages() {
-  return Boolean(state.me && state.view === 'chat' && steamOnline() && steamAccessAllowed() && state.activeId && !isCommunityGroup());
+  return Boolean(state.me && state.view === 'chat' && steamOnline() && grantAtLeast('full') && state.activeId && !isCommunityGroup());
 }
 
 function handleImagePaste(event: ClipboardEvent) {
@@ -4799,7 +5043,9 @@ function renderImageEmotesView() {
 
 function renderImageEmoteManager(container: HTMLElement) {
   clear(container);
-  const tools = panel('图片表情分组');
+  container.classList.add('emote-layout');
+  container.dataset.mobileDetail = String(imageEmoteMobileDetail);
+  const tools = panel('图片表情分组', 'emote-groups');
   const groupForm = create('form', 'image-emote-tools');
   const newName = create('input'); newName.placeholder = '新分组名称'; newName.maxLength = 80; newName.required = true;
   newName.setAttribute('aria-label', '新分组名称');
@@ -4809,6 +5055,10 @@ function renderImageEmoteManager(container: HTMLElement) {
   groupForm.append(newName, add, refresh);
   groupForm.addEventListener('submit', event => { event.preventDefault(); void editImageEmotes({ action: 'createGroup', name: newName.value }); });
   tools.append(groupForm);
+  for (const group of imageEmoteCatalog.groups) {
+    const button = create('button', `list-item${group.id === imageEmoteGroup ? ' is-active' : ''}`, `${group.name} · ${imageEmoteCatalog.images.filter(item => item.groupId === group.id).length}`);
+    button.addEventListener('click', () => { imageEmoteGroup = group.id; imageEmoteMobileDetail = true; renderImageEmoteManager(container); }); tools.append(button);
+  }
   if (imageEmoteError) tools.append(create('p', 'warn-text', imageEmoteError));
   if (imageEmoteLoading) tools.append(create('p', 'muted', '加载素材库…'));
   container.append(tools);
@@ -4819,6 +5069,7 @@ function renderImageEmoteManager(container: HTMLElement) {
   if (!imageEmoteCatalog.groups.some(group => group.id === imageEmoteGroup)) imageEmoteGroup = imageEmoteCatalog.groups[0].id;
   const activeGroup = imageEmoteCatalog.groups.find(group => group.id === imageEmoteGroup)!;
   const section = panel('分组内容');
+  const back = create('button', 'btn mobile-only', '返回分组'); back.addEventListener('click', () => { imageEmoteMobileDetail = false; renderImageEmoteManager(container); }); section.prepend(back);
   const controls = create('form', 'image-emote-tools');
   const groups = imageGroupSelect(imageEmoteGroup);
   groups.addEventListener('change', () => { imageEmoteGroup = groups.value; renderImageEmoteManager(container); });
@@ -4827,26 +5078,35 @@ function renderImageEmoteManager(container: HTMLElement) {
   const saveGroup = create('button', 'ghost-btn', '保存分组名称'); saveGroup.type = 'submit';
   const deleteGroup = create('button', 'danger-btn', '删除空分组'); deleteGroup.type = 'button';
   deleteGroup.disabled = imageEmoteCatalog.images.some(item => item.groupId === imageEmoteGroup);
-  deleteGroup.addEventListener('click', () => { if (window.confirm(`删除分组“${activeGroup.name}”？`)) void editImageEmotes({ action: 'deleteGroup', id: activeGroup.id }); });
+  deleteGroup.title = deleteGroup.disabled ? '分组内仍有图片，移除所有图片后才能删除' : '删除空分组';
+  deleteGroup.addEventListener('click', async () => { if (await confirmDialog(`删除分组「${activeGroup.name}」？`)) void editImageEmotes({ action: 'deleteGroup', id: activeGroup.id }); });
   controls.append(groups, rename, saveGroup, deleteGroup);
   controls.addEventListener('submit', event => { event.preventDefault(); void editImageEmotes({ action: 'renameGroup', id: activeGroup.id, name: rename.value }); });
   const upload = create('input'); upload.type = 'file'; upload.multiple = true; upload.accept = 'image/png,image/jpeg,image/gif,image/webp';
   upload.setAttribute('aria-label', '上传图片表情');
   upload.addEventListener('change', () => { void uploadImageEmotes(Array.from(upload.files || []), activeGroup.id); });
-  section.append(controls, create('p', 'muted', '支持 PNG、JPEG、GIF、WebP，每张最多 7 MiB。相同图片共用原文件，动画保留。'), upload);
+  section.append(controls, create('p', 'muted', '支持 PNG、JPEG、GIF、WebP，每张最多 7 MiB。相同图片共用原文件，动画保留。'));
   const grid = create('div', 'image-emote-grid');
+  const uploadCell = create('label', 'dropzone emote-upload', '＋ 拖入或选择图片'); uploadCell.append(upload); upload.multiple = true;
+  uploadCell.addEventListener('dragover', event => { event.preventDefault(); event.stopPropagation(); });
+  uploadCell.addEventListener('drop', event => { event.preventDefault(); event.stopPropagation(); void uploadImageEmotes(Array.from(event.dataTransfer?.files || []), activeGroup.id); });
+  grid.append(uploadCell);
   for (const item of imageEmoteCatalog.images.filter(item => item.groupId === imageEmoteGroup)) {
-    const form = create('form', 'image-emote-card');
+    const form = create('article', 'image-emote-card');
     const preview = create('button', 'image-emote-preview'); preview.type = 'button'; preview.title = '查看图片';
     const img = create('img'); img.src = emoteFileUrl(item.id); img.alt = item.name; img.loading = 'lazy'; preview.append(img);
     preview.addEventListener('click', () => openLightbox(emoteFileUrl(item.id)));
     const title = create('input'); title.value = item.name; title.required = true; title.maxLength = 80; title.setAttribute('aria-label', '图片名称');
     const destination = imageGroupSelect(item.groupId);
-    const save = create('button', 'ghost-btn', '保存名称 / 分组'); save.type = 'submit';
+    const save = create('button', 'ghost-btn', '编辑名称与分组'); save.type = 'button';
     const remove = create('button', 'danger-btn', '删除图片'); remove.type = 'button';
-    remove.addEventListener('click', () => { if (window.confirm(`从素材库删除“${item.name}”？已发送消息不受影响。`)) void editImageEmotes({ action: 'deleteImage', id: item.id }); });
-    form.append(preview, title, destination, create('small', 'muted', `${item.width} × ${item.height} · ${Math.ceil(item.bytes / 1024)} KiB`), save, remove);
-    form.addEventListener('submit', event => { event.preventDefault(); void editImageEmotes({ action: 'updateImage', id: item.id, groupId: destination.value, name: title.value }); });
+    remove.addEventListener('click', async () => { if (await confirmDialog(`从素材库删除「${item.name}」？已发送消息不受影响。`)) void editImageEmotes({ action: 'deleteImage', id: item.id }); });
+    form.append(preview, create('strong', '', item.name), create('small', 'muted', `${item.width} × ${item.height} · ${Math.ceil(item.bytes / 1024)} KiB`), save, remove);
+    save.addEventListener('click', () => {
+      const fields = create('form', 'stack-form'); const label = create('label', '', '图片名称'); label.append(title);
+      const groupLabel = create('label', '', '分组'); groupLabel.append(destination); fields.append(label, groupLabel);
+      openDialog('编辑图片表情', fields, async () => { await editImageEmotes({ action: 'updateImage', id: item.id, groupId: destination.value, name: title.value }); });
+    });
     grid.append(form);
   }
   if (!grid.childElementCount) grid.append(create('p', 'empty', '此分组暂无图片，请选择文件上传。'));
@@ -4863,7 +5123,7 @@ async function uploadImageEmotes(files: File[], groupId: string) {
   let count = 0;
   try {
     for (const file of files) {
-      if (context !== chatContext() || state.view !== 'imageEmotes') break;
+      if (context !== chatContext() || state.view !== 'emotes') break;
       if (!file.size || file.size > 7 * 1024 * 1024) throw new Error(`${file.name}：图片必须小于 7 MiB 且不能为空`);
       const data = await new Promise<string>((resolve, reject) => {
         const reader = new FileReader();
@@ -4871,7 +5131,7 @@ async function uploadImageEmotes(files: File[], groupId: string) {
         reader.onerror = () => reject(new Error('无法读取图片')); reader.onabort = () => reject(new Error('图片读取已取消'));
         reader.readAsDataURL(file);
       });
-      if (context !== chatContext() || state.view !== 'imageEmotes') break;
+      if (context !== chatContext() || state.view !== 'emotes') break;
       setFeedback(`正在保存 ${count + 1}/${files.length}：${file.name}`, 'muted');
       const catalog = await mutateImageEmotes({ action: 'addImage', groupId, name: file.name.slice(0, 80), data });
       if (context !== chatContext()) return;
@@ -4920,10 +5180,13 @@ function renderPicker(container: HTMLElement) {
     container.dataset.inventoryType = type;
     grid.hidden = type === 'custom'; customPanel.hidden = type !== 'custom';
     for (const [button, selected] of [[emoticons, type === 'emoticons'], [stickers, type === 'stickers'], [effects, type === 'effects'], [custom, type === 'custom']] as const) button.setAttribute('aria-pressed', String(selected));
+    if (type !== 'emoticons' && !grantAtLeast('full')) {
+      grid.hidden = false; customPanel.hidden = true; clear(grid); grid.append(create('p', 'notice', '图片、贴纸和效果需要「完整」授权。')); return;
+    }
     if (type === 'custom') { clear(customPanel); renderCustomImagePicker(customPanel); return; }
     clear(grid);
     const source = type === 'emoticons' ? state.emoticons : type === 'effects' ? state.effects : state.stickers;
-    if (!source.length) {
+    if (!source.length && type !== 'emoticons') {
       grid.append(create('div', 'empty small', '暂无素材'));
       return;
     }
@@ -4958,6 +5221,10 @@ function renderPicker(container: HTMLElement) {
         input.focus();
       });
       grid.append(button);
+    }
+    if (type === 'emoticons') for (const emoji of ['😀', '😊', '😂', '🥰', '😎', '🥲', '🤔', '😭', '👍', '👋', '🎉', '❤️']) {
+      const button = create('button', 'unicode-emote', emoji); button.type = 'button'; button.title = emoji; button.setAttribute('aria-label', emoji);
+      button.addEventListener('click', () => { const input = document.querySelector<HTMLTextAreaElement>('#messageInput'); if (input) { input.value += emoji; resizeComposerInput(input); input.focus(); } }); grid.append(button);
     }
   }
   emoticons.type = 'button';
@@ -5021,7 +5288,7 @@ function applyDurableMessages(items: MessageItem[]) {
   const current = accepted.filter(item => item.id === state.activeId);
   if (!current.length) return;
   historyLive = sortHistoryItems([...historyLive, ...current]).slice(-500);
-  if (historyDetached || state.view !== 'chat') return;
+  if (historyDetached) { updateHistoryControls(); return; }
   const before = new Set(historyItems.map(item => item.eventId));
   if (!current.some(item => !before.has(item.eventId))) return;
   const messages = document.querySelector<HTMLElement>('#messages');
@@ -5034,7 +5301,7 @@ function applyDurableMessages(items: MessageItem[]) {
 
 async function refreshDurableBaseline(context: string, signal: AbortSignal) {
   const conversationsRequest = loadConversations(false, signal);
-  const refreshHistory = state.activeId && state.view === 'chat' && !historyBrowsingRequest && !isCommunityGroup();
+  const refreshHistory = state.activeId && Boolean(document.querySelector('#chatLayout')) && !historyBrowsingRequest && !isCommunityGroup();
   const history = refreshHistory && (!historyDetached || historyCacheRebase)
     ? loadHistory(historyDetached ? 'date' : 'latest', historyDetached ? historyAt : '',
       { signal, preserve: !historyDetached, cacheRefresh: historyFromCache }) : Promise.resolve(true);
@@ -5257,7 +5524,7 @@ function startStatusPolling() {
     try {
       const statusRequest = api('/api/steam/status', { signal: controller.signal });
       let healthRequest: Promise<void> = Promise.resolve();
-      if (state.view === 'chat' && visible && now - lastHealth >= 60000) {
+      if (visible && now - lastHealth >= 60000) {
         lastHealth = now;
         healthRequest = loadStorageHealth(controller.signal);
       }
@@ -5270,7 +5537,7 @@ function startStatusPolling() {
       if (controller.signal.aborted || context !== chatContext() || !state.me || generation !== statusPollGeneration) return;
       if (state.view === 'chat') void loadReactionSnapshots();
       ensureWebSocket();
-      if (state.view === 'chat' && (steamOnline() !== wasOnline || steamStatusSignature() !== previousSignature)) void refreshChatData();
+      if (steamOnline() !== wasOnline || steamStatusSignature() !== previousSignature) void refreshChatData();
     } catch (_) {
       // Authentication errors are handled by api().
     } finally {
@@ -5308,6 +5575,7 @@ async function bootstrap() {
   state.needsSetup = Boolean(mePayload.needsSetup);
   state.me = mePayload.user || null;
   state.permissions = Array.isArray(mePayload.permissions) ? mePayload.permissions : [];
+  state.permissionDetails = mePayload.permissionDetails || [];
   updateSteamStatus(mePayload.steam || defaultSteamStatus);
   if (state.needsSetup) {
     renderSetup();
@@ -5323,30 +5591,46 @@ async function bootstrap() {
   state.imageOperationUpload = isRecord(config) && config.imageOperationUpload === true;
   renderShell();
   void restoreChatCache();
-  restoreImageOperations();
+  if (grantAtLeast('full')) restoreImageOperations();
 }
 
+let lightboxOpener: HTMLElement | null = null;
+let lightboxFocusDispose: (() => void) | null = null;
 function openLightbox(src: string) {
   const box = document.querySelector<HTMLElement>('#lightbox');
   const image = document.querySelector<HTMLImageElement>('#lightboxImage');
   if (!box || !image) return;
+  lightboxOpener = document.activeElement as HTMLElement | null;
   image.src = src;
+  image.alt = '聊天图片';
+  box.setAttribute('role', 'dialog'); box.setAttribute('aria-modal', 'true'); box.setAttribute('aria-label', '查看图片');
   box.hidden = false;
+  lightboxFocusDispose?.(); lightboxFocusDispose = trapDialogFocus(box, closeLightbox);
 }
 
-document.querySelector('#lightboxClose')?.addEventListener('click', () => {
+function closeLightbox() {
   const box = document.querySelector<HTMLElement>('#lightbox');
   const image = document.querySelector<HTMLImageElement>('#lightboxImage');
   if (box) box.hidden = true;
   if (image) image.src = '';
-});
+  lightboxFocusDispose?.(); lightboxFocusDispose = null;
+  lightboxOpener?.focus();
+}
+document.querySelector('#lightboxClose')?.addEventListener('click', closeLightbox);
+document.querySelector('#lightbox')?.addEventListener('click', event => { if (event.target === event.currentTarget) closeLightbox(); });
 
 document.addEventListener('dragover', (event) => {
-  if (state.view === 'chat' && steamOnline() && steamAccessAllowed() && state.activeId) event.preventDefault();
+  if (!canSendImages() || !event.dataTransfer?.types.includes('Files')) return;
+  event.preventDefault();
+  const overlay = document.querySelector<HTMLElement>('.drop-overlay');
+  if (overlay) { overlay.hidden = false; overlay.textContent = `释放发送图片 · 发送给 ${state.activeName || state.activeId}`; }
 });
 
+document.addEventListener('dragleave', event => { if (!event.relatedTarget) { const overlay = document.querySelector<HTMLElement>('.drop-overlay'); if (overlay) overlay.hidden = true; } });
+
 document.addEventListener('drop', (event) => {
-  if (state.view !== 'chat' || !steamOnline() || !steamAccessAllowed() || !state.activeId) return;
+  const overlay = document.querySelector<HTMLElement>('.drop-overlay'); if (overlay) overlay.hidden = true;
+  if (!canSendImages()) return;
   const files = event.dataTransfer?.files || null;
   if (files && files.length) {
     event.preventDefault();
@@ -5355,6 +5639,7 @@ document.addEventListener('drop', (event) => {
 });
 
 document.addEventListener('keydown', (event) => {
+  if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k' && state.me) { event.preventDefault(); openPalette(); return; }
   if (state.view !== 'chat' || !state.friendDetailsOpen) return;
   if (event.key === 'Escape') {
     setFriendDetailsOpen(false);
@@ -5376,5 +5661,6 @@ document.addEventListener('keydown', (event) => {
 
 bootstrap().catch((error) => {
   // A network outage is not a logout. Keep the disk snapshot for the next authenticated opening.
-  authPage('启动失败', errorMessage(error), create('div'), false);
+  const retry = create('button', 'primary-btn', '重试'); retry.addEventListener('click', () => { void bootstrap().catch(error => setFeedback(errorMessage(error), 'error')); });
+  authPage('启动失败', errorMessage(error), retry, false);
 });

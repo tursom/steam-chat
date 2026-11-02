@@ -5,7 +5,8 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const root = path.resolve(__dirname, '../../dist/web');
 const account = '76561198000000009', peer = '76561198000000001';
-const steam = { status: 'online', steamId: account, activeAccount: { id: 1, steamId: account }, accessAllowed: true };
+const steam = { status: 'online', steamId: account, activeAccount: { id: 1, steamId: account }, accessAllowed: true,
+  steamGrant: { level: 'full', scope: 'all', peerCount: 0, expiresAt: null } };
 const direct = 'https://www.bilibili.com/video/BV1xx411c7mD?p=2&autoplay=1';
 const short = 'https://b23.tv/Short1';
 const other = { id: '76561198000000002', name: 'Other conversation' };
@@ -23,7 +24,7 @@ const other = { id: '76561198000000002', name: 'Other conversation' };
           .map((message, index) => ({ id: peer, eventId: `bili-${index}`, type: 'message', message, ordinal: 0,
             sentAt: new Date(Date.now() - (5 - index) * 1000).toISOString() }));
         const fixtures = {
-          '/api/auth/me': { user: { id: 1, username: 'Test', role: 'user' }, permissions: ['chat.use'], steam },
+          '/api/auth/me': { user: { id: 1, username: 'Test', roleId: 'member' }, permissions: ['chat.use', 'self.password.change'], steam },
           '/api/steam/status': steam, '/api/config': { wsPath: '/ws' }, '/api/history/status': {},
           '/api/conversations': { items: [{ id: peer, name: 'Bilibili regression' }, other] },
           '/api/friends': [], '/api/groups': [], '/api/emoticons': {}, '/api/message-reactions': { items: [] }

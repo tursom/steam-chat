@@ -26,9 +26,11 @@ const { createChatService } = require('../../dist/src/server/chat-service');
         await context.addCookies([{ name: cookie.slice(0, separator), value: cookie.slice(separator + 1), url: base }]);
         const page = await context.newPage(); const errors = [];
         page.on('pageerror', e => errors.push(e.message));
-        await page.addInitScript(() => localStorage.setItem('steam-chat.view', 'account'));
-        await page.goto(base); await page.locator('#installApp').waitFor();
+        await page.addInitScript(() => localStorage.setItem('steam-chat.view', 'settings'));
+        await page.goto(base); await page.locator('#installApp').waitFor({ state: 'attached' });
         await page.evaluate(() => navigator.serviceWorker.ready);
+        // The worker deliberately does not claim an already loaded shell.
+        await page.reload(); await page.locator('#installApp').waitFor({ state: 'attached' });
         await page.waitForFunction(() => navigator.serviceWorker.controller !== null);
         const manifestResponse = await context.request.get(`${base}/manifest.webmanifest`);
         assert.match(manifestResponse.headers()['content-type'], /application\/manifest\+json/);
@@ -56,12 +58,18 @@ const { createChatService } = require('../../dist/src/server/chat-service');
         const installability = await cdp.send('Page.getInstallabilityErrors');
         assert.deepEqual(installability.installabilityErrors, []);
         await context.setOffline(true);
-        await page.reload(); await page.getByRole('heading', { name: '暂时无法连接 Steam Chat' }).waitFor();
+        await page.reload(); await page.getByRole('heading', { name: '启动失败' }).waitFor();
         await context.setOffline(false);
-        await page.getByRole('link', { name: '重新连接' }).click(); await page.locator('#installApp').waitFor();
-        assert.deepEqual(await page.evaluate(() => caches.keys()), []);
+        await page.getByRole('button', { name: '重试', exact: true }).click(); await page.locator('#installApp').waitFor({ state: 'attached' });
+        const cached = await page.evaluate(async () => {
+          const names = await caches.keys();
+          return { names, urls: (await Promise.all(names.map(async name => (await (await caches.open(name)).keys()).map(request => new URL(request.url).pathname)))).flat() };
+        });
+        assert.equal(cached.names.length, 1); assert.match(cached.names[0], /^steam-chat-shell-/);
+        assert.ok(cached.urls.includes('/index.html')); assert.ok(cached.urls.includes('/app.js')); assert.ok(cached.urls.includes('/console.js'));
+        assert.equal(cached.urls.some(url => url.startsWith('/api/') || url.startsWith('/proxy/')), false);
         assert.deepEqual(errors, []);
-        console.log(`PASS ${width}px: manifest/icons, install prompt, settings, service worker, offline recovery, no cached data`);
+        console.log(`PASS ${width}px: manifest/icons, install prompt, settings, service worker, offline recovery, public shell cache without private data`);
       } finally { await context.close(); }
     }
   } finally { await browser.close(); await service.stop(); auth.close(); await rm(dir, { recursive: true, force: true }); }

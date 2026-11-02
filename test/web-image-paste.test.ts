@@ -96,9 +96,9 @@ function harness() {
     __test: undefined as unknown
   };
   const source = readFileSync(resolve(__dirname, '../web/app.js'), 'utf8');
-  runInNewContext(`${source.slice(0, source.lastIndexOf('bootstrap().catch'))}
-    state.me = {id:1}; state.view = 'chat'; state.activeId = '76561198000000002';
-    state.steam = {...state.steam, status:'online', accessAllowed:true, steamId:'76561198000000001'};
+  runInNewContext(`${source.slice(0, source.indexOf('\nbootstrap().catch'))}
+    state.me = {id:1}; state.permissions = ['chat.use', 'self.password.change']; state.view = 'chat'; state.activeId = '76561198000000002';
+    state.steam = {...state.steam, status:'online', accessAllowed:true, steamId:'76561198000000001', steamGrant: {level:'full', scope:'all', peerCount:0, expiresAt:null}};
     root.append(renderComposer());
     loadHistory = async () => {};
     globalThis.__test = {state, resetHistory, invalidateChat, sendFiles, drafts: () => Array.from(imageDrafts.values()), currentDrafts: getImageDrafts, pending: () => pendingImageReaders.size};`, sandbox);
@@ -310,7 +310,7 @@ test('composer paste queues a thumbnail without reading or uploading and preserv
   assert.equal(h.requests.length, 0);
   assert.equal(h.created.length, 1);
   assert.equal(h.drafts()[0].peerId, '76561198000000002');
-  const tray = h.root.querySelector('.compose-row')!.querySelector('#imageDrafts')!;
+  const tray = h.root.querySelector('.composer-box')!.querySelector('#imageDrafts')!;
   const row = tray.querySelector('.image-draft')!;
   assert.equal(row.dataset.draftId, String(h.drafts()[0].id));
   assert.equal(row.querySelector('img')!.src, h.created[0].url);

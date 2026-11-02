@@ -32,7 +32,8 @@ async function run() {
         if (modified === ':Khappy:') modified = '[emoticon]Khappy[/emoticon]';
         callback({ modified_message: modified, server_timestamp: 1700000000, ordinal: packets.length }, { proto: { eresult: 1 } });
       };
-      const steam = { status: 'online', steamId: account, activeAccount: { id: 1, steamId: account }, accessAllowed: true };
+      const steam = { status: 'online', steamId: account, activeAccount: { id: 1, steamId: account }, accessAllowed: true,
+        steamGrant: { level: 'full', scope: 'all', peerCount: 0, expiresAt: null } };
       const service = createChatService({ steamUser: sdk, getSelfName: async () => 'Sender',
         steamLoginService: { getStatus: () => steam, ensureOnline() {} },
         config: { host: '127.0.0.1', port: 0 }, logger: { info() {}, warn() {}, error() {} },
@@ -58,7 +59,7 @@ async function run() {
         await page.route('**/api/**', route => {
           const pathname = new URL(route.request().url()).pathname;
           const data = {
-            '/api/auth/me': { user: { id: 1, username: 'Sender', role: 'user' }, permissions: ['chat.use'], steam },
+            '/api/auth/me': { user: { id: 1, username: 'Sender', roleId: 'member' }, permissions: ['chat.use', 'self.password.change'], steam },
             '/api/steam/status': steam, '/api/config': { wsPath: '/ws' }, '/api/history/status': {},
             '/api/conversations': { items: [{ id: peer, name: 'Receiver' }] },
             '/api/friends': [{ id: peer, name: 'Receiver' }], '/api/groups': [],
@@ -72,7 +73,7 @@ async function run() {
           if (new URL(request.url()).pathname === '/message') httpMessages.push(request.postDataJSON().msg);
         });
         await page.goto(`http://127.0.0.1:${service.server.address().port}`);
-        await page.locator('.list-item').first().click();
+        await page.locator('#chatListSections .conv').first().click();
         await page.locator('#pickerToggle').click();
         await page.locator('.picker-grid button').first().click();
         assert.equal(await page.locator('#messageInput').inputValue(), ':Khappy:');
@@ -95,14 +96,14 @@ async function run() {
         await page.locator('#sendButton').click();
         const delivered = page.locator('[data-event-id="confirmed-3"]');
         await delivered.waitFor();
-        assert.equal(await delivered.locator('.message-content').textContent(), literal);
+        assert.equal(await delivered.locator('.msg-body').textContent(), literal);
         assert.equal(await delivered.locator('img').count(), 0);
         assert.deepEqual(httpMessages, [':Khappy:', '/sticker :rbrb_rumi_sigh:', literal]);
         assert.deepEqual(packets.map(packet => packet.message), [':Khappy:', '/sticker :rbrb_rumi_sigh:', '\\[emoticon]Khappy\\[/emoticon]']);
         assert.equal(records[2].message, packets[2].message);
         await page.locator('#messageInput').fill('/sticker CatchHeart');
         await page.locator('#sendButton').click();
-        const unconfirmed = page.locator('.msg-row[data-send-state="unknown"]').filter({ hasText: '/sticker CatchHeart' });
+        const unconfirmed = page.locator('.msg[data-send-state="unknown"]').filter({ hasText: '/sticker CatchHeart' });
         await unconfirmed.waitFor();
         assert.doesNotMatch(await unconfirmed.innerText(), /已发送/);
         assert.equal(records.length, 3);
@@ -112,7 +113,7 @@ async function run() {
         await page.locator('[data-event-id="confirmed-4"] .sticker').waitFor();
         assert.equal(httpMessages[4], '/sticker catchheart');
         assert.equal(records[3].message, '[sticker type="catchheart" limit="0"][/sticker]');
-        assert.equal(await page.locator('.msg-row').count(), 5);
+        assert.equal(await page.locator('#messages .msg').count(), 5);
         console.log(`PASS ${width}px: actual browser -> HTTP backend -> installed SDK -> canonical record and echo`);
       } finally {
         await page.close();

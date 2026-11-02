@@ -9,9 +9,10 @@ const root = path.resolve(process.env.STEAM_CHAT_WEB_ROOT || path.join(__dirname
 const peer = '76561198000000001';
 const steamId = '76561198000000009';
 const friend = { id: peer, name: 'Scroll regression', online: true };
-const steam = { status: 'online', steamId, activeAccount: { id: 1, steamId }, accessAllowed: true };
+const steam = { status: 'online', steamId, activeAccount: { id: 1, steamId }, accessAllowed: true,
+  steamGrant: { level: 'full', scope: 'all', peerCount: 0, expiresAt: null } };
 const fixtures = {
-  '/api/auth/me': { user: { id: 1, username: 'Test', role: 'user' }, permissions: ['chat.use'], steam },
+  '/api/auth/me': { user: { id: 1, username: 'Test', roleId: 'member' }, permissions: ['chat.use', 'self.password.change'], steam },
   '/api/steam/status': steam,
   '/api/config': { wsPath: '/ws' },
   '/api/history/status': {},
@@ -48,8 +49,8 @@ async function run() {
             } catch { await route.fulfill({ status: 404 }); }
           });
           await page.goto('http://steam-chat.test');
-          await page.waitForFunction(() => document.querySelectorAll('.msg-row').length === 30);
-          await page.locator('.list-item').first().click();
+          await page.waitForFunction(() => document.querySelectorAll('#messages .msg').length === 30);
+          await page.locator('#chatListSections .conv').first().click();
           await page.evaluate(anchor => {
             const messages = document.querySelector('#messages');
             messages.style.overflowAnchor = anchor;

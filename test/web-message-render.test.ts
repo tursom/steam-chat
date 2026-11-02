@@ -61,7 +61,7 @@ class FakeElement {
 
   async dispatch(type: string, init: Record<string, unknown> = {}) {
     for (const listener of this.listeners.get(type) || []) {
-      await listener({ preventDefault() {}, ...init, currentTarget: this, target: (init.target as FakeElement) || this });
+      await listener({ preventDefault() {}, stopPropagation() {}, ...init, currentTarget: this, target: (init.target as FakeElement) || this });
     }
   }
 
@@ -181,11 +181,12 @@ function loadWebTestApi(): WebTestApi & {
   lightboxImage: FakeElement;
   offlineNote: FakeElement;
   chatControls: FakeElement[];
+  appRoot: FakeElement;
   dispatchDocument: (type: string, init: Record<string, unknown>) => Promise<void>;
 } {
   const appPath = path.resolve(__dirname, '../web/app.js');
   const appSource = fs.readFileSync(appPath, 'utf8');
-  const bootstrapIndex = appSource.lastIndexOf('bootstrap().catch');
+  const bootstrapIndex = appSource.indexOf('\nbootstrap().catch');
   assert.notEqual(bootstrapIndex, -1, 'web app bootstrap marker is required by the test harness');
 
   const appRoot = new FakeElement('div');
@@ -197,7 +198,7 @@ function loadWebTestApi(): WebTestApi & {
   const documentListeners = new Map<string, Listener[]>();
   const dispatchDocument = async (type: string, init: Record<string, unknown>) => {
     for (const listener of documentListeners.get(type) || []) {
-      await listener({ preventDefault() {}, ...init, currentTarget: appRoot, target: (init.target as FakeElement) || appRoot });
+      await listener({ preventDefault() {}, stopPropagation() {}, ...init, currentTarget: appRoot, target: (init.target as FakeElement) || appRoot });
     }
   };
   const clipboardWrites: string[] = [];
@@ -242,15 +243,16 @@ function loadWebTestApi(): WebTestApi & {
     Math,
     JSON,
     Promise,
+    queueMicrotask,
     setTimeout(callback: () => void) { callback(); return 0; },
     clearTimeout,
     setInterval,
     clearInterval
   };
   const testSource = `${appSource.slice(0, bootstrapIndex)}\n;globalThis.__webTest = { pageSubtitle: () => { state.view = 'chat'; return pageSubtitle(); }, renderSteamView, renderMessage, renderPicker, capturePickerSends: () => { const calls = []; state.me = {id: 1}; state.view = 'chat'; state.activeId = 'peer'; state.steam.status = 'online'; state.steam.accessAllowed = true; sendText = (text, preview) => { calls.push({text, preview}); return Promise.resolve(true); }; return calls; }, createElement: (tag) => document.createElement(tag), setMediaInventory: (emoticons, stickers, effects = []) => { state.emoticons = emoticons; state.stickers = stickers; state.effects = effects; }, filterChatEntries, openConversation, showChatList, getChatState: () => ({ activeId: state.activeId, activeName: state.activeName, chatPanel: state.chatPanel }), setChatAvailability: (online, accessAllowed, activeId) => { state.steam.status = online ? 'online' : 'logged_out'; state.steam.accessAllowed = accessAllowed; state.activeId = activeId; updateChatAvailability(); }, renderChatList: renderChatListSections, setChatListState: (recent, friends, groups, tab, query, activeId) => { state.conversations = recent; state.friends = friends; state.groups = groups; state.chatListTab = tab; state.chatQuery = query; state.activeId = activeId; }, renderChatView, mountChatView: () => { state.view = 'chat'; const view = renderChatView(); document.querySelector('#app').replaceChildren(view); return view; }, setFriendDetailsOpen, updateSteamStatus, renderFriendDetails, markMessageRuns };`;
-  vm.runInNewContext(testSource, sandbox);
+  vm.runInNewContext(testSource + `\nstate.me = {id: 1}; state.view = 'chat'; state.permissions = ['chat.use', 'self.password.change']; state.steam.accessAllowed = true; state.steam.steamGrant = {level:'full', scope:'all', peerCount:0, expiresAt:null};`, sandbox);
   assert.ok(sandbox.__webTest);
-  return { ...sandbox.__webTest, clipboardWrites, lightbox, lightboxImage, offlineNote, chatControls, dispatchDocument };
+  return { ...sandbox.__webTest, appRoot, clipboardWrites, lightbox, lightboxImage, offlineNote, chatControls, dispatchDocument };
 }
 
 test('web chat renders Steam OpenGraph messages as preview cards', async () => {
@@ -388,7 +390,7 @@ test('web chat leaves malformed or unsafe OpenGraph markup visible', () => {
   for (const message of messages) {
     const rendered = renderMessage({ id: '1', name: 'Alice', type: 'message', message });
     assert.equal(rendered.findByClass('og-card'), null);
-    assert.equal(rendered.textContent, `Alice${message}`);
+    assert.equal(rendered.findByClass('msg-body')!.textContent, message);
   }
 });
 
@@ -419,7 +421,7 @@ test('web chat handles long unclosed OpenGraph markup without blocking', () => {
   const rendered = renderMessage({ id: '1', name: 'Alice', type: 'message', message });
 
   assert.ok(performance.now() - startedAt < 250, 'unclosed markup should be handled in linear time');
-  assert.equal(rendered.textContent, `Alice${message}`);
+  assert.equal(rendered.findByClass('msg-body')!.textContent, message);
 });
 
 test('web chat keeps sticker, emoticon, and plain-link rendering around OpenGraph support', () => {
@@ -475,7 +477,7 @@ for (const token of [':wave:', '\u02d0wave\u02d0', '[emoticon]wave[/emoticon]', 
     const { renderMessage } = loadWebTestApi();
     const rendered = renderMessage({ id: '1', name: 'Alice', message: `before ${token} after` });
     assert.equal(rendered.findAllByClass('emoticon').length, 1);
-    assert.equal(rendered.textContent, 'Alicebefore  after');
+    assert.equal(rendered.findByClass('msg-body')!.textContent, 'before  after');
     assert.equal(rendered.findByClass('emoticon')!.alt, ':wave:');
   });
 }
@@ -483,7 +485,7 @@ for (const token of [':wave:', '\u02d0wave\u02d0', '[emoticon]wave[/emoticon]', 
 test('emoticon parsing preserves literal surrounding punctuation and ordinary text', () => {
   const { renderMessage } = loadWebTestApi();
   const rendered = renderMessage({ id: '1', name: 'Alice', message: '::wave:: :[emoticon]wave[/emoticon]: 12:30:45 https://example.com/:wave: word:value:tail' });
-  assert.equal(rendered.textContent, 'Alice:: :: 12:30:45 https://example.com/:wave: word:value:tail');
+  assert.equal(rendered.findByClass('msg-body')!.textContent, ':: :: 12:30:45 https://example.com/:wave: word:value:tail');
   assert.equal(rendered.findAllByClass('emoticon').length, 2);
 });
 
@@ -518,7 +520,18 @@ test('consecutive messages group by sender and time with day separators', () => 
   markMessageRuns(messages);
   const rows = messages.children;
   assert.deepEqual(rows.map(row => row.dataset.continued === 'true'), [false, true, false, false, false]);
-  // Merged rows hide their meta line, so each bubble carries its own hover time.
+  assert.deepEqual(rows.map(row => row.className.split(' ').includes('is-cont')), [false, true, false, false, false]);
+  assert.deepEqual(rows.map(row => row.className.split(' ').includes('is-self')), [false, false, true, true, true]);
+  for (const row of rows) {
+    assert.match(row.className, /\bmsg\b/);
+    assert.equal(row.tagName, 'ARTICLE');
+    assert.ok(row.findByClass('msg-av'));
+    assert.ok(row.findByClass('msg-main'));
+    assert.ok(row.findByClass('msg-head'));
+    assert.ok(row.findByClass('msg-body'));
+    assert.ok(row.findByClass('msg-tools'));
+  }
+  // Continuations retain an accessible individual timestamp.
   assert.equal(rows[1].findByClass('msg-hover-time')!.textContent, new Date(at(5, 20, 2)).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' }));
   assert.ok(rows[0].dataset.day);
   assert.deepEqual(rows.slice(1, 4).map(row => row.dataset.day), [undefined, undefined, undefined]);
@@ -537,7 +550,7 @@ test('historical unparsed sticker commands are not labelled as confirmed sends',
   assert.equal(rendered.dataset.sendState, 'unknown');
   assert.match(rendered.textContent, /贴纸结果未确认/);
   assert.doesNotMatch(rendered.textContent, /已发送/);
-  assert.equal(rendered.findByClass('message-content')!.textContent, '/sticker CatchHeart');
+  assert.equal(rendered.findByClass('msg-body')!.textContent, '/sticker CatchHeart');
 });
 
 test('escaped literal markup remains text instead of becoming a fake sticker or emoticon', () => {
@@ -545,7 +558,7 @@ test('escaped literal markup remains text instead of becoming a fake sticker or 
   for (const markup of ['[sticker type="Show Love" limit="0"][/sticker]', '[emoticon]Khappy[/emoticon]']) {
     const message = markup.replace(/\[/g, '\\[');
     const rendered = renderMessage({ id: '1', message });
-    assert.equal(rendered.findByClass('message-content')!.textContent, markup);
+    assert.equal(rendered.findByClass('msg-body')!.textContent, markup);
     assert.equal(rendered.findAllByTag('img').length, 0);
   }
 });
@@ -712,7 +725,7 @@ test('web chat preserves malformed, unsafe, or unsupported Steam BBCode', () => 
 
   for (const message of messages) {
     const rendered = renderMessage({ id: '1', name: 'Alice', type: 'message', message });
-    assert.equal(rendered.textContent, `Alice${message}`);
+    assert.equal(rendered.findByClass('msg-body')!.textContent, message);
     assert.equal(rendered.findByClass('bbcode-image'), null);
   }
 });
@@ -725,7 +738,7 @@ test('web chat handles long unclosed supported BBCode without blocking', () => {
   const rendered = renderMessage({ id: '1', name: 'Alice', type: 'message', message });
 
   assert.ok(performance.now() - startedAt < 250, 'unclosed markup should be handled in linear time');
-  assert.equal(rendered.textContent, `Alice${message}`);
+  assert.equal(rendered.findByClass('msg-body')!.textContent, message);
 });
 
 test('recent list and selected header use current peer identity instead of the outgoing sender', async () => {
@@ -798,7 +811,8 @@ test('web chat renders the selected conversation group, empty results, and activ
 });
 
 test('web chat enters a conversation and returns to the list without losing the selection', () => {
-  const { openConversation, showChatList, getChatState } = loadWebTestApi();
+  const { openConversation, showChatList, getChatState, mountChatView } = loadWebTestApi();
+  mountChatView();
 
   openConversation('76561198000000001', 'Alice');
   assert.equal(getChatState().activeId, '76561198000000001');
@@ -831,12 +845,12 @@ test('web chat disables composer controls until a usable conversation is selecte
   setChatAvailability(true, false, '76561198000000001');
   assert.ok(controls.every((node) => node.disabled));
   assert.equal(offlineNote.hidden, false);
-  assert.match(offlineNote.textContent, /未被授权/);
+  assert.match(offlineNote.textContent, /尚无聊天访问权限/);
 });
 
 test('web chat shows disconnected status instead of denied access without a Steam session', () => {
   const { setChatAvailability, chatControls, offlineNote, pageSubtitle, renderSteamView } = loadWebTestApi();
-  setChatAvailability(false, false, '76561198000000001');
+  setChatAvailability(false, true, '76561198000000001');
   assert.ok(chatControls.every((node) => node.disabled));
   assert.equal(offlineNote.hidden, false);
   assert.match(offlineNote.textContent, /Steam 未在线/);
@@ -890,11 +904,12 @@ test('friend details follow conversation selection, clear on permission loss and
   assert.ok(details);
   assert.match(details.textContent, /状态未知/);
   api.openConversation(second, 'Bob');
-  assert.match(details.textContent, /Bob/);
-  assert.doesNotMatch(details.textContent, /Alice/);
+  const nextDetails = view.findById('friendDetails')!;
+  assert.match(nextDetails.textContent, /Bob/);
+  assert.doesNotMatch(nextDetails.textContent, /Alice/);
   api.updateSteamStatus({ status: 'online', accessAllowed: false });
-  assert.equal(details.hidden, true);
-  assert.doesNotMatch(details.textContent, /Bob/);
+  assert.equal(view.findById('friendDetails')!.hidden, true);
+  assert.doesNotMatch(view.findById('friendDetails')!.textContent, /Bob/);
   assert.equal(view.findById('friendDetailsToggle')?.disabled, true);
 });
 
@@ -937,9 +952,10 @@ test('friend details show when an offline friend was last online, and groups lin
   assert.match(details.textContent, /最后在线/);
   assert.equal(details.findByClass('friend-game'), null);
   api.openConversation(group, 'Club');
-  assert.match(details.textContent, /群组资料/);
-  assert.equal(details.findByTag('a')!.href, `https://steamcommunity.com/gid/${group}`);
-  assert.doesNotMatch(details.textContent, /最后在线/);
+  const groupDetails = view.findById('friendDetails')!;
+  assert.match(groupDetails.textContent, /群组资料/);
+  assert.equal(groupDetails.findByTag('a')!.href, `https://steamcommunity.com/gid/${group}`);
+  assert.doesNotMatch(groupDetails.textContent, /最后在线/);
 });
 
 test('friend details omit profile links for invalid identifiers and close on returning to the list', () => {
@@ -954,20 +970,19 @@ test('friend details omit profile links for invalid identifiers and close on ret
 });
 
 test('web chat opens and closes the new conversation dialog', async () => {
-  const { renderChatView } = loadWebTestApi();
-  const view = renderChatView();
+  const { mountChatView, appRoot } = loadWebTestApi();
+  const view = mountChatView();
   const openButton = view.findByClass('new-chat-btn');
-  const dialog = view.findByClass('new-chat-dialog');
-  const closeButton = view.findByClass('dialog-close');
-
   assert.ok(openButton);
-  assert.ok(dialog);
-  assert.ok(closeButton);
-  assert.equal(dialog.open, false);
+  assert.equal(appRoot.findByClass('modal'), null);
   await openButton.dispatch('click');
-  assert.equal(dialog.open, true);
-  await closeButton.dispatch('click');
-  assert.equal(dialog.open, false);
+  const dialog = appRoot.findByClass('modal')!;
+  assert.equal(dialog.attributes.role, 'dialog');
+  assert.equal(dialog.attributes['aria-label'], '新建会话');
+  assert.equal(dialog.attributes['aria-modal'], 'true');
+  assert.ok(dialog.findByClass('new-chat-form'));
+  await dialog.findByTag('button')!.dispatch('click');
+  assert.equal(appRoot.findByClass('modal'), null);
 });
 
 test('web chat closes the attachment menu with Escape or an outside click', async () => {

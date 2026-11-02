@@ -22,6 +22,7 @@ function fixture(t: any) {
   }
   fs.mkdirSync(path.join(root, 'dist/web'), { recursive: true });
   fs.writeFileSync(path.join(root, 'dist/web/app.js'), 'console.log("fixture app");');
+  fs.writeFileSync(path.join(root, 'dist/web/console.js'), 'console.log("fixture console");');
   fs.mkdirSync(path.join(root, 'node_modules/artplayer/dist'), { recursive: true });
   fs.writeFileSync(path.join(root, 'node_modules/artplayer/dist/artplayer.mjs'), 'export default {};');
   return root;
@@ -110,7 +111,7 @@ test('built HTML uses exact content hashes while source HTML stays unversioned',
   const output = path.join(projectRoot, 'dist/web');
   const html = fs.readFileSync(path.join(output, 'index.html'), 'utf8');
   const source = fs.readFileSync(path.join(projectRoot, 'web/index.html'), 'utf8');
-  for (const name of ['app.js', 'style.css']) {
+  for (const name of ['app.js', 'console.js', 'style.css']) {
     const hash = hashBytes(fs.readFileSync(path.join(output, name)));
     assert.ok(html.includes(`"/${name}?v=${hash}"`));
     assert.ok(source.includes(`"/${name}"`));
@@ -127,6 +128,7 @@ test('build versions are reproducible and track JS, CSS, HTML, icons and worker 
   assert.equal(fs.readFileSync(path.join(root, 'dist/web/sw.js'), 'utf8'), firstWorker);
   for (const [name, suffix] of [
     ['dist/web/app.js', '\nconsole.log("new app");'],
+    ['dist/web/console.js', '\nconsole.log("new console");'],
     ['web/style.css', '\nbody { color: red; }'],
     ['web/index.html', '\n<!-- new shell -->'],
     ['web/icons/send.svg', '\n<!-- new icon -->'],
@@ -139,7 +141,7 @@ test('build versions are reproducible and track JS, CSS, HTML, icons and worker 
     for (const entry of current.resources) {
       const bytes = fs.readFileSync(path.join(root, 'dist/web', entry.url.split('?')[0]));
       assert.equal(entry.hash, hashBytes(bytes));
-      if (/^\/(app.js|style.css)\?/.test(entry.url)) assert.ok(entry.url.endsWith(`?v=${entry.hash}`));
+      if (/^\/(app.js|console.js|style.css)\?/.test(entry.url)) assert.ok(entry.url.endsWith(`?v=${entry.hash}`));
     }
     previous = current;
   }

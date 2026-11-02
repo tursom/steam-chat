@@ -7,10 +7,11 @@ const path = require('node:path');
 const root = path.resolve(process.env.STEAM_CHAT_WEB_ROOT || path.join(__dirname, '../../dist/web'));
 const peer = '76561198000000001';
 const account = '76561198000000009';
-const steam = { status: 'online', steamId: account, activeAccount: { id: 1, steamId: account }, accessAllowed: true };
+const steam = { status: 'online', steamId: account, activeAccount: { id: 1, steamId: account }, accessAllowed: true,
+  steamGrant: { level: 'full', scope: 'all', peerCount: 0, expiresAt: null } };
 const friend = { id: peer, name: 'Outgoing regression', online: true };
 const fixtures = {
-  '/api/auth/me': { user: { id: 1, username: 'Preview', role: 'user' }, permissions: ['chat.use'], steam },
+  '/api/auth/me': { user: { id: 1, username: 'Preview', roleId: 'member' }, permissions: ['chat.use', 'self.password.change'], steam },
   '/api/steam/status': steam,
   '/api/config': { wsPath: '/ws' },
   '/api/history/status': {},
@@ -97,7 +98,9 @@ async function run() {
       await writes[1].route.fulfill({ json: { ok: true, item: queuedItem } });
       writes[1].done();
       await page.waitForTimeout(100);
-      assert.match(await queued.innerText(), /已发送/);
+      assert.equal(await queued.getAttribute('data-send-state'), 'sent');
+      assert.equal(await queued.getAttribute('data-event-id'), 'confirmed-2');
+      assert.doesNotMatch(await queued.innerText(), /发送中|发送失败|未确认/);
 
       await page.locator('#messageInput').fill('Rejected text');
       await page.locator('#sendButton').click();
@@ -158,7 +161,8 @@ async function run() {
       await page.waitForTimeout(100);
       assert.equal(await preview.count(), 0);
       const confirmedImage = page.locator('[data-event-id="image-confirmed"]');
-      assert.match(await confirmedImage.innerText(), /已发送/);
+      assert.equal(await confirmedImage.getAttribute('data-send-state'), 'sent');
+      assert.doesNotMatch(await confirmedImage.innerText(), /发送中|发送失败|未确认/);
       await page.waitForFunction(() => document.querySelector('[data-event-id="image-confirmed"] img')?.naturalWidth === 240);
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
       if (process.env.SCREENSHOT_DIR) await page.screenshot({ path: path.join(process.env.SCREENSHOT_DIR, `steam-chat-outgoing-${width}.png`) });

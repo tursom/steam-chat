@@ -25,6 +25,8 @@ class Element {
   remove() { if (this.parent) this.parent.children = this.parent.children.filter(child => child !== this); this.parent = null; }
   insertBefore(node: Element, before: Element | null) { node.remove(); node.parent = this; const index = before ? this.children.indexOf(before) : this.children.length; this.children.splice(index, 0, node); }
   querySelector(): null { return null; }
+  querySelectorAll(): Element[] { return []; }
+  getBoundingClientRect() { return { top: 0, bottom: this.clientHeight }; }
   removeAttribute() {}
   setAttribute() {}
   addEventListener(name: string, listener: () => void) {
@@ -74,7 +76,7 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
   const pending: Pending[] = [];
   const sandbox = {
     document: { querySelector: (id: string) => nodes[id] || null, querySelectorAll: (): Element[] => [],
-      visibilityState: 'visible', addEventListener: events.addEventListener.bind(events), createElement: () => new Element() },
+      visibilityState: 'visible', addEventListener: events.addEventListener.bind(events), removeEventListener: events.removeEventListener.bind(events), createElement: () => new Element() },
     window: { addEventListener: events.addEventListener.bind(events) },
     location: { protocol: 'http:', host: 'test' }, WebSocket: FakeSocket, AbortController, crypto: webcrypto,
     ...(disk ? { indexedDB: { open: () => {
@@ -100,10 +102,11 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
       signal: options.signal || undefined, resolve: (payload) => resolve({ ok: true, json: async () => payload }), reject })),
     __test: undefined as unknown
   };
-  runInNewContext(`${source.slice(0, source.lastIndexOf('bootstrap().catch'))}
+  runInNewContext(`${source.slice(0, source.indexOf('\nbootstrap().catch'))}
     uploadRequest = (path, options) => fetch(path, options);
     renderMessage = (item) => { const row = document.createElement('article'); row.dataset.eventId = item.eventId; return row; };
-    state.me = {id: 1}; state.activeId = 'peer'; state.steam.accessAllowed = true;
+    state.me = {id: 1}; state.permissions = ['chat.use', 'self.password.change']; state.activeId = 'peer'; state.steam.accessAllowed = true;
+    state.steam.steamGrant = {level:'full', scope:'all', peerCount:0, expiresAt:null};
     resizeComposerInput = () => {};
     globalThis.__test = {refreshChatData, loadChatInventory, sendText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
       openConversation, rememberThread, restoreThread, scheduleChatCache, restoreChatCache, clearChatCache,
@@ -133,7 +136,7 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     resetHistory: () => void;
     invalidateChat: () => void;
     switchPeer: (id: string) => void;
-    state: { me: { id: number; sessionVersion?: number }; sendOperations: boolean; imageOperationUpload: boolean; activeId: string; view: string; steam: { steamId: string; status: string; accessAllowed: boolean }; friends: Array<{id: string; name: string}>; activeName: string;
+    state: { me: { id: number; sessionVersion?: number }; sendOperations: boolean; imageOperationUpload: boolean; activeId: string; view: string; steam: { steamId: string; status: string; accessAllowed: boolean; accessRevision?: string; steamGrant?: { level: string; scope: string; peerCount: number } }; friends: Array<{id: string; name: string}>; activeName: string;
       conversations: Array<{id: string; name?: string; preview?: string; updatedAt?: string}>; feedback: string };
     outgoing: () => Array<{ state: string; item: Item; context: string }>;
     items: () => Item[];
@@ -776,22 +779,25 @@ test('initial sync commits its boundary only after baseline succeeds and preserv
 
 test('invalidated durable cursor rebases once, while stale account and aborted responses cannot advance it', async () => {
   const { api, pending, timers } = harness(false, true);
-  api.state.steam.steamId = 'account'; api.state.view = 'steam'; api.setSyncCursor('old-generation');
+  api.state.steam.steamId = 'account'; api.state.view = 'accounts'; api.setSyncCursor('old-generation');
   api.requestDurableSync(); pending[0].reject(Object.assign(new Error('Reset required'), { status: 409 }));
   await microtasks(() => pending.length === 2);
   assert.equal(pending[1].url.searchParams.get('mode'), 'history');
   pending[1].resolve({ steamAccountId: 'account', items: [], liveCursor: 'fresh', hasMore: false });
-  await microtasks(() => pending.length === 3); pending[2].resolve({ items: [] });
   await microtasks(() => pending.length === 4);
-  pending[3].resolve({ steamAccountId: 'account', items: [], nextCursor: 'fresh', hasMore: false });
+  assert.equal(pending[2].url.pathname, '/api/conversations');
+  assert.equal(pending[3].url.pathname, '/api/history', 'chat history remains mounted underneath the console');
+  pending[2].resolve({ items: [] }); pending[3].resolve({ items: [] });
+  await microtasks(() => pending.length === 5);
+  pending[4].resolve({ steamAccountId: 'account', items: [], nextCursor: 'fresh', hasMore: false });
   await microtasks(() => !api.syncTask()); assert.equal(api.syncCursor(), 'fresh');
   api.requestDurableSync();
   const deadline = [...timers.values()].find(timer => timer.delay === 30000)!; deadline.callback();
-  assert.equal(pending[4].signal?.aborted, true);
-  pending[4].resolve({ steamAccountId: 'account', items: [recovered(8)], nextCursor: 'unprocessed', hasMore: false });
+  assert.equal(pending[5].signal?.aborted, true);
+  pending[5].resolve({ steamAccountId: 'account', items: [recovered(8)], nextCursor: 'unprocessed', hasMore: false });
   await microtasks(() => !api.syncTask()); assert.equal(api.syncCursor(), 'fresh');
   api.requestDurableSync(); api.invalidateChat(); api.state.steam.steamId = 'other-account';
-  pending[5].resolve({ steamAccountId: 'account', items: [recovered(9)], nextCursor: 'secret', hasMore: false });
+  pending[6].resolve({ steamAccountId: 'account', items: [recovered(9)], nextCursor: 'secret', hasMore: false });
   await microtasks(() => !api.syncTask()); assert.equal(api.items().length, 0); assert.equal(api.syncCursor(), '');
 });
 
@@ -835,7 +841,7 @@ test('socket open and durable hints catch up, pong avoids reconnect, and missed 
 
 test('wake events and timer gaps reuse open sockets and do not abort in-flight catch-up', async () => {
   const { api, pending, sockets, timers, events, advance } = harness(false, true);
-  api.state.view = 'steam';
+  api.state.view = 'accounts';
   api.state.steam.steamId = 'account'; api.setSyncCursor('start'); api.ensureWebSocket(); api.startStatusPolling(); api.setupRealtimeResume();
   const poll = [...timers.values()].find(timer => timer.delay === 5000)!;
   void poll.callback(); assert.equal(pending[1].url.pathname, '/api/steam/status');
@@ -843,8 +849,9 @@ test('wake events and timer gaps reuse open sockets and do not abort in-flight c
   await microtasks(() => !api.syncTask());
   advance(60000); await poll.callback();
   assert.equal(pending[1].signal?.aborted, false); assert.equal(sockets[0].closed, false); assert.equal(sockets.length, 1);
-  assert.equal(pending[2].url.searchParams.get('cursor'), 'start');
-  pending[2].resolve({ steamAccountId: 'account', items: [], nextCursor: 'start', hasMore: false });
+  assert.equal(pending[2].url.pathname, '/api/history/status', 'health remains polled with a console overlay');
+  assert.equal(pending[3].url.searchParams.get('cursor'), 'start');
+  pending[3].resolve({ steamAccountId: 'account', items: [], nextCursor: 'start', hasMore: false });
   await microtasks(() => !api.syncTask());
   for (const event of ['visibilitychange', 'online', 'pageshow']) {
     const prior: number = sockets.length; events.dispatch(event, { persisted: true });
@@ -853,7 +860,7 @@ test('wake events and timer gaps reuse open sockets and do not abort in-flight c
     request.resolve({ steamAccountId: 'account', items: [], nextCursor: 'start', hasMore: false });
     await microtasks(() => !api.syncTask());
   }
-  api.stopWebSocket(); api.stopStatusPolling(); pending[1].reject(new Error('Aborted stale poll'));
+  api.stopWebSocket(); api.stopStatusPolling(); pending[1].reject(new Error('Aborted stale poll')); pending[2].reject(new Error('Aborted stale health poll'));
 });
 
 test('periodic message sync continues when Steam status fails, and a timed-out health read releases polling', async () => {
@@ -949,6 +956,23 @@ test('disk hydration cannot cross invalidation and persistent history never hide
   assert.deepEqual(Array.from(next.api.items(), row => row.eventId), ['recovered-98', 'recovered-99']);
   const older = next.api.loadHistory('older'); assert.equal(next.pending[1].url.searchParams.get('before'), 'correct-boundary');
   next.pending[1].resolve({ items: [] }); await older;
+});
+
+test('disk snapshots stay bound to the complete Steam grant, including equal-size peer replacements', async () => {
+  const disk = new Map<string, unknown>([['recent', { scope: '1:0:account:old-peers', savedAt: Date.now(), conversations: [{ id: 'peer', name: 'previously authorized' }],
+    threads: [['peer', { items: [recovered(0)], savedAt: Date.now(), following: true }]] }]]);
+  const restricted = harness(false, true, disk);
+  restricted.api.state.steam.steamId = 'account'; restricted.api.state.view = 'chat';
+  restricted.api.state.steam.steamGrant = { level: 'read', scope: 'some', peerCount: 1 };
+  restricted.api.state.steam.accessRevision = 'new-peers';
+  await restricted.api.restoreChatCache();
+  assert.equal(restricted.api.items().length, 0); assert.equal(restricted.api.state.conversations.length, 0);
+  const same = harness(false, true, disk); same.api.state.steam.steamId = 'account'; same.api.state.view = 'chat';
+  same.api.state.steam.steamGrant = { level: 'read', scope: 'some', peerCount: 1 }; same.api.state.steam.accessRevision = 'old-peers';
+  await same.api.restoreChatCache(); assert.equal(same.api.items().length, 1);
+  const oldServer = harness(false, true, disk); oldServer.api.state.steam.steamId = 'account'; oldServer.api.state.view = 'chat';
+  oldServer.api.state.steam.steamGrant = { level: 'read', scope: 'some', peerCount: 1 };
+  await oldServer.api.restoreChatCache(); assert.equal(oldServer.api.items().length, 0);
 });
 
 test('authoritative empty network results cannot be resurrected by later disk hydration', async () => {
@@ -1072,19 +1096,21 @@ test('authenticated bootstrap uses the bundled configuration without extra statu
 
 test('healthy foreground status polling is throttled and hidden tabs defer background requests', async () => {
   const { api, pending, timers, advance, setVisibility } = harness(false, true);
-  api.state.view = 'steam'; api.state.steam.steamId = 'account'; api.state.steam.status = 'online';
+  api.state.view = 'accounts'; api.state.steam.steamId = 'account'; api.state.steam.status = 'online';
   api.setSyncCursor('start'); api.ensureWebSocket(); api.startStatusPolling();
   const poll = [...timers.values()].find(timer => timer.delay === 5000)!;
   const first = poll.callback();
   pending[0].resolve({ steamAccountId: 'account', items: [], nextCursor: 'start', hasMore: false });
   pending[1].resolve({ status: 'online', steamId: 'account', accessAllowed: true });
+  assert.equal(pending[2].url.pathname, '/api/history/status');
+  pending[2].resolve({ jsonl: { state: 'healthy', queued: 0 }, rocksdb: { state: 'healthy', queued: 0 } });
   await first; await microtasks(() => !api.syncTask());
   for (let i = 0; i < 5; i++) { advance(5000); await poll.callback(); }
-  assert.equal(pending.length, 2, 'No three-second status or per-tick health request');
+  assert.equal(pending.length, 3, 'No three-second status or per-tick health request');
   advance(5000); const second = poll.callback();
-  assert.equal(pending[2].url.pathname, '/api/steam/status');
-  pending[2].resolve({ status: 'online', steamId: 'account', accessAllowed: true }); await second;
+  assert.equal(pending[3].url.pathname, '/api/steam/status');
+  pending[3].resolve({ status: 'online', steamId: 'account', accessAllowed: true }); await second;
   setVisibility('hidden'); advance(60000); await poll.callback();
-  assert.equal(pending.length, 3);
+  assert.equal(pending.length, 4);
   api.stopStatusPolling(); api.stopWebSocket();
 });

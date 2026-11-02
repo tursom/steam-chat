@@ -68,13 +68,13 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
             nextCursor: 'fixture', liveCursor: 'fixture', hasMore: false } });
           return Object.hasOwn(replies, url.pathname) ? route.fulfill({ json: replies[url.pathname] }) : route.continue();
         });
-        await page.goto(base); await page.locator('.list-item').first().click();
+        await page.goto(base); await page.locator('#chatListSections .conv').first().click();
         for (const [index, url] of fixtures.entries()) {
           const row = page.locator(`[data-event-id="history-${index}"]`);
           const image = row.locator('.bbcode-image'); await image.scrollIntoViewIfNeeded();
           await image.evaluate(node => node.decode());
           assert.equal(await image.getAttribute('src'), `/proxy/image?url=${encodeURIComponent(url)}`);
-          assert.equal(await row.locator('.message-content a').count(), 0);
+          assert.equal(await row.locator('.msg-body a').count(), 0);
           assert.ok(await image.evaluate(node => node.naturalWidth > 0 && node.naturalHeight > 0));
           const bounds = await image.boundingBox(); assert.ok(bounds.x >= 0 && bounds.x + bounds.width <= width);
           await row.getByRole('button', { name: '查看大图' }).click();

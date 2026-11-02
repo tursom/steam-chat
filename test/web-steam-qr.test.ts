@@ -10,6 +10,7 @@ class Element {
   src = ''; type = ''; parent: Element | null = null;
   dataset: Record<string, string> = {};
   attributes: Record<string, string> = {};
+  style = { setProperty() {} };
   children: Element[] = [];
   listeners = new Map<string, (event: any) => unknown>();
   private text = '';
@@ -81,15 +82,27 @@ function harness(view = 'steam', manage = true) {
     }))
   };
   const source = readFileSync(resolve(__dirname, '../web/app.js'), 'utf8');
-  runInNewContext(`${source.slice(0, source.lastIndexOf('bootstrap().catch'))}
+  const consoleSource = readFileSync(resolve(__dirname, '../web/console.js'), 'utf8');
+  // Exercise the shared login state machine with both password endpoints. The
+  // browser suite covers mounting these controls in the console's add-account modal.
+  runInNewContext(`${consoleSource}\n${source.slice(0, source.indexOf('\nbootstrap().catch'))}
     invalidateChat = stopWebSocket = syncFriendDetails = updateChatAvailability = requestDurableSync = () => {};
     ensureWebSocket = () => {};
     renderShell = () => { throw new Error('Unexpected full shell render'); };
-    state.me = {id: 1, role: 'admin'};
-    state.permissions = ${JSON.stringify(manage ? ['steam.manage', 'steam.account.manage'] : ['steam.account.manage'])};
-    state.view = ${JSON.stringify(view)};
+    state.me = {id: 1, username: 'Fixture', roleId: 'member'};
+    state.permissions = ${JSON.stringify(manage ? ['steam.manage', 'steam.account.manage', 'chat.use', 'self.password.change'] : ['steam.account.manage', 'chat.use', 'self.password.change'])};
+    state.view = normalizeView(${JSON.stringify(view)});
     globalThis.testApi = { state, updateSteamStatus, startStatusPolling, changeSteamQrLogin,
-      mount(view) { state.view = view; root.replaceChildren(view === 'steam' ? renderSteamView() : renderSteamAccountsView()); syncSteamLoginUi(); } };
+      mount(view) {
+        state.view = normalizeView(view);
+        root.replaceChildren(renderSteamView());
+        if (view === 'steamAccounts') {
+          const table = create('div'); table.id = 'steamAccountTable'; renderSteamAccountTable(table); root.append(table);
+          const form = root.querySelector('.steam-password-login');
+          if (form) form.listeners.set('submit', event => { event.preventDefault(); return submitSteamPassword(form, '/api/steam/accounts/login'); });
+        }
+        syncSteamLoginUi();
+      } };
   `, sandbox);
   const app = sandbox.testApi;
   app.mount(view);
@@ -161,9 +174,9 @@ for (const view of ['steam', 'steamAccounts']) {
       assert.match(h.root.textContent, /扫码账户/);
       assert.equal(h.root.querySelector('.steam-password-login'), null);
       h.mount('steamAccounts');
-    } else assert.equal(h.input('accountName').disabled, false);
+    } else assert.equal(h.root.querySelector('.steam-password-login'), null);
     assert.match(h.root.querySelector('#steamAccountTable')!.textContent, /扫码账户.*当前活动/);
-    assert.ok(h.root.querySelector('.steam-account-connect')!.disabled);
+    assert.equal(h.root.querySelector('.steam-account-connect'), null, 'active accounts do not offer a connect action');
   });
 
   test(`${view}: password login keeps its endpoint and payload and still enters Guard`, async () => {
@@ -178,11 +191,9 @@ for (const view of ['steam', 'steamAccounts']) {
     assert.equal(h.requests.length, 1);
     h.requests[0].resolve({ status: 'waiting_guard', requiresGuard: true, guardType: 'email', domain: 'example.com' });
     await settle();
-    if (view === 'steamAccounts') {
-      h.requests[1].resolve({ steamAccounts: [] });
-      await pending;
-      h.mount('steam');
-    } else await pending;
+    h.requests[1].resolve({ steamAccounts: [] });
+    await pending;
+    h.mount('steam');
     assert.match(h.root.textContent, /Steam Guard.*邮箱验证码：example.com/);
     assert.ok(h.button('扫码登录 Steam').disabled);
     assert.equal(h.root.querySelector('input')!.name, 'code');
@@ -264,7 +275,7 @@ test('expiry remains actionable when status polling fails', async () => {
 
 test('read-only connection page still updates access changes while Steam remains online', () => {
   const h = harness('steam', false);
-  h.state.me.role = 'user'; h.mount('steam');
+  h.mount('steam');
   h.updateSteamStatus({ status: 'online', steamId: '123', accessAllowed: true });
   assert.match(h.root.textContent, /普通用户只能/);
   h.updateSteamStatus({ status: 'online', steamId: '123', accessAllowed: false });

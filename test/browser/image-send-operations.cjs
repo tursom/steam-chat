@@ -66,11 +66,15 @@ async function run(browser, width) {
     let loseStartReply = false;
     page.on('pageerror', error => errors.push(error.message));
     page.on('response', async response => { if (new URL(response.url()).pathname === '/api/send-operations' && response.status() === 201) created.push((await response.json()).id); });
-    page.on('request', request => { if (/\/start$/.test(new URL(request.url()).pathname)) starts.push(request.url()); });
+    page.on('request', request => {
+      const pathname = new URL(request.url()).pathname;
+      if (/\/start$/.test(pathname) || pathname === '/api/send-operations/upload') starts.push(request.url());
+      if (pathname === '/api/send-operations/upload') created.push(request.postDataJSON().operationId);
+    });
     await page.addInitScript(peer => { localStorage.setItem('steam-chat.view', 'chat'); localStorage.setItem('steam-chat.target', peer); }, peer);
     await page.route('https://music.163.com/outchain/player**', route => route.fulfill({ contentType: 'text/html', body: '<script>window.marker="playing"</script>' }));
     await page.route('**/proxy/image?**', route => route.fulfill({ body: original, contentType: 'image/png' }));
-    await page.route('**/api/send-operations/*/start', async route => {
+    await page.route(/\/api\/send-operations\/(?:[^/]+\/start|upload)$/, async route => {
       if (!loseStartReply) return route.continue();
       loseStartReply = false;
       await route.fetch(); // The server has accepted the task; only the reply is lost.

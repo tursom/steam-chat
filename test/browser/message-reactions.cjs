@@ -7,9 +7,9 @@ const path=require('node:path');
  const page=await browser.newPage({viewport:{width,height:900}}), errors=[], updates=[];
  page.on('pageerror',e=>errors.push(e.message)); await page.routeWebSocket(/.*/,()=>{});
  const account='76561198000000002',peer='76561198000000001', timestamp=1700000000;
- const steam={status:'online',steamId:account,activeAccount:{id:1,steamId:account},accessAllowed:true};
+ const steam={status:'online',steamId:account,activeAccount:{id:1,steamId:account},accessAllowed:true,steamGrant:{level:'full',scope:'all',peerCount:0,expiresAt:null}};
  let reactions=[{type:2,name:'AnimationSticker8',users:[account,peer]}];
- const fixtures={'/api/auth/me':{user:{id:1,username:'Test',role:'user'},permissions:['chat.use'],steam},'/api/steam/status':steam,
+ const fixtures={'/api/auth/me':{user:{id:1,username:'Test',roleId:'member'},permissions:['chat.use','self.password.change'],steam},'/api/steam/status':steam,
  '/api/config':{wsPath:'/ws'},'/api/history/status':{},'/api/conversations':{items:[{id:peer,name:'Friend'}]},'/api/friends':[{id:peer,name:'Friend'}],'/api/groups':[],
  '/api/emoticons':{emoticons:[{name:'smile'}],stickers:[{name:'AnimationSticker8',title:'贴纸'}]},
  '/api/history':{items:[{id:peer,eventId:'message-1',sentAt:new Date(timestamp*1000).toISOString(),ordinal:0,message:'React to this'}]}};
@@ -33,7 +33,9 @@ const path=require('node:path');
  assert.match(await chip.getAttribute('title'),/你、Friend/);
  await chip.click();await page.waitForFunction(()=>document.querySelector('.reaction-chip')?.textContent==='1');
  assert.equal(updates[0].add,false);assert.equal(updates[0].steamAccountId,account);
- await page.getByRole('button',{name:'添加表情回应'}).click();
+ await page.locator('.msg').hover();
+ await page.locator('.msg-tools').getByRole('button',{name:'添加表情回应'}).click();
+ assert.equal(await page.locator('.reaction-picker').count(),1,'the message toolbar opens the reaction picker');
  await page.locator('.reaction-picker button[title=":smile:"]').click();
  await page.waitForFunction(()=>document.querySelectorAll('.reaction-chip').length===2);
  assert.equal(updates[1].reaction,':smile:');assert.equal(updates[1].ordinal,0);

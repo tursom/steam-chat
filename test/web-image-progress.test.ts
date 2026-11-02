@@ -102,9 +102,9 @@ function harness() {
     __test: undefined as unknown
   };
   const source = readFileSync(resolve(__dirname, '../web/app.js'), 'utf8');
-  runInNewContext(`${source.slice(0, source.lastIndexOf('bootstrap().catch'))}
-    state.me = {id:1}; state.view = 'chat'; state.activeId = 'peer';
-    state.steam = {...state.steam, status:'online', accessAllowed:true, steamId:'account-A'};
+  runInNewContext(`${source.slice(0, source.indexOf('\nbootstrap().catch'))}
+    state.me = {id:1}; state.permissions = ['chat.use', 'self.password.change']; state.view = 'chat'; state.activeId = 'peer';
+    state.steam = {...state.steam, status:'online', accessAllowed:true, steamId:'account-A', steamGrant: {level:'full', scope:'all', peerCount:0, expiresAt:null}};
     root.append(renderComposer());
     loadHistory = holdHistory;
     globalThis.__test = {api, uploadRequest, sendImage, sendFiles, resetHistory, invalidateChat, renderImageTransfers, state,
@@ -324,7 +324,7 @@ test('an unconfirmed success response leaves the send unknown without retry', as
 
 test('upload 401 preserves shared auth handling and does not resend', async () => {
   const h = harness();
-  h.state.permissions = ['chat'];
+  h.state.permissions = ['chat.use'];
   const sending = h.sendImage({ img: 'YWJj' });
   h.requests[0].respond(401, { error: 'Session expired' });
   await sending;

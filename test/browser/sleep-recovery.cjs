@@ -68,8 +68,8 @@ async function run(width, browser) {
     await until(() => storage.canSend());
     for (let n = 0; n < 25; n++) storage.append(record(`start-${n}`, n, n === 0 ? { message: 'https://www.bilibili.com/video/BV1xx411c7mD' } : {}));
     await until(() => storage.status().rocksdb.durable === 25 && storage.status().jsonl.durable === 25);
-    await page.goto(base); await page.locator('.list-item').first().click();
-    await page.waitForFunction(() => document.querySelectorAll('.msg-row').length === 25);
+    await page.goto(base); await page.locator('#chatListSections .conv').first().click();
+    await page.waitForFunction(() => document.querySelectorAll('#messages .msg').length === 25);
     await until(() => livePages.length > 0);
     const seedCursor = livePages.at(-1).nextCursor;
     assert.equal(livePages.at(-1).items.length, 0);
@@ -80,9 +80,12 @@ async function run(width, browser) {
     const frame = await iframe.contentFrame();
     await frame.waitForFunction(() => window.playbackMarker === 'initial');
     await frame.evaluate(() => window.playbackMarker = 'playing-at-42s');
-    await page.locator('#messages').hover(); await page.mouse.wheel(0, -600);
+    // The flat layout can put the list's center over the embedded video. Wheel
+    // there belongs to the iframe; use a text row to exercise the chat scroller.
+    await page.locator('#messages .msg').last().hover(); await page.mouse.wheel(0, -600);
     await page.waitForTimeout(100);
     const top = await page.locator('#messages').evaluate(node => node.scrollTop);
+    assert.ok(await page.locator('#messages').evaluate(node => node.scrollHeight - node.clientHeight - node.scrollTop > 100), 'the reader must actually leave the latest position');
     const alertsBefore = await page.evaluate(() => window.recoveryAlerts.length);
     cdp = await context.newCDPSession(page);
     await cdp.send('Page.setWebLifecycleState', { state: 'frozen' });
@@ -103,17 +106,19 @@ async function run(width, browser) {
     failNextLivePage = true;
     await cdp.send('Page.setWebLifecycleState', { state: 'active' });
     await page.evaluate(() => window.dispatchEvent(new Event('online')));
-    await page.waitForFunction(() => document.querySelectorAll('#messages .msg-row').length === 646, null, { timeout: 25000 });
-    assert.ok(failedCursor); assert.ok(requests.filter(url => url.searchParams.get('cursor') === failedCursor).length >= 2);
+    await page.waitForFunction(() => document.querySelectorAll('#messages .msg').length === 646, null, { timeout: 25000 });
+    assert.ok(failedCursor);
+    await until(() => requests.filter(url => url.searchParams.get('cursor') === failedCursor).length >= 2);
+    assert.ok(requests.filter(url => url.searchParams.get('cursor') === failedCursor).length >= 2);
     assert.equal(requests.filter(url => url.searchParams.get('mode') === 'history').length, 1, 'Wake preserves the established live boundary');
     assert.ok(livePages.some(result => result.items.length === 100 && result.hasMore));
-    const ids = await page.locator('#messages .msg-row').evaluateAll(rows => rows.map(row => row.dataset.eventId));
+    const ids = await page.locator('#messages .msg').evaluateAll(rows => rows.map(row => row.dataset.eventId));
     assert.equal(new Set(ids).size, 646); assert.equal(ids[0], eventId('late-arrival')); assert.equal(ids.includes(eventId('other-account')), false);
-    assert.equal(await page.locator('#messages').evaluate(node => node.scrollTop), top);
+    assert.equal(await page.locator('#messages').evaluate(node => node.scrollTop), top, 'durable catch-up must preserve the reading position');
     assert.equal(await iframe.evaluate(node => node.isConnected), true);
     assert.equal(await frame.evaluate(() => window.playbackMarker), 'playing-at-42s');
     notifications.push(...await page.evaluate(() => window.recoveryAlerts)); assert.equal(notifications.length, alertsBefore);
-    assert.ok(await page.locator('.list-item').filter({ hasText: 'Other peer' }).count());
+    assert.ok(await page.locator('#chatListSections .conv').filter({ hasText: 'Other peer' }).count());
     // Live broadcast overlapping a durable hint is still exactly one timeline row.
     storage.append(record('overlap', 648));
     await row('overlap').waitFor();
@@ -122,13 +127,14 @@ async function run(width, browser) {
     assert.equal(await row('overlap').count(), 1);
     assert.equal(await frame.evaluate(() => window.playbackMarker), 'playing-at-42s');
     // Catch-up must not pull the reader out of a selected date window.
+    await page.locator('#dateChip').click();
     await page.locator('#historyDate').fill('2023-11-14T22:15'); await page.locator('#historyJump').click();
     await page.waitForFunction(() => !document.querySelector('#historyLatest').hidden);
-    const dateIds = await page.locator('#messages .msg-row').evaluateAll(rows => rows.map(row => row.dataset.eventId));
+    const dateIds = await page.locator('#messages .msg').evaluateAll(rows => rows.map(row => row.dataset.eventId));
     storage.append(record('while-reading-date', 649), { notify: false });
     await until(() => storage.status().rocksdb.durable === 650);
     await until(() => livePages.some(result => result.items.some(item => item.eventId === eventId('while-reading-date'))));
-    assert.deepEqual(await page.locator('#messages .msg-row').evaluateAll(rows => rows.map(row => row.dataset.eventId)), dateIds);
+    assert.deepEqual(await page.locator('#messages .msg').evaluateAll(rows => rows.map(row => row.dataset.eventId)), dateIds);
     assert.equal(await page.locator('#historyLatest').isVisible(), true);
     await page.locator('#historyLatest').click(); await row('while-reading-date').waitFor();
     assert.deepEqual(errors, []); assert.deepEqual(writes, []);
