@@ -1,0 +1,35 @@
+import assert from 'node:assert/strict';
+import test from 'node:test';
+import type { AddressInfo } from 'node:net';
+const { createAuthStore } = require('../src/auth/store');
+const { createSessionManager } = require('../src/auth/session');
+const { createChatService } = require('../src/server/chat-service');
+
+test('login shows backend attempt counts; unlocking requires user.manage, audits changes and marks the current session', async t => {
+  const store = createAuthStore({ dbPath: ':memory:' });
+  const root = store.createInitialAdmin({ username: 'root', password: 'password123' });
+  const reader = store.createUser({ username: 'reader', password: 'password123' }, root.id);
+  const sessions = createSessionManager({ store });
+  const rootCookie = sessions.createSetCookie(root).split(';')[0], readerCookie = sessions.createSetCookie(reader).split(';')[0];
+  const service = createChatService({ config: { host: '127.0.0.1', port: 0 }, authStore: store, sessionManager: sessions, logger: { info() {}, warn() {}, error() {} } });
+  await new Promise<void>(resolve => service.server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => { await service.stop(); store.close(); });
+  const base = `http://127.0.0.1:${(service.server.address() as AddressInfo).port}`;
+  const login = () => fetch(base + '/api/auth/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ username: 'reader', password: 'wrong' }) });
+  const first = await login(); assert.equal(first.status, 401);
+  assert.equal((await first.json()).remainingAttempts, 4);
+  for (let index = 0; index < 4; index++) await login();
+  assert.equal((await login()).status, 423);
+  const unlock = (cookie: string, id = reader.id) => fetch(`${base}/api/users/${id}/unlock`, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: '{}' });
+  assert.equal((await unlock(readerCookie)).status, 403);
+  assert.equal((await unlock(rootCookie)).status, 200);
+  assert.equal(store.getUserById(reader.id).failedLoginCount, 0);
+  assert.equal(store.getUserById(reader.id).lockedUntil, null);
+  const audit = store.listAuditLogs({ action: 'user.unlock' });
+  assert.equal(audit.length, 1); assert.equal(audit[0].actorUserId, root.id);
+  assert.ok(audit[0].detail.changes.some((change: { field: string }) => change.field === 'lockedUntil'));
+  const active = await (await fetch(`${base}/api/users/${root.id}/sessions`, { headers: { Cookie: rootCookie } })).json();
+  assert.equal(active.sessions.filter((session: { current?: boolean }) => session.current).length, 1);
+  store.setPermissionOverrides(reader.id, [{ permission: 'user.manage', effect: 'grant' }], root.id);
+  assert.equal((await unlock(readerCookie, root.id)).status, 403, 'ordinary managers cannot modify a super');
+});

@@ -30,7 +30,7 @@ import { sendSteamImage, sendSteamImageAttempt } from './image-upload';
 import { SendOperations, SendOperationOptions, SendOwner } from './send-operations';
 import { createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
-const { ALL_PERMISSIONS } = require('../auth/store') as { ALL_PERMISSIONS: UserPermission[] };
+const { ALL_PERMISSIONS, FAILED_LOGIN_LOCK_THRESHOLD } = require('../auth/store') as { ALL_PERMISSIONS: UserPermission[]; FAILED_LOGIN_LOCK_THRESHOLD: number };
 
 const fs = require('node:fs/promises');
 const http = require('node:http');
@@ -160,6 +160,8 @@ type AuthStoreLike = {
   permissionDetails: (userId: unknown) => Array<{ permission: UserPermission; effective: boolean; source: string }>;
   getPermissionOverrides: (userId: unknown) => Array<{ permission: UserPermission; effect: 'grant' | 'revoke' }>;
   getUserById: (id: unknown) => PublicUser | null;
+  getUserByUsername?: (username: unknown) => PublicUser | null;
+  unlockUser: (id: unknown, actorId: unknown) => PublicUser;
   listRoles: () => RoleView[];
   getRole: (id: unknown) => RoleView | null;
   createRole: (input: UnknownRecord, actorId?: unknown) => RoleView;
@@ -207,6 +209,7 @@ type SteamStatusSummary = {
   steamId?: string | null;
   activeAccount?: Pick<PublicSteamAccount, 'id' | 'steamId' | 'label'> | null;
   accessAllowed?: boolean;
+  accessRevision?: string;
   steamGrant?: { level: SteamLevel; scope: 'all' | 'some'; peerCount: number; expiresAt: string | null; via: 'grant' | 'all' } | null;
   qrLogin?: { imageDataUrl: string | null; scanned: boolean; expiresAt: number } | null;
 };
@@ -394,6 +397,8 @@ function errorPayload(error: unknown): UnknownRecord {
   if (isRecord(error) && typeof error.code === 'string') payload.code = error.code;
   if (isRecord(error) && typeof error.required === 'string') payload.required = error.required;
   if (isRecord(error) && typeof error.memberCount === 'number') payload.memberCount = error.memberCount;
+  if (isRecord(error) && typeof error.remainingAttempts === 'number') payload.remainingAttempts = error.remainingAttempts;
+  if (isRecord(error) && typeof error.lockedUntil === 'string') payload.lockedUntil = error.lockedUntil;
   if (isRecord(error) && error.statusCode === 403) payload.statusCode = 403;
   if (isRecord(error) && typeof error.steamStatus === 'string') {
     payload.steamStatus = error.steamStatus;
@@ -682,6 +687,7 @@ function createChatService(options: ChatServiceOptions = {}) {
       qrLogin: session && authStore?.hasPermission(session.user, 'steam.manage') ? status.qrLogin : null,
       activeAccount: accessAllowed || (session && authStore?.hasPermission(session.user, 'steam.manage')) ? activeAccountSummary(active) : null,
       accessAllowed,
+      accessRevision: grant ? createHash('sha256').update(JSON.stringify([grant.level, grant.scope, [...grant.peers].sort(), grant.expiresAt])).digest('hex').slice(0, 24) : undefined,
       steamGrant: grant ? { level: grant.level, scope: grant.scope, peerCount: grant.peers.size, expiresAt: grant.expiresAt, via: grant.via }
         : legacy ? { level: 'full', scope: 'all', peerCount: 0, expiresAt: null, via: 'all' } : null
     };
@@ -953,8 +959,17 @@ function createChatService(options: ChatServiceOptions = {}) {
 
     if (req.method === 'POST' && pathname === '/api/auth/login') {
       const body = await readJsonBody(req);
-      const user = authStore.authenticate(body.username, body.password, requestContext(req));
-      if (!user) throw Object.assign(new Error('Invalid username or password'), { statusCode: 401 });
+      let user: PublicUser | null;
+      try { user = authStore.authenticate(body.username, body.password, requestContext(req)); }
+      catch (error) {
+        if (isRecord(error) && error.statusCode === 423) throw Object.assign(new Error('账号已锁定，请在 15 分钟后重试或联系管理员解除锁定。'), { statusCode: 423, lockedUntil: authStore.getUserByUsername?.(body.username)?.lockedUntil });
+        throw error;
+      }
+      if (!user) {
+        const failed = authStore.getUserByUsername?.(body.username);
+        const remainingAttempts = failed && !failed.disabled ? Math.max(0, FAILED_LOGIN_LOCK_THRESHOLD - failed.failedLoginCount) : undefined;
+        throw Object.assign(new Error(remainingAttempts === undefined ? '账号或密码错误' : remainingAttempts > 0 ? `账号或密码错误，再失败 ${remainingAttempts} 次将锁定 15 分钟。` : '账号已锁定，请在 15 分钟后重试或联系管理员解除锁定。'), { statusCode: 401, remainingAttempts, lockedUntil: failed?.lockedUntil });
+      }
       jsonResponse(res, 200, { ok: true, user, permissions: authStore.effectivePermissions(user), permissionDetails: authStore.permissionDetails(user.id),
         steam: steamStatusForSession({ user }) }, {
         'Set-Cookie': sessionManager.createSetCookie(user, req)
@@ -1001,6 +1016,14 @@ function createChatService(options: ChatServiceOptions = {}) {
   async function handleUsersApi(req: IncomingMessage, res: ServerResponse, url: URL) {
     if (!authStore || !sessionManager) return false;
     const pathname = url.pathname;
+    const unlockMatch = /^\/api\/users\/(\d+)\/unlock$/.exec(pathname);
+    if (unlockMatch && req.method === 'POST') {
+      const session = requirePermission(req, 'user.manage');
+      await readManagementBody(req);
+      const user = authStore.unlockUser(unlockMatch[1], session!.user.id);
+      jsonResponse(res, 200, { ok: true, user });
+      return true;
+    }
     if (pathname === '/api/users') {
       if (req.method === 'GET') {
         requirePermission(req, 'user.view');
@@ -1046,7 +1069,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (sessionsMatch) {
       const session = requirePermission(req, 'session.manage');
       if (req.method === 'GET') {
-        jsonResponse(res, 200, { sessions: authStore.listUserSessions(sessionsMatch[1]) });
+        jsonResponse(res, 200, { sessions: authStore.listUserSessions(sessionsMatch[1]).map(item => ({ ...item, current: item.id === session?.sessionId })) });
         return true;
       }
       if (req.method === 'DELETE') {

@@ -132,6 +132,11 @@ test('v2 me/login, Steam status and WS status expose effective permissions and a
   const wsStatus = await ws.request({ type: 'get_steam_status' });
   assert.deepEqual(wsStatus.steamGrant, me.steam.steamGrant);
   assert.deepEqual(wsStatus.permissionDetails, me.permissionDetails);
+  assert.match(me.steam.accessRevision, /^[a-f0-9]{24}$/);
+  f.grant('chat', 'some', [BOB]);
+  const changedScope = await (await f.request('/api/steam/status')).json();
+  assert.equal(changedScope.steamGrant.peerCount, me.steam.steamGrant.peerCount);
+  assert.notEqual(changedScope.accessRevision, me.steam.accessRevision, 'equal-size peer replacements must invalidate old browser snapshots');
   f.store.setPermissionOverrides(f.user.id, [{ permission: 'chat.use', effect: 'revoke' }], f.root.id);
   const revoked = await (await f.request('/api/auth/me')).json();
   assert.equal(revoked.steam.accessAllowed, false);

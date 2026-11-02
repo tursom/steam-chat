@@ -976,6 +976,19 @@ function createAuthStore(options: AuthStoreOptions = {}) {
     });
   }
 
+  function unlockUser(id: unknown, actorId: Actor): PublicUser {
+    const actor = requireActor(actorId, 'user.manage');
+    const user = getUserById(id);
+    if (!user) throw httpError(404, 'User not found');
+    protectSuper(user, actor);
+    return transaction(() => {
+      db.prepare('UPDATE users SET failed_login_count = 0, locked_until = NULL, updated_at = ? WHERE id = ?').run(nowIso(), user.id);
+      auditChanges(actor.id, 'user.unlock', 'user', user.id, changesBetween(
+        { failedLoginCount: user.failedLoginCount, lockedUntil: user.lockedUntil }, { failedLoginCount: 0, lockedUntil: null }));
+      return publicUser(getUserById(user.id)!);
+    });
+  }
+
   function setPassword(id: unknown, password: unknown, options: UnknownRecord = {}, actorId?: Actor): PublicUser {
     const actor = requireActor(actorId ?? options.actorId, 'user.manage');
     const user = getUserById(id);
@@ -1546,6 +1559,7 @@ function createAuthStore(options: AuthStoreOptions = {}) {
     touchSession,
     updateSteamAccount,
     updateUser,
+    unlockUser,
     updateRole,
     upsertSteamAccount,
     validateSession
