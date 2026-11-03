@@ -108,7 +108,9 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
     });
     const friendInfo = await settleMetadata<Persona>(getUserInfo(id), { player_name: id });
     const selfName = await selfNamePromise;
-    for (const message of response.messages || []) {
+    const messages = [...(response.messages || [])].sort((a, b) =>
+      (a.server_timestamp?.getTime() || 0) - (b.server_timestamp?.getTime() || 0) || Number(a.ordinal || 0) - Number(b.ordinal || 0));
+    for (const message of messages) {
       const senderId = steamIdToString(message.sender);
       const echo = Boolean(senderId && senderId !== id);
       await persist({
@@ -131,7 +133,8 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
     const history = await new Promise<SteamHistoryMessage[]>((resolve) => {
       steamUser.getChatHistory?.(id, (error: unknown, messages?: SteamHistoryMessage[]) => resolve(error ? [] : messages || []));
     });
-    for (const message of history) {
+    for (const message of [...history].sort((a, b) =>
+      (a.timestamp || 0) - (b.timestamp || 0) || Number(a.ordinal || 0) - Number(b.ordinal || 0))) {
       const senderId = steamIdToString(message.steamID || message.accountid);
       const echo = Boolean(senderId && senderId !== id);
       await persist({
@@ -192,7 +195,9 @@ function createSteamMessageLogger(options: SteamMessageLoggerOptions) {
     const steamAccountId = activeSteamAccountId();
     const selfNamePromise = settleMetadata(getSelfName(steamAccountId), 'Me');
     const key = echoKey(`${steamAccountId || ''}:${id}:${event.serverTimestamp?.getTime() ?? ''}`, event.message, event.ordinal);
-    if (!rememberEcho(key)) return;
+    // Storage coordinates complete event identities durably. Its metadata-poor
+    // events must remain independent, rather than being merged by body here.
+    if (!storage && !rememberEcho(key)) return;
     try {
       if (storage && !steamAccountId) throw new Error('Steam account is required for history');
       await persist({

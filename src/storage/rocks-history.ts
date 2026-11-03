@@ -281,9 +281,12 @@ export class RocksHistoryStore {
     });
   }
 
-  async *all(): AsyncIterable<HistoryItem> {
+  async *all(options: { durable?: boolean } = {}): AsyncIterable<HistoryItem> {
     await this.ready();
     if (this.closing) throw new Error('History store closed');
+    // A previous transaction may have committed before its flush failed. The
+    // replay index must not turn those rows into durable evidence prematurely.
+    if (options.durable) await this.db.flush({ allowWriteStall: true });
     let release!: () => void;
     const active = new Promise<void>((resolve) => { release = resolve; });
     this.exports.add(active);

@@ -457,7 +457,7 @@ function storageFixture() {
   let onMessage = (_item: HistoryItem) => {};
   let onDurable = (_item: HistoryItem) => {};
   const storage: HistoryStorage = {
-    append: input => input as HistoryItem, canSend: () => true, close: async () => {},
+    append: async input => input as HistoryItem, canSend: () => true, close: async () => {},
     status: () => ({ jsonl: { state: 'healthy', queued: 0, writable: true, durable: 0, missed: 0 }, rocksdb: { state: 'healthy', queued: 0, writable: true, durable: 0, missed: 0 } }),
     history: async input => ({ items: rows.filter(item => item.id === input.id), nextCursor: 'history-cursor' }),
     conversations: async input => input.before ? { items: [] } : ({ items: rows.map(item => ({ id: item.id, name: item.name, updatedAt: item.date, preview: item.message,

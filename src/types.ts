@@ -59,6 +59,8 @@ export type HistoryRecordInput = UnknownRecord & {
 
 export type HistoryItem = {
   eventId?: string;
+  // false means timestamp/ordinal were synthesized, not supplied by Steam.
+  steamMetadata?: false;
   persistence?: { jsonl: string; rocksdb: string };
   type: string;
   date: string;

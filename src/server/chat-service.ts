@@ -1432,7 +1432,7 @@ function createChatService(options: ChatServiceOptions = {}) {
       broadcast({ type: 'message', ...item });
       return item;
     }
-    try { return historyStorage.append(record); }
+    try { return await historyStorage.append(record); }
     catch (error) {
       // Steam already accepted this send. A persistence failure must not invite a retry.
       logger.error?.('Sent message persistence failed', { error: errorMessage(error) });

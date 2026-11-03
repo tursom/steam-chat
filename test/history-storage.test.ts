@@ -37,7 +37,7 @@ test('two independent copies contain the same event and DB is immediately querya
   const { storage, logPath } = await fixture(t);
   const durable: string[] = [];
   storage.onDurable((item) => durable.push(item.eventId!));
-  const item = storage.append(message());
+  const item = await storage.append(message());
   assert.deepEqual(durable, []);
   await until(() => storage.status().rocksdb.durable === 1 && storage.status().jsonl.durable === 1);
   assert.deepEqual(durable, [item.eventId]);
@@ -56,14 +56,14 @@ test('Steam send result and echo share identity without repeating the visible ev
   storage.onMessage(() => visible++);
   const record = { ...message(), echo: true,
     steamEventKey: steamEventKey(account, peer, true, 'hello', new Date(message().sentAt), 0) };
-  const first = storage.append(record);
-  const second = storage.append({ ...record, name: 'changed lookup' });
+  const first = await storage.append(record);
+  const second = await storage.append({ ...record, name: 'changed lookup' });
   assert.equal(first.eventId, second.eventId);
   assert.equal(visible, 1);
   await until(() => storage.status().rocksdb.durable === 2 && storage.status().jsonl.durable === 2);
   assert.equal((await storage.history({ steamAccountId: account, id: peer })).items.length, 1);
   const records = (await fs.readFile(logPath, 'utf8')).trim().split('\n').map(line => JSON.parse(line));
-  assert.deepEqual(records[0], records[1]);
+  assert.equal(records.length, 1, 'A repeated enqueue must not append a second JSONL line');
 });
 
 test('historical supplementation does not broadcast old messages but a live counterpart still does', async (t) => {
@@ -71,9 +71,9 @@ test('historical supplementation does not broadcast old messages but a live coun
   let visible = 0;
   storage.onMessage(() => visible++);
   const record = { ...message(), steamEventKey: steamEventKey(account, peer, false, 'hello', new Date(message().sentAt), 0) };
-  const imported = storage.append(record, { notify: false });
+  const imported = await storage.append(record, { notify: false });
   assert.equal(visible, 0);
-  assert.equal(storage.append(record).eventId, imported.eventId);
+  assert.equal((await storage.append(record)).eventId, imported.eventId);
   assert.equal(visible, 1);
 });
 
@@ -91,7 +91,7 @@ test('RocksDB open failure does not prevent JSONL durable writes', async (t) => 
 
 test('JSONL open failure does not prevent direct RocksDB writes or queries', async (t) => {
   const { storage } = await fixture(t, { logPath: '/dev/null/no-log' });
-  const item = storage.append(message());
+  const item = await storage.append(message());
   await until(() => storage.status().rocksdb.durable === 1);
   assert.equal((await storage.history({ steamAccountId: account, id: peer })).items[0].eventId, item.eventId);
   assert.equal(storage.status().jsonl.durable, 0);

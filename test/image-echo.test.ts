@@ -69,16 +69,16 @@ async function storageFixture(t: { after: (fn: () => Promise<void>) => void }) {
 
 test('repeated uploads pair one-to-one and a duplicate Steam echo does not consume the next upload', async t => {
   const { storage, upload, echo } = await storageFixture(t);
-  const a = storage.append(upload);
-  const b = storage.append(upload);
+  const a = await storage.append(upload);
+  const b = await storage.append(upload);
   assert.notEqual(a.eventId, b.eventId);
   const firstEcho = { ...echo, steamEventKey: steamEventKey(account, peer, true, markup, new Date(echo.sentAt!), 0) };
-  assert.equal(storage.append(firstEcho).eventId, a.eventId);
-  assert.equal(storage.append(firstEcho).eventId, a.eventId);
+  assert.equal((await storage.append(firstEcho)).eventId, a.eventId);
+  assert.equal((await storage.append(firstEcho)).eventId, a.eventId);
   const later = new Date(Date.parse(echo.sentAt!) + 1000);
-  assert.equal(storage.append({ ...echo, sentAt: later.toISOString(),
-    steamEventKey: steamEventKey(account, peer, true, markup, later, 0) }).eventId, b.eventId);
-  const c = storage.append(upload);
+  assert.equal((await storage.append({ ...echo, sentAt: later.toISOString(),
+    steamEventKey: steamEventKey(account, peer, true, markup, later, 0) })).eventId, b.eventId);
+  const c = await storage.append(upload);
   assert.notEqual(c.eventId, a.eventId);
   assert.notEqual(c.eventId, b.eventId);
 });
@@ -94,8 +94,8 @@ for (const [name, change, historical] of [
 ] as Array<[string, Partial<HistoryRecordInput>, boolean?]>) {
   test(`image pairing preserves ${name}`, async t => {
     const { storage, upload, echo } = await storageFixture(t);
-    const a = storage.append(upload);
-    const b = storage.append({ ...echo, ...change }, { notify: !historical });
+    const a = await storage.append(upload);
+    const b = await storage.append({ ...echo, ...change }, { notify: !historical });
     assert.notEqual(a.eventId, b.eventId);
   });
 }
@@ -118,17 +118,17 @@ test('expired image candidates are not reused even if Steam timestamps match', a
   const { storage, upload, echo } = await storageFixture(t);
   t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
   try {
-    const a = storage.append(upload);
+    const a = await storage.append(upload);
     t.mock.timers.tick(30001);
-    assert.notEqual(storage.append(echo).eventId, a.eventId);
+    assert.notEqual((await storage.append(echo)).eventId, a.eventId);
   } finally { t.mock.timers.reset(); }
 });
 
 for (const quote of ['"', "'"]) {
   test(`image pairing accepts ${quote} quoted src attributes`, async t => {
     const { storage, upload, echo } = await storageFixture(t);
-    const a = storage.append(upload);
-    const b = storage.append({ ...echo, message: markup.replace(`src=${image} `, `src=${quote}${image}${quote} `) });
+    const a = await storage.append(upload);
+    const b = await storage.append({ ...echo, message: markup.replace(`src=${image} `, `src=${quote}${image}${quote} `) });
     assert.equal(a.eventId, b.eventId);
   });
 }
@@ -190,7 +190,7 @@ for (const echoFirst of [false, true]) {
     for (const offset of [0, 1000]) {
       let first;
       if (echoFirst) first = await storage.appendSteamImage!(makeEcho(offset));
-      const sent = storage.append(upload);
+      const sent = await storage.append(upload);
       // No durability wait between counterpart and concurrent historical replays.
       const results = await Promise.all([
         storage.appendSteamImage!(makeEcho(offset)),
@@ -280,7 +280,7 @@ test('Steam logger retains exact timestamp precision for distinct same-image eve
 
 test('historical image without an established alias does not borrow an unmatched upload identity', async t => {
   const { storage, upload, echo } = await storageFixture(t);
-  const sent = storage.append(upload);
+  const sent = await storage.append(upload);
   const historical: HistoryRecordInput = { ...echo, imageSendSource: undefined,
     steamEventKey: steamEventKey(account, peer, true, markup, new Date(echo.sentAt!), 0) };
   const imported = await storage.appendSteamImage!(historical, { notify: false });
@@ -306,8 +306,8 @@ test('Steam image identity admission bounds pending lookups and rejects after cl
 test('bare UGC echoes pair one-to-one but ordinary links and intentional repeats are retained', async t => {
   const { storage, upload, echo } = await storageFixture(t);
   const url = 'https://images.steamusercontent.com/ugc/123456/ABCDEF012345/';
-  const first = storage.append({ ...upload, message: url });
-  const second = storage.append({ ...upload, message: url });
+  const first = await storage.append({ ...upload, message: url });
+  const second = await storage.append({ ...upload, message: url });
   const at = new Date(echo.sentAt!);
   const record = { ...echo, message: url, steamEventKey: steamEventKey(account, peer, true, url, at, 0) };
   assert.equal((await storage.appendSteamImage!(record)).eventId, first.eventId);
@@ -315,7 +315,7 @@ test('bare UGC echoes pair one-to-one but ordinary links and intentional repeats
   const next = { ...record, ordinal: 1, steamEventKey: steamEventKey(account, peer, true, url, at, 1) };
   assert.equal((await storage.appendSteamImage!(next)).eventId, second.eventId);
   for (const message of ['https://example.com/image.jpg', `${url} caption`, `See ${url}`]) {
-    const own = storage.append({ ...upload, message });
-    assert.notEqual(storage.append({ ...echo, message }).eventId, own.eventId);
+    const own = await storage.append({ ...upload, message });
+    assert.notEqual((await storage.append({ ...echo, message })).eventId, own.eventId);
   }
 });

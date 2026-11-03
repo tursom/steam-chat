@@ -1,71 +1,49 @@
-import * as fs from 'node:fs/promises';
-import * as path from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { AppendOnlyJsonlWriter } from './history-jsonl';
 import { SteamImageAliases } from './history-steam-alias';
 import { serializeStoredMessage, type StoredMessage } from './history-message';
+import { HistoryIdempotency, jsonlRecords } from './history-idempotency';
 
 // This module is loaded only by the forked writer, never by the HTTP process.
 let database: any;
-let file: fs.FileHandle | undefined;
-let logFilename: string | undefined;
+let log: AppendOnlyJsonlWriter | undefined;
 let aliases: SteamImageAliases;
+let idempotency: HistoryIdempotency;
 let serial = Promise.resolve();
-
-async function openLog(filename: string) {
-  await fs.mkdir(path.dirname(filename), { recursive: true });
-  file = await fs.open(filename, 'a+');
-  const directory = await fs.open(path.dirname(filename), 'r');
-  try { await directory.sync(); } finally { await directory.close(); }
-  const size = (await file.stat()).size;
-  if (!size) return;
-  const tail = Buffer.alloc(Math.min(size, 4 * 1024 * 1024));
-  await file.read(tail, 0, tail.length, size - tail.length);
-  if (tail[tail.length - 1] === 10) return;
-  const newline = tail.lastIndexOf(10);
-  if (newline < 0 && size > tail.length) throw new Error('JSONL tail exceeds repair limit; offline repair required');
-  const partial = tail.subarray(newline + 1);
-  const quarantine = await fs.open(`${filename}.${randomBytes(8).toString('hex')}.partial`, 'wx');
-  try { await quarantine.writeFile(partial); await quarantine.sync(); } finally { await quarantine.close(); }
-  await file.truncate(size - partial.length);
-  await file.sync();
-}
 
 async function run(method: string, value: any): Promise<any> {
   if (method === 'init') {
     aliases = new SteamImageAliases(`${value.path}.steam-image-aliases-v1`);
-    if (value.kind === 'jsonl') { logFilename = value.path; await openLog(value.path); }
+    if (value.kind === 'jsonl') { log = new AppendOnlyJsonlWriter(value.path); await log.ready(); }
     else {
       const { RocksHistoryStore } = require('./rocks-history');
       database = new RocksHistoryStore(value.path);
       await database.ready();
     }
+    idempotency = new HistoryIdempotency(`${value.path}.idempotency-v1.sqlite`,
+      () => log ? jsonlRecords(value.path) : database.all({ durable: true }),
+      async item => {
+        if (log) await log.append(serializeStoredMessage(item));
+        else await database.put(item);
+      });
+    await idempotency.ready();
     return true;
   }
-  if (method === 'imageAlias') return aliases.get(value);
+  if (method === 'imageAlias') return (await aliases.get(value)) || idempotency.get(value);
+  if (method === 'resolve') { if (log) await log.ready(); await idempotency.ready(); return idempotency.resolve(value); }
   if (method === 'append') {
     const item: StoredMessage = value;
-    // The alias must survive even if the primary write succeeds but its ACK is lost.
-    if (value.steamImageEventKey) await aliases.put(value.steamImageEventKey, item);
-    if (logFilename) {
-      try {
-        if (!file) await openLog(logFilename);
-        await file.writeFile(`${serializeStoredMessage(item)}\n`, 'utf8');
-        await file.sync();
-        return true;
-      } catch (error) {
-        await file?.close().catch((): undefined => undefined);
-        file = undefined;
-        throw error;
-      }
-    }
-    return database.put(item);
+    // Reopen/repair an uncertain JSONL tail before consulting actual records.
+    if (log) await log.ready();
+    return idempotency.append(item, value.steamImageEventKey
+      ? resolved => aliases.put(value.steamImageEventKey, resolved) : undefined, value.canonicalResolved === true);
   }
   if (method === 'sync') return database.sync(value);
   if (method === 'history') return database.history(value);
   if (method === 'conversations') return database.conversations(value);
   if (method === 'close') {
-    if (file) { await file.sync(); await file.close(); file = undefined; }
+    if (log) await log.close();
     if (database) await database.close();
+    idempotency.close();
     return true;
   }
   throw new Error('Unknown storage worker method');
