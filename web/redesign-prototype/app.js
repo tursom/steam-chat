@@ -34,7 +34,8 @@ const S = {
   roleSel: 'cs', roleView: 'role', auditCat: 'all', auditOpen: 0, auditQuery: '', emoteGroup: 'common',
   modal: null, menu: null, palette: false, paletteQuery: '', loginMode: 'login',
   snapshot: null, scrollBottom: true,
-  settings: { notify: true, bgOnly: true }
+  settings: { notify: true, bgOnly: true },
+  privacy: { on: qs.get('privacy') === '1', style: qs.get('pv') === 'alias' ? 'alias' : 'mosaic', self: true, account: true, user: true, images: false }
 };
 
 // ---------- Authorization model (see docs/authorization-v2.md) ----------
@@ -73,11 +74,52 @@ function statusText(x) {
   if (x.group) return 'Steam 社区群组';
   return x.presence === 'game' ? `正在玩 ${x.game}` : x.presence === 'offline' ? `${x.lastOnline}在线` : STATUS[x.presence];
 }
-function av(x, size = 'md', dot = true) {
-  const initial = [...x.name.trim()][0].toUpperCase();
-  return `<span class="av av-${size}${x.group ? ' is-group' : ''}" style="--h:${x.hue}">${esc(initial)}${dot && !x.group && x.presence ? `<i class="dot p-${x.presence}"></i>` : ''}</span>`;
+// ---------- Privacy mode ----------
+// Masked values never reach anything that can be seen or read out (text, title, aria-label, placeholder, toasts),
+// so nothing leaks through zoom, hover, text selection or a screen reader. Routing keys in data-* stay real.
+function pvHash(key) {
+  let h = 2166136261;
+  for (const c of String(key)) h = Math.imul(h ^ c.charCodeAt(0), 16777619);
+  // FNV alone keeps neighbouring SteamIDs in neighbouring buckets (好友 N2, O8, P4…); mix the bits.
+  h ^= h >>> 16; h = Math.imul(h, 0x85ebca6b); h ^= h >>> 13; h = Math.imul(h, 0xc2b2ae35); h ^= h >>> 16;
+  return h >>> 0;
 }
-const userAv = (u, size = 'md') => av({ name: u.display || u.username, hue: (u.id * 67) % 360 }, size, false);
+const PV_PREFIX = { friend: '好友', group: '群组', user: '用户', account: '账户' };
+function pvOn(kind) {
+  const p = S.privacy;
+  return p.on && (kind === 'friend' || kind === 'group' || Boolean(p[kind]));
+}
+function alias(kind, key) {
+  if (kind === 'self') return '我';
+  const h = pvHash(key);
+  return `${PV_PREFIX[kind]} ${String.fromCharCode(65 + h % 26)}${1 + (h >>> 5) % 9}`;
+}
+// HTML for a name or ID. IDs are always mosaicked: an alias for a number would only invite confusion.
+function nm(text, kind, key = text, isId = false) {
+  if (!pvOn(kind)) return esc(text);
+  if (S.privacy.style === 'alias' && !isId) return `<span class="pv-alias">${esc(alias(kind, key))}</span>`;
+  return `<span class="pv-mask" style="--n:${isId ? 9 : 3 + pvHash(key) % 3}" role="img" aria-label="已隐藏"></span>`;
+}
+// Plain text for attributes, toasts and titles.
+const plain = (text, kind, key = text) => !pvOn(kind) ? text : S.privacy.style === 'alias' ? alias(kind, key) : '已隐藏';
+const convKind = x => x.group ? 'group' : 'friend';
+const convName = x => nm(x.name, convKind(x), x.id);
+const userKind = u => u.id === me().id ? 'self' : 'user';
+const userName = u => nm(u.display, userKind(u), `u${u.id}`);
+// The @handle only repeats the name, so alias mode drops it instead of inventing a second alias.
+const userHandle = u => !pvOn(userKind(u)) ? `@${esc(u.username)}` : S.privacy.style === 'alias' ? '' : nm(u.username, userKind(u), `h${u.id}`);
+const acctName = a => nm(a.label, 'account', `a${a.id}`);
+const acctId = a => nm(a.steamId, 'account', `i${a.id}`, true);
+const activeName = () => acctName(STEAM_ACCOUNTS.find(a => a.active));
+
+function av(x, size = 'md', dot = true) {
+  const kind = x.kind || convKind(x);
+  const masked = pvOn(kind);
+  const label = masked ? (S.privacy.style === 'alias' ? alias(kind, x.id) : '') : x.name;
+  const initial = label ? [...label.replace(/^(好友|群组|用户|账户) /, '').trim()][0].toUpperCase() : '';
+  return `<span class="av av-${size}${x.group ? ' is-group' : ''}${masked && !label ? ' is-masked' : ''}" style="--h:${x.hue}">${esc(initial)}${dot && !x.group && x.presence ? `<i class="dot p-${x.presence}"></i>` : ''}</span>`;
+}
+const userAv = (u, size = 'md') => av({ id: `u${u.id}`, name: u.display || u.username, hue: (u.id * 67) % 360, kind: userKind(u) }, size, false);
 const accAv = (a, size = 'md') => `<span class="av av-${size} is-steam">${ic('gamepad-2')}</span>`;
 const badge = (text, tone = '') => `<span class="badge ${tone}">${esc(text)}</span>`;
 const seg = (items, value, act, o = {}, disabled = false) => `<div class="seg" role="radiogroup">${items.map(([v, label]) =>
@@ -121,7 +163,7 @@ const canOpenAny = () => { const g = myGrant(); return g.scope !== 'some' && lev
 function convRow(x) {
   const n = unread[x.id] || 0;
   return `<button type="button" class="conv${x.id === S.active ? ' is-active' : ''}" data-act="open" data-id="${x.id}" data-ctx="${S.tab === 'recent' ? x.id : ''}" aria-current="${x.id === S.active}">
-    ${av(x)}<span class="conv-body"><span class="conv-top"><strong>${esc(x.name)}</strong><time>${esc(x.time)}</time></span>
+    ${av(x)}<span class="conv-body"><span class="conv-top"><strong>${convName(x)}</strong><time>${esc(x.time)}</time></span>
     <span class="conv-bottom"><span class="conv-preview">${esc(x.preview)}</span>${n ? `<span class="unread">${n}</span>` : ''}</span></span></button>`;
 }
 function convTabs(items) {
@@ -138,7 +180,7 @@ function scopeNotice() {
   const g = myGrant();
   if (g.all || g.level === 'none') return '';
   const scope = g.scope === 'some' ? `仅 ${g.friends.length} 位指定好友` : '全部会话';
-  return `<div class="scope-note">${ic('shield-check')}<span>主号 · Dove：<b>${levelName(g.level)}</b> · ${scope}${g.expires ? ` · 至 ${g.expires}` : ''}</span></div>`;
+  return `<div class="scope-note">${ic('shield-check')}<span>${activeName()}：<b>${levelName(g.level)}</b> · ${scope}${g.expires ? ` · 至 ${g.expires}` : ''}</span></div>`;
 }
 function contextMenu() {
   if (!S.ctx) return '';
@@ -150,6 +192,7 @@ function contextMenu() {
 
 // ---------- Messages ----------
 function msgBody(m) {
+  if (m.t === 'image' && pvOn('images')) return `<button type="button" class="msg-image is-masked" data-act="lightbox" data-src="${m.img}" aria-label="图片已隐藏，点击查看"><img src="${m.img}" alt="" width="460" height="215"><span>${ic('eye-off')}图片已隐藏</span></button>`;
   if (m.t === 'image') return `<button type="button" class="msg-image" data-act="lightbox" data-src="${m.img}"><img src="${m.img}" alt="图片" width="460" height="215"></button>`;
   if (m.t === 'og') return `<a class="og" href="#" data-act="noop"><img src="${m.img}" alt=""><span class="og-copy"><small>${esc(m.url)}</small><strong>${esc(m.title)}</strong><span>${esc(m.desc)}</span></span></a>`;
   if (m.t === 'sticker') return `<span class="sticker">${esc(m.text)}</span>`;
@@ -172,14 +215,14 @@ function sendState(m, i) {
   return `<span class="send-state is-${m.state}">${ic(s[0])}${s[1]}${action}</span>`;
 }
 function msgRow(m, conv, cont, i) {
-  const who = m.self ? { name: 'Dove', hue: 210 } : conv;
+  const who = m.self ? { id: 'self', name: 'Dove', hue: 210, kind: 'self' } : conv;
   const full = levelAtLeast(myGrant(), 'full') && S.steamOnline;
   const reacts = (m.reactions || []).map(r => `<button type="button" class="react${r.mine ? ' is-mine' : ''}" data-act="react" ${full ? '' : 'disabled title="表情回应需要「完整」授权"'}><img src="${EMOTICONS.find(e => e.name === r.e).img}" alt=":${r.e}:">${r.n}</button>`).join('');
   const state = sendState(m, i);
   return `<article class="msg${m.self ? ' is-self' : ''}${cont ? ' is-cont' : ''}" data-state="${m.state || ''}">
     <span class="msg-av">${cont ? '' : av(who, 'sm', false)}</span>
     <div class="msg-main">
-      ${cont ? '' : `<header class="msg-head"><strong>${esc(who.name)}</strong>${m.self ? '<span class="me-tag">我</span>' : ''}<time>${m.time}</time></header>`}
+      ${cont ? '' : `<header class="msg-head"><strong>${nm(who.name, who.kind || convKind(who), who.id)}</strong>${m.self && !(pvOn('self') && S.privacy.style === 'alias') ? '<span class="me-tag">我</span>' : ''}<time>${m.time}</time></header>`}
       <div class="msg-body">${msgBody(m)}</div>
       ${reacts || state ? `<div class="msg-foot">${reacts}${state}</div>` : ''}
     </div>
@@ -226,7 +269,7 @@ function picker() {
 function composer(conv) {
   const g = myGrant();
   // Permanent reasons (read-only grant, group) win over the transient offline state; read-only drops the input entirely.
-  if (g.level === 'read') return `<footer class="composer"><div class="composer-note is-muted">${ic('lock')}<span>你在「主号 · Dove」上的授权为<b>只读</b>：可以浏览会话和历史，不能发送消息。</span></div></footer>`;
+  if (g.level === 'read') return `<footer class="composer"><div class="composer-note is-muted">${ic('lock')}<span>你在「${activeName()}」上的授权为<b>只读</b>：可以浏览会话和历史，不能发送消息。</span></div></footer>`;
   let note = '';
   if (conv.group) note = `${ic('info')}<span>这是 Steam 社区群组，尚未接入群聊频道。可在资料中打开群组主页。</span>`;
   else if (!S.steamOnline) note = `${ic('wifi-off')}<span>Steam 未在线，暂时不能发送。草稿会保留，连接恢复后可继续。</span>`;
@@ -243,7 +286,7 @@ function composer(conv) {
       <div class="composer-row">
         ${ib('smile', '表情和贴纸', 'picker', off ? 'disabled' : `aria-expanded="${S.picker}"`, 'icon-btn tool')}
         ${ib('image-plus', media ? '添加图片（也可粘贴或拖入）' : '发送图片需要「完整」授权', 'attach', off || !media ? 'disabled' : '', 'icon-btn tool')}
-        <textarea id="composer" rows="1" placeholder="${off ? '' : `发送给 ${esc(conv.name)}`}" data-input="draft" ${off ? 'disabled' : ''} aria-label="消息">${esc(S.drafts[conv.id] || '')}</textarea>
+        <textarea id="composer" rows="1" placeholder="${off ? '' : pvOn(convKind(conv)) && S.privacy.style === 'mosaic' ? '发送消息' : `发送给 ${esc(plain(conv.name, convKind(conv), conv.id))}`}" data-input="draft" ${off ? 'disabled' : ''} aria-label="消息">${esc(S.drafts[conv.id] || '')}</textarea>
         ${ib('send', '发送（Enter）', 'send', off ? 'disabled' : '', 'icon-btn send')}
       </div>
     </div>
@@ -253,10 +296,10 @@ function composer(conv) {
 function profileFacts(conv) {
   const g = myGrant();
   const rows = [
-    ['SteamID', `<span class="mono">${conv.id}</span>${ib('copy', '复制 SteamID', 'copy', '', 'icon-btn xs')}`],
+    ['SteamID', `<span class="mono">${nm(conv.id, convKind(conv), conv.id, true)}</span>${ib('copy', '复制 SteamID', 'copy', '', 'icon-btn xs')}`],
     ['关系', conv.group ? 'Steam 社区群组' : 'Steam 好友'],
-    ...(conv.nickname ? [['备注', esc(conv.nickname)]] : []),
-    ['当前账户', '主号 · Dove'],
+    ...(conv.nickname ? [['备注', nm(conv.nickname, convKind(conv), `n${conv.id}`)]] : []),
+    ['当前账户', activeName()],
     ['我的授权', g.all ? '完整 · 全部账户' : `${levelName(g.level)} · ${g.scope === 'some' ? '指定好友' : '全部会话'}`]
   ];
   return `<dl class="facts">${rows.map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('')}</dl>`;
@@ -268,7 +311,7 @@ function gameCard(conv) {
 }
 function profilePanel(conv) {
   return `<div class="profile">
-    <div class="profile-id">${av(conv, 'xl')}<h3>${esc(conv.name)}</h3><span class="presence-text p-${conv.presence || 'group'}">${esc(statusText(conv))}</span>
+    <div class="profile-id">${av(conv, 'xl')}<h3>${convName(conv)}</h3><span class="presence-text p-${conv.presence || 'group'}">${esc(statusText(conv))}</span>
       <a href="#" class="link" data-act="noop">${conv.group ? '群组主页' : 'Steam 主页'} ${ic('external-link')}</a></div>
     ${gameCard(conv)}${profileFacts(conv)}</div>`;
 }
@@ -286,23 +329,23 @@ function accountsContent() {
   const online = S.steamOnline;
   const conn = `<section class="card conn">
     <div class="conn-main">${accAv(active, 'lg')}
-      <div><span class="status ${online ? 'is-online' : 'is-off'}"><i></i>${online ? '在线' : '未连接'}</span><h2>${active.label}</h2><p class="mono">${active.steamId}</p></div></div>
+      <div><span class="status ${online ? 'is-online' : 'is-off'}"><i></i>${online ? '在线' : '未连接'}</span><h2>${acctName(active)}</h2><p class="mono">${acctId(active)}</p></div></div>
     <div class="conn-actions">${manage ? (online ? btn('切换账户', 'menu', { m: 'switch' }, 'btn', 'refresh-cw') + btn('退出 Steam', 'confirm', { k: 'steamLogout' }, 'btn danger-ghost', 'power') : btn('连接', 'steamToggle', {}, 'btn primary', 'power')) : '<span class="hint">你没有登录或切换 Steam 的权限</span>'}
-      ${S.menu === 'switch' ? `<div class="menu">${STEAM_ACCOUNTS.filter(a => a.enabled).map(a => `<button type="button" data-act="toastClose" data-v="已切换到 ${a.label}">${accAv(a, 'xs')}<span>${a.label}</span>${a.active ? ic('check') : ''}</button>`).join('')}</div>` : ''}</div>
+      ${S.menu === 'switch' ? `<div class="menu">${STEAM_ACCOUNTS.filter(a => a.enabled).map(a => `<button type="button" data-act="toastClose" data-v="已切换到 ${esc(plain(a.label, 'account', `a${a.id}`))}">${accAv(a, 'xs')}<span>${acctName(a)}</span>${a.active ? ic('check') : ''}</button>`).join('')}</div>` : ''}</div>
     <dl class="conn-facts"><div><dt>最近登录</dt><dd>今天 09:12</dd></div><div><dt>Token 更新</dt><dd>${active.token}</dd></div><div><dt>授权用户</dt><dd>${active.users} 人</dd></div><div><dt>消息存储</dt><dd>${S.storageOk ? '<span class="status is-online"><i></i>正常</span>' : '<span class="status is-warn"><i></i>历史索引正在同步</span>'}</dd></div></dl>
   </section>`;
   const rows = STEAM_ACCOUNTS.map(a => `<div class="trow">
-      <div class="cell grow">${accAv(a)}<div><strong>${a.label}</strong><small class="mono">${a.steamId}${a.hint ? ` · ${a.hint}` : ''}</small></div></div>
+      <div class="cell grow">${accAv(a)}<div><strong>${acctName(a)}</strong><small class="mono">${acctId(a)}${a.hint ? ` · ${nm(a.hint, 'account', `h${a.id}`)}` : ''}</small></div></div>
       <div class="cell">${a.active ? badge('当前活动', 'accent') : a.enabled ? badge('已启用', 'ok') : badge('已禁用', 'muted')}</div>
       <div class="cell hide-sm"><small>授权</small>${a.users} 人</div>
       <div class="cell hide-sm"><small>活跃</small>${a.lastActive}</div>
-      <div class="cell actions">${manage && !a.active && a.enabled ? btn('连接', 'toastClose', { v: `正在连接 ${a.label}…` }, 'btn sm') : ''}${can('steam.account.manage') ? ib('ellipsis', '更多操作', 'menu', `data-m="acct${a.id}"`) : ''}
+      <div class="cell actions">${manage && !a.active && a.enabled ? btn('连接', 'toastClose', { v: `正在连接 ${plain(a.label, 'account', `a${a.id}`)}…` }, 'btn sm') : ''}${can('steam.account.manage') ? ib('ellipsis', '更多操作', 'menu', `data-m="acct${a.id}"`) : ''}
         ${S.menu === `acct${a.id}` ? `<div class="menu">${btn('编辑资料', 'modal', { m: 'editAccount' }, '', 'pencil')}${btn(a.enabled ? '禁用' : '启用', 'toastClose', { v: a.enabled ? '已禁用' : '已启用' }, '', 'power')}${a.active ? btn('退出登录', 'confirm', { k: 'steamLogout' }, '', 'log-out') : ''}${btn('删除', 'confirm', { k: 'deleteAccount' }, 'danger', 'trash-2')}</div>` : ''}</div>
     </div>`).join('');
   const list = `<section class="card"><header class="card-head"><div><h3>账户</h3><p>同一时间只有一个活动账户在线</p></div>${manage ? btn('添加账户', 'modal', { m: 'addSteam' }, 'btn primary', 'plus') : ''}</header><div class="table">${rows}</div></section>`;
   const overview = can('steam.grant.manage') ? `<section class="card"><header class="card-head"><div><h3>授权概览</h3><p>谁能以什么等级访问哪个账户 · 点击进入用户的 Steam 授权</p></div></header>
-    <div class="grant-matrix" style="--cols:${STEAM_ACCOUNTS.length}"><div class="gm-head"><span>用户</span>${STEAM_ACCOUNTS.map(a => `<span>${a.label}</span>`).join('')}</div>
-    ${users.map(u => `<button type="button" class="gm-row" data-act="gotoGrant" data-id="${u.id}"><span class="gm-user">${userAv(u, 'xs')}${esc(u.display)}</span>${STEAM_ACCOUNTS.map(a => levelBadge(grantFor(u, a.id))).join('')}</button>`).join('')}</div></section>` : '';
+    <div class="grant-matrix" style="--cols:${STEAM_ACCOUNTS.length}"><div class="gm-head"><span>用户</span>${STEAM_ACCOUNTS.map(a => `<span>${acctName(a)}</span>`).join('')}</div>
+    ${users.map(u => `<button type="button" class="gm-row" data-act="gotoGrant" data-id="${u.id}"><span class="gm-user">${userAv(u, 'xs')}${userName(u)}</span>${STEAM_ACCOUNTS.map(a => levelBadge(grantFor(u, a.id))).join('')}</button>`).join('')}</div></section>` : '';
   return conn + list + overview;
 }
 
@@ -316,7 +359,7 @@ function usersContent() {
       <div class="list-tools">${searchBox('搜索账号、昵称、备注', 'userSearch', 'userQuery', S.userQuery)}</div>
       <div class="chips">${filters.map(([v, l]) => `<button type="button" class="chip${S.userFilter === v ? ' is-on' : ''}" data-act="userFilter" data-v="${v}">${l}<small>${v === 'all' ? users.length : users.filter(u => u.status === v).length}</small></button>`).join('')}</div>
       <div class="rows" id="userRows" data-scroll>${list.map(u => `<button type="button" class="urow${u.id === sel.id ? ' is-active' : ''}" data-act="userSel" data-id="${u.id}">
-        ${userAv(u)}<span class="urow-body"><span><strong>${esc(u.display)}</strong> <small>@${u.username}</small></span><span>${badge(roleOf(u).name, roleOf(u).id === 'super' ? 'accent' : '')}${u.status !== 'enabled' ? userStatus(u) : ''}</span></span>${ic('chevron-right', 'chev')}</button>`).join('') || '<div class="empty-small">没有匹配的用户</div>'}</div>
+        ${userAv(u)}<span class="urow-body"><span><strong>${userName(u)}</strong> <small>${userHandle(u)}</small></span><span>${badge(roleOf(u).name, roleOf(u).id === 'super' ? 'accent' : '')}${u.status !== 'enabled' ? userStatus(u) : ''}</span></span>${ic('chevron-right', 'chev')}</button>`).join('') || '<div class="empty-small">没有匹配的用户</div>'}</div>
     </section>
     <section class="card detail-pane">${userDetail(sel)}</section>
   </div>`;
@@ -326,14 +369,14 @@ function userDetail(u) {
   const self = u.id === me().id;
   const tabs = [['overview', '概览'], ['perm', '权限'], ['grant', 'Steam 授权'], ['sessions', `会话 ${u.sessions.length}`]];
   let body = '';
-  if (S.userTab === 'overview') body = `<dl class="facts wide">${[['昵称', esc(u.display)], ['账号', `@${u.username}`], ['备注', esc(u.note) || '<span class="hint">无</span>'], ['创建时间', u.created], ['最近登录', `${u.lastLogin} · ${u.ip}`], ['最近活跃', u.seen], ['密码修改', u.pwd], ['连续失败', `${u.failed} 次${u.status === 'locked' ? ' · 锁定 15 分钟' : ''}`]].map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('')}</dl>`;
+  if (S.userTab === 'overview') body = `<dl class="facts wide">${[['昵称', userName(u)], ['账号', userHandle(u) || nm(u.username, userKind(u), `h${u.id}`)], ['备注', esc(u.note) || '<span class="hint">无</span>'], ['创建时间', u.created], ['最近登录', `${u.lastLogin} · ${u.ip}`], ['最近活跃', u.seen], ['密码修改', u.pwd], ['连续失败', `${u.failed} 次${u.status === 'locked' ? ' · 锁定 15 分钟' : ''}`]].map(([k, v]) => `<div><dt>${k}</dt><dd>${v}</dd></div>`).join('')}</dl>`;
   else if (S.userTab === 'perm') body = permTab(u, self);
   else if (S.userTab === 'grant') body = grantTab(u);
   else body = `<div class="sessions">${u.sessions.map((s, i) => `<div class="session">${ic(s.device.includes('Android') || s.device.includes('iPhone') ? 'smartphone' : 'monitor')}<div><strong>${s.device}${s.current ? ' ' + badge('当前', 'accent') : ''}</strong><small>${s.ip} · ${s.seen}</small></div>${can('session.manage') && !s.current ? btn('踢下线', 'kick', { i }, 'btn sm danger-ghost') : ''}</div>`).join('') || '<div class="empty-small">暂无活动会话</div>'}
     ${u.sessions.length && can('session.manage') ? btn('踢下线全部会话', 'confirm', { k: 'kickAll' }, 'btn danger-ghost', 'log-out') : ''}</div>`;
   const more = S.menu === 'userMore' ? `<div class="menu">${btn(u.status === 'disabled' ? '启用用户' : '禁用用户', 'userStatus', {}, '', 'power')}${u.status === 'locked' ? btn('解除锁定', 'toastClose', { v: '已解除锁定' }, '', 'lock-open') : ''}${btn('要求下次登录改密', 'toastClose', { v: '已要求该用户下次登录修改密码' }, '', 'key-round')}${btn('删除用户', 'confirm', { k: 'deleteUser' }, 'danger', 'trash-2')}</div>` : '';
   return `<header class="ud-head">${ib('arrow-left', '返回用户列表', 'userBack', '', 'icon-btn mobile-only')}${userAv(u, 'lg')}
-      <div class="ud-id"><h2>${esc(u.display)}</h2><p>@${u.username} · ${badge(roleOf(u).name, roleOf(u).id === 'super' ? 'accent' : '')} ${userStatus(u)}${self ? ' ' + badge('你', 'muted') : ''}</p></div>
+      <div class="ud-id"><h2>${userName(u)}</h2><p>${userHandle(u)} ·${badge(roleOf(u).name, roleOf(u).id === 'super' ? 'accent' : '')} ${userStatus(u)}${self ? ' ' + badge('你', 'muted') : ''}</p></div>
       <div class="ud-actions">${manage ? btn('编辑', 'modal', { m: 'editUser' }, 'btn sm', 'pencil') + btn('重置密码', 'modal', { m: 'resetPwd' }, 'btn sm', 'key-round') + (self ? '' : ib('ellipsis', '更多', 'menu', 'data-m="userMore"')) + more : badge('只读查看', 'muted')}</div></header>
     <div class="tabs" role="tablist">${tabs.map(([t, l]) => `<button type="button" role="tab" aria-selected="${S.userTab === t}" class="${S.userTab === t ? 'is-on' : ''}" data-act="userTab" data-t="${t}">${l}</button>`).join('')}</div>
     <div class="tab-body" id="userTabBody" data-scroll>${body}</div>${saveBar()}`;
@@ -363,13 +406,13 @@ function grantTab(u) {
     const soon = g.expires === '2026-11-09';
     const detail = g.level === 'none' ? '' : `
       <div class="grant-line"><span>会话范围</span>${seg([['all', '全部会话'], ['some', '指定好友']], g.scope, 'scope', { a: a.id }, off)}</div>
-      ${g.scope === 'some' ? `<div class="friend-chips">${g.friends.map(id => { const f = byId(id); return `<span class="fchip">${av(f, 'xs', false)}${esc(f.name)}${off ? '' : `<button type="button" data-act="unpick" data-a="${a.id}" data-id="${id}" aria-label="移除 ${esc(f.name)}">${ic('x')}</button>`}</span>`; }).join('')}
+      ${g.scope === 'some' ? `<div class="friend-chips">${g.friends.map(id => { const f = byId(id); return `<span class="fchip">${av(f, 'xs', false)}${convName(f)}${off ? '' : `<button type="button" data-act="unpick" data-a="${a.id}" data-id="${id}" aria-label="移除 ${esc(plain(f.name, 'friend', f.id))}">${ic('x')}</button>`}</span>`; }).join('')}
         ${off ? '' : `<button type="button" class="fchip add" data-act="modal" data-m="pickFriends" data-a="${a.id}">${ic('plus')}添加好友</button>`}</div>
         <p class="hint">受限用户只能看到这些好友的会话、历史和实时消息，不能按 SteamID 新建会话，也看不到群组。</p>` : ''}
       <div class="grant-line"><span>有效期</span><select data-change="expires" data-a="${a.id}" ${off ? 'disabled' : ''}>${[['', '永久'], ['2026-11-09', '7 天（至 11 月 9 日）'], ['2026-12-02', '30 天（至 12 月 2 日）'], ['2026-12-31', '至 2026-12-31']].map(([v, l]) => `<option value="${v}" ${v === g.expires ? 'selected' : ''}>${l}</option>`).join('')}</select>${soon ? badge('7 天内到期', 'warn') : ''}</div>
       <ul class="caps">${[['查看会话与历史', 'read'], ['发送文字与 Steam 表情', 'chat'], ['图片、贴纸、效果与回应', 'full']].map(([t, l]) => { const on = levelAtLeast(g, l); return `<li class="${on ? 'is-on' : ''}">${ic(on ? 'check' : 'x')}${t}</li>`; }).join('')}</ul>`;
     return `<article class="grant-card${g.level === 'none' ? ' is-none' : ''}${a.enabled ? '' : ' is-disabled'}">
-      <header>${accAv(a)}<div><strong>${a.label}</strong><small>${a.enabled ? a.steamId : '账户已禁用，授权暂不生效'}</small></div>
+      <header>${accAv(a)}<div><strong>${acctName(a)}</strong><small>${a.enabled ? acctId(a) : '账户已禁用，授权暂不生效'}</small></div>
       ${seg(LEVELS.map(([v, l]) => [v, l]), allAcc.on ? 'full' : g.level, 'level', { a: a.id }, off)}</header>${allAcc.on ? '' : detail}</article>`;
   }).join('');
   return `${head}${!editable ? `<p class="notice">${ic('info')}你没有「分配 Steam 授权」权限，只能查看。</p>` : ''}${cards}`;
@@ -392,7 +435,7 @@ function rolesContent() {
       <div class="rows">${roles.map(x => `<button type="button" class="urow${x.id === r.id ? ' is-active' : ''}" data-act="roleSel" data-id="${x.id}"><span class="role-ic">${ic(x.id === 'super' ? 'shield-check' : 'key-round')}</span><span class="urow-body"><span><strong>${x.name}</strong>${x.builtin ? ' ' + badge('内置', 'muted') : ''}</span><small>${users.filter(u => u.role === x.id).length} 名成员 · ${x.perms.length} 项权限</small></span>${ic('chevron-right', 'chev')}</button>`).join('')}</div></section>
     <section class="card detail-pane"><header class="ud-head">${ib('arrow-left', '返回角色列表', 'userBack', '', 'icon-btn mobile-only')}<span class="role-ic lg">${ic(r.id === 'super' ? 'shield-check' : 'key-round')}</span><div class="ud-id"><h2>${r.name}</h2><p>${r.desc}</p></div>
       <div class="ud-actions">${r.builtin ? badge(r.id === 'super' ? '不可修改' : '不可删除', 'muted') : btn('重命名', 'modal', { m: 'newRole' }, 'btn sm', 'pencil') + btn('删除角色', 'confirm', { k: 'deleteRole' }, 'btn sm danger-ghost', 'trash-2')}</div></header>
-      <div class="members"><span class="hint">成员</span>${members.map(u => `<button type="button" class="fchip" data-act="gotoUser" data-id="${u.id}">${userAv(u, 'xs')}${esc(u.display)}</button>`).join('') || '<span class="hint">暂无成员</span>'}</div>
+      <div class="members"><span class="hint">成员</span>${members.map(u => `<button type="button" class="fchip" data-act="gotoUser" data-id="${u.id}">${userAv(u, 'xs')}${userName(u)}</button>`).join('') || '<span class="hint">暂无成员</span>'}</div>
       <div class="tab-body" data-scroll id="roleBody">${PERMISSION_GROUPS.map(g => `<section class="perm-group"><h4>${g.name}</h4>${g.items.map(([k, n, d]) => `<label class="perm-row check"><input type="checkbox" data-act="rolePerm" data-r="${r.id}" data-p="${k}" ${r.perms.includes(k) ? 'checked' : ''} ${r.id === 'super' ? 'disabled' : ''}><div class="perm-copy"><strong>${n}</strong><code>${k}</code><p>${d}</p></div></label>`).join('')}</section>`).join('')}
       ${!r.builtin && members.length ? `<p class="hint">删除前需先把 ${members.length} 名成员改为其他角色。</p>` : ''}</div>${saveBar()}</section></div>`;
 }
@@ -405,7 +448,7 @@ function auditContent() {
     <div class="chips">${cats.map(([v, l]) => `<button type="button" class="chip${S.auditCat === v ? ' is-on' : ''}" data-act="auditCat" data-v="${v}">${l}</button>`).join('')}</div>
     <section class="card"><div class="audit">${list.map(x => { const i = audit.indexOf(x); const open = S.auditOpen === i; return `<div class="arow${open ? ' is-open' : ''}">
       <button type="button" class="arow-main" data-act="auditOpen" data-i="${i}" aria-expanded="${open}"><span class="cat cat-${x.cat}">${ic({ grant: 'shield-check', role: 'key-round', user: 'users', steam: 'gamepad-2', session: 'log-out' }[x.cat])}</span>
-        <span class="arow-body"><strong>${x.action}</strong><small>${esc(x.actor)} → ${esc(x.target)}</small></span><span class="arow-meta"><time>${x.time}</time><small class="mono">${x.ip}</small></span>${ic('chevron-down', 'chev')}</button>
+        <span class="arow-body"><strong>${x.action}</strong><small>${nm(x.actor, 'user')} → ${roles.some(r => r.name === x.target) ? esc(x.target) : nm(x.target, 'user')}</small></span><span class="arow-meta"><time>${x.time}</time><small class="mono">${x.ip}</small></span>${ic('chevron-down', 'chev')}</button>
       ${open ? `<table class="diff"><thead><tr><th>字段</th><th>之前</th><th>之后</th></tr></thead><tbody>${x.diff.map(([k, a, b]) => `<tr><td>${k}</td><td class="before">${esc(a) || '—'}</td><td class="after">${esc(b) || '—'}</td></tr>`).join('')}</tbody></table>` : ''}</div>`; }).join('') || '<div class="empty-small">没有匹配的记录</div>'}</div></section>`;
 }
 
@@ -430,10 +473,11 @@ function settingsContent() {
       <div class="set-row"><div><strong>桌面通知</strong><small>页面在后台或你在看其他会话时提醒</small></div>${toggle(S.settings.notify, 'set', { k: 'notify' })}</div>
       <div class="set-row"><div><strong>提示音</strong><small>新消息时播放</small></div><div class="inline"><select aria-label="提示音"><option>Steam 消息（默认）</option><option>Steam 聊天室</option><option>Steam 提及</option><option>关闭</option></select>${ib('volume-2', '试听', 'toastClose', 'data-v="♪ 试听提示音"')}</div></div>
       <div class="set-row"><div><strong>仅在页面不在前台时提醒</strong><small>正在查看的会话不重复提醒</small></div>${toggle(S.settings.bgOnly, 'set', { k: 'bgOnly' })}</div></section>
+    ${privacyCard()}
     <section class="card"><header class="card-head"><div><h3>${ic('shield-check')} 我的权限</h3><p>当前登录账号的有效权限与 Steam 授权，由管理员配置。悬停可查看来源。</p></div></header>
       <div class="set-row"><div><strong>角色</strong></div>${badge(roleOf(u).name, 'accent')}</div>
       <div class="perm-tags">${effectivePerms.map(p => `<span class="ptag" title="${effective(u, p).src}">${PERMISSION_GROUPS.flatMap(g => g.items).find(i => i[0] === p)[1]}${effective(u, p).src === '个人授予' ? ic('plus', 'tiny') : ''}</span>`).join('')}</div>
-      ${grants.map(([a, g]) => `<div class="set-row"><div><strong>${a.label}</strong><small>${g.all ? '访问全部账户' : g.scope === 'some' ? `指定好友 ${g.friends.length} 人` : '全部会话'}${g.expires ? ` · 至 ${g.expires}` : ''}</small></div>${levelBadge(g)}</div>`).join('') || '<div class="set-row"><small>暂无 Steam 授权</small></div>'}</section>
+      ${grants.map(([a, g]) => `<div class="set-row"><div><strong>${acctName(a)}</strong><small>${g.all ? '访问全部账户' : g.scope === 'some' ? `指定好友 ${g.friends.length} 人` : '全部会话'}${g.expires ? ` · 至 ${g.expires}` : ''}</small></div>${levelBadge(g)}</div>`).join('') || '<div class="set-row"><small>暂无 Steam 授权</small></div>'}</section>
     <section class="card"><header class="card-head"><div><h3>${ic('lock')} 账号安全</h3><p>修改后台登录密码；其他设备上的会话会保留。</p></div></header>
       ${can('self.password.change') ? `<form class="form-grid" data-act="noop"><label>当前密码<input type="password" autocomplete="current-password"></label><label>新密码<input type="password" autocomplete="new-password" placeholder="至少 8 位"></label><div>${btn('修改密码', 'toastClose', { v: '密码已修改' }, 'btn primary')}</div></form>` : '<p class="hint">你没有修改密码的权限。</p>'}
       <div class="set-row"><div><strong>退出其他设备</strong><small>保留当前浏览器，其他会话立即失效</small></div>${btn('退出其他设备', 'toastClose', { v: '已退出其他设备' }, 'btn sm')}</div></section>
@@ -441,6 +485,21 @@ function settingsContent() {
     <section class="card"><header class="card-head"><div><h3>${ic('hard-drive')} 消息存储</h3><p>历史记录写入状态；异常时聊天顶部也会提示。</p></div></header>
       <div class="set-row"><div><strong>消息归档</strong></div><span class="status is-online"><i></i>正常</span></div><div class="set-row"><div><strong>历史索引</strong></div>${S.storageOk ? '<span class="status is-online"><i></i>正常</span>' : '<span class="status is-warn"><i></i>正在同步 · 32 条待处理</span>'}</div></section>
     </div>`;
+}
+function privacyCard() {
+  const p = S.privacy;
+  const scopes = [
+    ['friend', '好友与群组的昵称、头像、SteamID、备注', true],
+    ['self', '我的昵称与头像（Steam 资料和后台账号）'],
+    ['account', 'Steam 账户名称、SteamID 与账号提示'],
+    ['user', '控制台中其他后台用户的昵称与账号'],
+    ['images', '聊天里的图片']
+  ];
+  return `<section class="card" id="privacyCard"><header class="card-head"><div><h3>${ic('eye-off')} 隐私模式</h3><p>截图或共享屏幕前开启，把昵称和头像打码。只影响当前浏览器的显示，不改动任何数据。</p></div>${toggle(p.on, 'privacy')}</header>
+    <div class="set-row"><div><strong>打码方式</strong><small>${p.style === 'alias' ? '用「好友 K7」这样的化名代替，同一个人在本浏览器里化名固定，截图里仍能分清是谁在说话' : '用马赛克块代替文字，头像只保留颜色'}</small></div>${seg([['mosaic', '马赛克'], ['alias', '化名']], p.style, 'pvStyle')}</div>
+    <div class="set-row pv-scopes"><div><strong>打码范围</strong></div><div class="pv-checks">${scopes.map(([k, l, locked]) => `<label class="check"><input type="checkbox" data-act="pvScope" data-k="${k}" ${locked || p[k] ? 'checked' : ''} ${locked ? 'disabled' : ''}>${l}</label>`).join('')}</div></div>
+    <div class="set-row"><div><strong>快捷键</strong><small>在任何页面切换隐私模式</small></div><span><kbd>Alt</kbd> <kbd>Shift</kbd> <kbd>P</kbd></span></div>
+    <p class="hint pv-limit">${ic('info')}不会识别消息正文里提到的名字、图片里的文字和链接预览；需要时请另行检查。</p></section>`;
 }
 const PAGE_CONTENT = { accounts: accountsContent, users: usersContent, roles: rolesContent, audit: auditContent, emotes: emotesContent, settings: settingsContent };
 function headActions(page) {
@@ -454,7 +513,8 @@ function steamChip() {
 function meMenu() {
   const u = me();
   const admin = allowedAdmin();
-  return `<div class="menu me-menu"><div class="menu-head">${userAv(u)}<div><strong>${esc(u.display)}</strong><small>@${u.username} · ${roleOf(u).name}</small></div></div>
+  return `<div class="menu me-menu"><div class="menu-head">${userAv(u)}<div><strong>${userName(u)}</strong><small>${[userHandle(u), roleOf(u).name].filter(Boolean).join(' · ')}</small></div></div>
+    <hr><button type="button" role="menuitemcheckbox" aria-checked="${S.privacy.on}" data-act="privacy">${ic(S.privacy.on ? 'eye-off' : 'eye')}<span>隐私模式</span><kbd>Alt Shift P</kbd></button>
     ${admin.length ? `<hr>${admin.map(p => btn(PAGES[p].label, 'page', { p }, '', PAGES[p].icon)).join('')}` : ''}<hr>
     ${btn('设置', 'page', { p: 'settings' }, '', 'settings')}${btn('退出后台', 'logout', {}, 'danger', 'log-out')}</div>`;
 }
@@ -465,25 +525,25 @@ function shell() {
   const consoleOpen = S.page !== 'chat';
   const g = myGrant();
   const list = `<aside class="clist" aria-label="会话列表">
-    <div class="ctop"><button type="button" class="me-btn" data-act="menu" data-m="me" aria-label="我的账号与控制台">${userAv(me(), 'sm')}</button>
+    <div class="ctop"><button type="button" class="me-btn${S.privacy.on ? ' is-private' : ''}" data-act="menu" data-m="me" aria-label="我的账号与控制台${S.privacy.on ? '（隐私模式已开启）' : ''}">${userAv(me(), 'sm')}${S.privacy.on ? `<span class="pv-badge">${ic('eye-off')}</span>` : ''}</button>
       <button type="button" class="jump" data-act="palette">${ic('search')}<span>搜索</span><kbd>Ctrl K</kbd></button>
       ${canOpenAny() ? ib('square-pen', '新建会话', 'modal', 'data-m="newChat"') : ''}
       ${S.menu === 'me' ? meMenu() : ''}</div>
     ${PAGES.chat.allow() ? `${convTabs([['recent', '全部'], ['unread', '未读'], ['friends', '好友'], ...(g.scope === 'some' ? [] : [['groups', '群组']])])}${scopeNotice()}
       <div class="conv-list" id="convList" data-scroll>${chatBlocked() ? '<div class="empty-small">没有 Steam 授权</div>' : convListBody()}</div>` : '<div class="grow"></div>'}
-    <button type="button" class="cstatus" data-act="${PAGES.accounts.allow() ? 'page' : 'noop'}" data-p="accounts">${steamChip()}<span>主号 · Dove</span>${allowedAdmin().length ? `<span class="console-link">控制台 ${ic('chevron-right')}</span>` : ''}</button>
+    <button type="button" class="cstatus" data-act="${PAGES.accounts.allow() ? 'page' : 'noop'}" data-p="accounts">${steamChip()}<span>${activeName()}</span>${allowedAdmin().length ? `<span class="console-link">控制台 ${ic('chevron-right')}</span>` : ''}</button>
   </aside>`;
   let thread;
   if (!PAGES.chat.allow()) thread = `<main class="cthread">${emptyState('lock', '没有聊天权限', '你的账号没有「使用聊天」权限。可从左上角头像打开控制台。')}</main>`;
   else if (chatBlocked()) thread = `<main class="cthread">${emptyState('lock', '没有可用的 Steam 授权', '你的账号尚未被授权访问当前活动 Steam 账户。请联系管理员在「用户 → Steam 授权」中开通。')}</main>`;
   else if (!conv) thread = `<main class="cthread">${emptyState('messages-square', '选择一个会话', '从左侧列表打开好友会话，或按 Ctrl K 搜索。')}</main>`;
   else thread = `<main class="cthread"><header class="thread-head">${ib('arrow-left', '返回会话列表', 'back', '', 'icon-btn mobile-only')}
-      <button type="button" class="thread-name" data-act="details" aria-expanded="${S.details}"><strong>${esc(conv.name)}</strong><span class="presence-text p-${conv.presence || 'group'}">${esc(statusText(conv))}</span></button>
+      <button type="button" class="thread-name" data-act="details" aria-expanded="${S.details}"><strong>${convName(conv)}</strong><span class="presence-text p-${conv.presence || 'group'}">${esc(statusText(conv))}</span></button>
       <div class="thread-actions"><button type="button" class="date-chip" data-act="datePop" aria-expanded="${S.datePop}">${ic('calendar')}<span>${S.detached ? '10 月 26 日' : '今天'}</span>${ic('chevron-down')}</button>${datePopover()}</div>
       ${S.details ? `<div class="popover profile-pop">${profilePanel(conv)}</div>` : ''}</header>
     ${S.storageOk ? '' : `<div class="banner-warn">${ic('triangle-alert')}<span>历史索引正在同步（32 条待处理），新消息仍会实时显示。</span><button type="button" data-act="page" data-p="settings">详情</button></div>`}
     ${messages(conv)}${composer(conv)}
-    ${S.dragging && levelAtLeast(g, 'full') ? `<div class="drop-overlay">${ic('image-plus', 'big')}<strong>释放发送图片</strong><span>发送给 ${esc(conv.name)}</span></div>` : ''}</main>`;
+    ${S.dragging && levelAtLeast(g, 'full') ? `<div class="drop-overlay">${ic('image-plus', 'big')}<strong>释放发送图片</strong><span>发送给 ${convName(conv)}</span></div>` : ''}</main>`;
   const pages = [...allowedAdmin(), 'settings'];
   const consoleSheet = consoleOpen ? `<div class="sheet-scrim" data-act="closeSheet"></div><section class="sheet" role="dialog" aria-label="控制台">
       <aside class="sheet-nav"><div class="sheet-title"><strong>控制台</strong>${ib('x', '关闭（Esc）', 'closeSheet')}</div>
@@ -529,7 +589,7 @@ function modal() {
     const tabs = seg([['qr', '扫码登录'], ['pwd', '账号密码']], m.tab, 'steamTab');
     if (m.tab === 'qr') {
       const step = m.step;
-      body = `${tabs}<div class="qr-box">${step === 'done' ? `<div class="qr-done">${ic('circle-check', 'big')}<strong>已登录：主号 · Dove</strong></div>` : step === 'scanned' ? `<div class="qr-done">${ic('smartphone', 'big')}<strong>已扫码</strong><span>请在手机 Steam App 中确认登录</span></div>` : step === 'expired' ? `<div class="qr-done">${ic('timer-off', 'big')}<strong>二维码已过期</strong><span>请重新生成</span></div>` : step === 'waiting' ? fakeQr() : `<div class="qr-done">${ic('qr-code', 'big')}<span>生成二维码后，用手机 Steam App 扫描</span></div>`}</div>
+      body = `${tabs}<div class="qr-box">${step === 'done' ? `<div class="qr-done">${ic('circle-check', 'big')}<strong>已登录：${activeName()}</strong></div>` : step === 'scanned' ? `<div class="qr-done">${ic('smartphone', 'big')}<strong>已扫码</strong><span>请在手机 Steam App 中确认登录</span></div>` : step === 'expired' ? `<div class="qr-done">${ic('timer-off', 'big')}<strong>二维码已过期</strong><span>请重新生成</span></div>` : step === 'waiting' ? fakeQr() : `<div class="qr-done">${ic('qr-code', 'big')}<span>生成二维码后，用手机 Steam App 扫描</span></div>`}</div>
         <ol class="steps"><li class="${!['idle', 'expired'].includes(step) ? 'is-done' : ''}">生成二维码</li><li class="${['scanned', 'done'].includes(step) ? 'is-done' : ''}">打开 Steam App → Steam 令牌 → 扫描</li><li class="${step === 'done' ? 'is-done' : ''}">在手机上确认</li></ol>`;
       foot = close + ({ idle: btn('生成二维码', 'qrStep', { v: 'waiting' }, 'btn primary'), expired: btn('重新生成', 'qrStep', { v: 'waiting' }, 'btn primary'),
         waiting: btn('模拟：过期', 'qrStep', { v: 'expired' }, 'btn ghost') + btn('模拟：已扫码', 'qrStep', { v: 'scanned' }, 'btn'), scanned: btn('模拟：手机确认', 'qrStep', { v: 'done' }, 'btn primary'), done: btn('完成', 'closeModal', {}, 'btn primary') })[step];
@@ -550,18 +610,21 @@ function modal() {
       <label class="check span"><input type="checkbox" checked> 首次登录后要求修改密码</label></div><p class="hint">创建后可在「Steam 授权」中为该用户开通账户访问。</p>`;
     foot = close + btn('创建', 'toastClose', { v: '原型：用户已创建' }, 'btn primary');
   }
-  if (m.type === 'editUser') { title = `编辑 ${u.display}`; body = `<div class="form-grid"><label>昵称<input value="${esc(u.display)}"></label><label>备注<textarea rows="3">${esc(u.note)}</textarea></label></div>`; foot = close + btn('保存', 'toastClose', { v: '资料已保存' }, 'btn primary'); }
+  const uPlain = esc(plain(u.display, userKind(u), `u${u.id}`));
+  // Edit forms keep the real value in the input; the note tells the user before they screenshot it.
+  const pvFormNote = S.privacy.on ? `<p class="notice">${ic('eye')}编辑表单中显示真实内容。</p>` : '';
+  if (m.type === 'editUser') { title = `编辑 ${uPlain}`; body = `${pvFormNote}<div class="form-grid"><label>昵称<input value="${esc(u.display)}"></label><label>备注<textarea rows="3">${esc(u.note)}</textarea></label></div>`; foot = close + btn('保存', 'toastClose', { v: '资料已保存' }, 'btn primary'); }
   if (m.type === 'editAccount') { title = '编辑 Steam 账户'; body = `<div class="form-grid"><label>显示名称<input value="交易号"></label><label>账号提示<input value="dove_trade"></label></div>`; foot = close + btn('保存', 'toastClose', { v: '已保存' }, 'btn primary'); }
-  if (m.type === 'resetPwd') { title = `重置 ${u.display} 的密码`; body = `<div class="form-grid"><label>新密码<input type="password" placeholder="至少 8 位"></label><label class="check"><input type="checkbox" checked> 要求下次登录后修改密码</label><label class="check"><input type="checkbox" checked> 同时踢下线该用户的全部会话</label></div>`; foot = close + btn('重置密码', 'toastClose', { v: '密码已重置' }, 'btn primary'); }
+  if (m.type === 'resetPwd') { title = `重置 ${uPlain} 的密码`; body = `<div class="form-grid"><label>新密码<input type="password" placeholder="至少 8 位"></label><label class="check"><input type="checkbox" checked> 要求下次登录后修改密码</label><label class="check"><input type="checkbox" checked> 同时踢下线该用户的全部会话</label></div>`; foot = close + btn('重置密码', 'toastClose', { v: '密码已重置' }, 'btn primary'); }
   if (m.type === 'newRole') { title = '角色'; body = `<div class="form-grid"><label>名称<input placeholder="例如：值班客服"></label><label>说明<input></label><label>复制权限自<select>${roles.map(r => `<option>${r.name}</option>`).join('')}<option selected>不复制（空白）</option></select></label></div>`; foot = close + btn('保存', 'toastClose', { v: '原型：角色已保存' }, 'btn primary'); }
   if (m.type === 'pickFriends') {
     const g = u.grants[m.a];
     title = '选择可访问的好友';
-    body = `${searchBox('搜索好友', 'pickSearch', 'noop', '')}<div class="pick-list">${FRIENDS.map(f => `<label class="pick">${av(f, 'sm')}<span><strong>${esc(f.name)}</strong><small class="mono">${f.id}</small></span><input type="checkbox" data-act="pick" data-a="${m.a}" data-id="${f.id}" ${g.friends.includes(f.id) ? 'checked' : ''}></label>`).join('')}</div>`;
+    body = `${searchBox('搜索好友', 'pickSearch', 'noop', '')}<div class="pick-list">${FRIENDS.map(f => `<label class="pick">${av(f, 'sm')}<span><strong>${convName(f)}</strong><small class="mono">${nm(f.id, 'friend', f.id, true)}</small></span><input type="checkbox" data-act="pick" data-a="${m.a}" data-id="${f.id}" ${g.friends.includes(f.id) ? 'checked' : ''}></label>`).join('')}</div>`;
     foot = btn(`完成（${g.friends.length}）`, 'closeModal', {}, 'btn primary');
   }
   if (m.type === 'confirm') {
-    const text = { steamLogout: ['退出 Steam 并删除 token？', '活动账户将下线，所有用户的聊天立即不可用。'], deleteAccount: ['删除这个 Steam 账户？', '账户资料与所有用户授权关系会被删除，历史消息保留。'], deleteUser: [`删除 ${u.display}？`, '该用户的会话立即失效，审计记录保留。'], kickAll: ['踢下线全部会话？', '该用户需要重新登录。'], deleteRole: ['删除这个角色？', '角色下仍有成员时不能删除。'], deleteEmote: ['从素材库删除这张图片？', '已发送的消息不受影响。'] }[m.k];
+    const text = { steamLogout: ['退出 Steam 并删除 token？', '活动账户将下线，所有用户的聊天立即不可用。'], deleteAccount: ['删除这个 Steam 账户？', '账户资料与所有用户授权关系会被删除，历史消息保留。'], deleteUser: [`删除 ${uPlain}？`, '该用户的会话立即失效，审计记录保留。'], kickAll: ['踢下线全部会话？', '该用户需要重新登录。'], deleteRole: ['删除这个角色？', '角色下仍有成员时不能删除。'], deleteEmote: ['从素材库删除这张图片？', '已发送的消息不受影响。'] }[m.k];
     title = text[0]; body = `<p>${text[1]}</p>`; foot = close + btn('确认', 'toastClose', { v: '原型：已执行' }, 'btn danger');
   }
   return `<div class="modal-scrim" data-act="closeModal"></div><section class="modal" role="dialog" aria-modal="true" aria-label="${esc(title)}"><header><h2>${title}</h2>${ib('x', '关闭', 'closeModal')}</header><div class="modal-body">${body}</div><footer>${foot}</footer></section>`;
@@ -571,10 +634,12 @@ function palette() {
   const q = S.paletteQuery.trim().toLowerCase();
   const convs = PAGES.chat.allow() && !chatBlocked() ? all.filter(x => scopeOk(x.id) && !(x.group && myGrant().scope === 'some')).filter(x => !q || x.name.toLowerCase().includes(q)).slice(0, 6) : [];
   const pages = Object.keys(PAGES).filter(p => p !== 'chat' && PAGES[p].allow() && (!q || PAGES[p].label.includes(q)));
-  const cmds = [['跳转到日期…', 'calendar-search', 'cmdDate'], ['切换主题', 'sun', 'cmdTheme']].filter(([l]) => !q || l.includes(q));
+  const cmds = [['跳转到日期…', 'calendar-search', 'cmdDate', ''], ['切换主题', 'sun', 'cmdTheme', '深色 浅色'],
+    [S.privacy.on ? '关闭隐私模式' : '开启隐私模式', S.privacy.on ? 'eye' : 'eye-off', 'privacy', '打码 截图 马赛克 privacy']]
+    .filter(([l, , , kw]) => !q || `${l} ${kw}`.toLowerCase().includes(q));
   return `<div class="modal-scrim" data-act="closePalette"></div><section class="palette" role="dialog" aria-label="快速跳转">
     <label class="palette-input">${ic('search')}<input id="paletteInput" placeholder="搜索会话、页面或命令" value="${esc(S.paletteQuery)}" data-input="paletteQuery" autocomplete="off"><kbd>Esc</kbd></label>
-    <div class="palette-list">${convs.length ? `<small>会话</small>${convs.map(x => `<button type="button" data-act="palOpen" data-id="${x.id}">${av(x, 'xs')}<span>${esc(x.name)}</span><em>${esc(statusText(x))}</em></button>`).join('')}` : ''}
+    <div class="palette-list">${convs.length ? `<small>会话</small>${convs.map(x => `<button type="button" data-act="palOpen" data-id="${x.id}">${av(x, 'xs')}<span>${convName(x)}</span><em>${esc(statusText(x))}</em></button>`).join('')}` : ''}
       ${pages.length ? `<small>控制台</small>${pages.map(p => `<button type="button" data-act="page" data-p="${p}">${ic(PAGES[p].icon)}<span>${PAGES[p].label}</span></button>`).join('')}` : ''}
       ${cmds.length ? `<small>命令</small>${cmds.map(([l, i, a]) => `<button type="button" data-act="${a}">${ic(i)}<span>${l}</span></button>`).join('')}` : ''}</div></section>`;
 }
@@ -588,6 +653,7 @@ function controls() {
       <button type="button" class="${S.steamOnline ? '' : 'is-on'}" data-act="steamToggle">${ic(S.steamOnline ? 'wifi' : 'wifi-off')}Steam ${S.steamOnline ? '在线' : '离线'}</button>
       <button type="button" class="${S.storageOk ? '' : 'is-on'}" data-act="storageToggle">${ic('hard-drive')}存储${S.storageOk ? '正常' : '异常'}</button>
       <button type="button" class="${S.dragging ? 'is-on' : ''}" data-act="dragToggle">${ic('image-plus')}拖入图片</button>
+      <button type="button" class="${S.privacy.on ? 'is-on' : ''}" data-act="privacy">${ic('eye-off')}隐私模式</button>
       <button type="button" data-act="pcHide" title="收起" aria-label="收起原型工具">${ic('chevron-down')}</button></div>`;
 }
 
@@ -698,6 +764,9 @@ const ACT = {
   loginSubmit: () => { S.page = firstAllowed(); S.scrollBottom = true; S.loginError = false; },
   closeSheet: () => { S.page = 'chat'; },
   set: d => { S.settings[d.k] = !S.settings[d.k]; },
+  privacy: () => { S.privacy.on = !S.privacy.on; S.palette = false; toast(S.privacy.on ? '隐私模式已开启 · Alt+Shift+P 关闭' : '隐私模式已关闭'); },
+  pvStyle: d => { S.privacy.style = d.v; },
+  pvScope: (d, el) => { S.privacy[d.k] = el.checked; },
   // Users & authorization
   userSel: d => { S.userSel = Number(d.id); S.mobileDetail = true; transient(); },
   userBack: () => { S.mobileDetail = false; },
@@ -771,6 +840,8 @@ document.addEventListener('input', e => {
 });
 document.addEventListener('keydown', e => {
   if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') { e.preventDefault(); ACT.palette(); render(); return; }
+  // e.code, not e.key: on macOS Option+Shift+P types a character instead of reporting "P".
+  if (e.altKey && e.shiftKey && !e.ctrlKey && !e.metaKey && e.code === 'KeyP') { e.preventDefault(); ACT.privacy(); render(); return; }
   if (e.key === 'Escape') {
     if (S.palette) S.palette = false;
     else if (S.modal) S.modal = null;

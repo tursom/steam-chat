@@ -574,6 +574,35 @@ kbd { padding: 1px 6px; border: 1px solid var(--line-2); border-bottom-width: 2p
 .ptag { display: inline-flex; align-items: center; gap: 3px; padding: 3px 9px; border-radius: 999px; background: var(--sunken); color: var(--text-2); font-size: 12.5px; }
 .settings form { padding: 0 18px 18px; max-width: 420px; }
 
+/* ============ Privacy mode ============ */
+/* Masked values carry no real text; the mosaic only reserves roughly the space a name would take. */
+:root { --pv-pattern: url("data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 width=%2216%22 height=%2216%22%3E%3Crect x=%220%22 y=%220%22 width=%224%22 height=%224%22 fill-opacity=%220.9%22/%3E%3Crect x=%224%22 y=%220%22 width=%224%22 height=%224%22 fill-opacity=%220.5%22/%3E%3Crect x=%228%22 y=%220%22 width=%224%22 height=%224%22 fill-opacity=%220.75%22/%3E%3Crect x=%2212%22 y=%220%22 width=%224%22 height=%224%22 fill-opacity=%220.35%22/%3E%3Crect x=%220%22 y=%224%22 width=%224%22 height=%224%22 fill-opacity=%220.6%22/%3E%3Crect x=%224%22 y=%224%22 width=%224%22 height=%224%22 fill-opacity=%221%22/%3E%3Crect x=%228%22 y=%224%22 width=%224%22 height=%224%22 fill-opacity=%220.4%22/%3E%3Crect x=%2212%22 y=%224%22 width=%224%22 height=%224%22 fill-opacity=%220.8%22/%3E%3Crect x=%220%22 y=%228%22 width=%224%22 height=%224%22 fill-opacity=%220.3%22/%3E%3Crect x=%224%22 y=%228%22 width=%224%22 height=%224%22 fill-opacity=%220.7%22/%3E%3Crect x=%228%22 y=%228%22 width=%224%22 height=%224%22 fill-opacity=%220.95%22/%3E%3Crect x=%2212%22 y=%228%22 width=%224%22 height=%224%22 fill-opacity=%220.55%22/%3E%3Crect x=%220%22 y=%2212%22 width=%224%22 height=%224%22 fill-opacity=%220.85%22/%3E%3Crect x=%224%22 y=%2212%22 width=%224%22 height=%224%22 fill-opacity=%220.45%22/%3E%3Crect x=%228%22 y=%2212%22 width=%224%22 height=%224%22 fill-opacity=%220.6%22/%3E%3Crect x=%2212%22 y=%2212%22 width=%224%22 height=%224%22 fill-opacity=%221%22/%3E%3C/svg%3E"); }
+.pv-mask {
+  display: inline-block; width: calc(var(--n, 4) * 1em); max-width: 100%; height: .9em; vertical-align: -.1em; border-radius: 2px;
+  background: currentColor; opacity: .42;
+  -webkit-mask: var(--pv-pattern) 0 0 / auto 100% repeat-x; mask: var(--pv-pattern) 0 0 / auto 100% repeat-x;
+}
+.pv-alias { font-style: normal; }
+.av.is-masked { overflow: hidden; }
+.av.is-masked::before {
+  content: ""; position: absolute; inset: 0; border-radius: inherit; background: hsl(var(--h, 210) 30% 45%); opacity: .55;
+  -webkit-mask: var(--pv-pattern) 0 0 / 100% 100%; mask: var(--pv-pattern) 0 0 / 100% 100%;
+}
+.av.is-masked .dot { z-index: 1; }
+.me-btn { position: relative; }
+.pv-badge { position: absolute; right: -3px; bottom: -3px; display: grid; place-items: center; width: 16px; height: 16px; border-radius: 50%; background: var(--text); color: var(--bg); box-shadow: 0 0 0 2px var(--side); }
+.pv-badge svg { width: 10px; height: 10px; }
+.msg-image.is-masked { position: relative; background: var(--sunken); }
+.msg-image.is-masked img { filter: blur(22px) saturate(.5); transform: scale(1.15); opacity: .6; }
+.msg-image.is-masked span { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; gap: 6px; color: var(--text-2); font-size: 13px; font-weight: 550; }
+.msg-image.is-masked span svg { width: 16px; height: 16px; }
+.me-menu kbd { margin-left: auto; }
+.pv-scopes { align-items: flex-start; }
+.pv-checks { display: grid; gap: 8px; }
+.pv-checks .check { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.pv-limit { display: flex; gap: 6px; align-items: flex-start; padding: 0 18px 16px; }
+.pv-limit svg { width: 14px; height: 14px; margin-top: 2px; flex: none; }
+
 /* ============ Login ============ */
 .login { display: grid; place-items: center; height: 100%; padding: 32px 20px 140px; overflow: auto; }
 .login-card { display: grid; gap: 14px; width: min(360px, 100%); }
