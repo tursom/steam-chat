@@ -157,6 +157,10 @@ STEAM_CHAT_DEPLOY_WEBHOOK_URL=http://host.docker.internal:3001/deploy
 
 宿主机 `data/` 对应容器 `/app/data`，包含后台用户库、Steam 登录凭据、RocksDB 历史库、JSONL 副本和媒体缓存。整个目录都应作为敏感数据保护。
 
+聊天原始日志自动按写入日轮转：活动文件为 `data/logs/chat.jsonl`，跨天后的首次写入前封存为 `chat-YYYYMMDD.jsonl`，启动时也会检查旧活动文件。日期表示归档内容的写入日，补拉的历史消息仍写入当天文件；空闲日不会产生空归档。重名时生成带随机后缀的独立归档，不覆盖已有数据。归档保持未压缩且不会自动删除。
+
+Compose 默认使用 UTC；需要北京时间时在 `.env` 设置 `STEAM_CHAT_TZ=Asia/Shanghai` 后重建容器。直接运行 Node 时使用 `TZ=Asia/Shanghai`。不要同时对活动文件执行外部 `logrotate`。外部导入器应挂载整个 `data/logs/` 目录并扫描活动文件与所有归档，使用适配轮转后的 `steam-chat-import/import.py`；只挂载单个文件无法跟随新活动文件。升级顺序为先更新导入器，在原日志路径上运行一次以建立文件身份基线，再部署本版服务启用轮转。细节见 [历史存储维护说明](history-storage-operations.md#daily-jsonl-rotation)。
+
 停止所有写入进程后备份整个目录，不要把运行中直接复制的 RocksDB 当作一致性备份：
 
 ```bash

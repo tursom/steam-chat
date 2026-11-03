@@ -27,6 +27,48 @@ the deployed configuration before running any command. The storage wrapper uses
 `@harperfast/rocksdb-js`; maintenance does not open another binding or bypass its
 conflict and locking rules.
 
+## Daily JSONL Rotation
+
+The realtime JSONL writer owns rotation; no cron or external `logrotate` is needed.
+`chat.jsonl` remains the active path (or the configured `STEAM_CHAT_LOG_PATH`). On
+startup and before each append, the writer checks the local calendar day. At the
+first append after midnight it seals the previous writing day's nonempty file as
+`chat-YYYYMMDD.jsonl` and opens a new active file. Idle days create no empty archives.
+The date is the writing day, not the event's `sentAt`, so Steam backfill goes into
+the current active file. A small `chat.jsonl.rotation.json` state file binds the
+writing day to the active inode; it is synced before tail repair can alter mtime.
+On first upgrade, an existing active file's mtime supplies its initial writing day.
+Docker defaults to UTC; set `STEAM_CHAT_TZ=Asia/Shanghai`
+in the Compose `.env` (or `TZ` when running Node directly) for Beijing midnight.
+
+An existing archive is never overwritten: additional segments receive a random
+suffix, such as `chat-20260102-0123456789abcdef.jsonl`. The directory's dated files
+are the sealed segment inventory; the day state does not duplicate that inventory.
+The writer fsyncs and closes the active file, publishes an exclusive hard link,
+fsyncs the directory, then unlinks the active name and opens its replacement. A
+restart recognizes the same inode under both names and completes an interrupted
+rotation before appending. This requires a local filesystem supporting hard links
+and directory fsync, consistent with offline publication requirements below.
+Only one writer may own an active path. Do not rename, truncate or externally
+rotate the live file. Archives are uncompressed and are not automatically deleted;
+retain them for import, repair and backups. Image alias metadata beside the active
+path stays in place across daily rotation.
+
+Mount the entire logs directory into the external importer, including active and
+dated files, rather than mounting a single file. Use the updated sibling project's
+`steam-chat-import/import.py`: it tracks file identity as well as byte offsets so
+renaming the active inode preserves progress and a newly created active file
+starts at zero. It waits for complete newline-terminated records. Keep its
+`positions.yml` persistent and run one importer at a time. Older path-only state
+can only establish a baseline for files currently at those paths; it cannot
+reconstruct renames that happened before upgrading. Upgrade and run the importer
+once against the original paths before deploying the rotating writer. New records use `eventId` for
+Mongo retry deduplication; old records keep their legacy behavior.
+
+Before offline reconciliation, supply a complete source covering the active file
+and all relevant sealed segments as described below. A single day's archive is
+not the complete JSONL replica of the database.
+
 ## Import
 
 Keep a source manifest with the immutable file, account, timezone and stable

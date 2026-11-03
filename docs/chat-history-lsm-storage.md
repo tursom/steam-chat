@@ -118,7 +118,7 @@ writer 直接从消息分发获得完整记录，不查询 RocksDB。保持每�
 
 记录追加采用至少一次语义。确认丢失或恢复重试可能产生重复行，但必须复用 eventId，不伪造新消息。writer 启动时校验活动文件末尾；不完整尾部先隔离保存，再修复到完整行边界后追加，避免新旧内容拼接成坏行。不修改只读历史导入源。
 
-JSONL writer 独立记录轮转文件清单及封存状态，不依赖 RocksDB 元信息启动或追加。现有 import 继续读取 JSONL；新增字段不改变旧字段含义。外部 SQL 自身的去重不等于所有下游幂等，Mongo 等消费者若要求按 eventId 去重需另行适配。本方案不承诺物理 JSONL 行或外部数据库 exactly-once。
+JSONL writer 独立管理轮转，不依赖 RocksDB 元信息启动或追加。当前实现以日志目录中的日期归档文件作为封存清单，活动文件固定为 `chat.jsonl`，启动及追加前按本地写入日检查跨天；首次接入的既有活动文件由 mtime 确定写入日，随后由 `chat.jsonl.rotation.json` 将写入日与活动 inode 绑定并在尾部修复前持久化。先同步关闭，通过独占 hard link 发布归档，再同步目录并移除活动路径；启动时通过 inode 识别并完成中断的轮转。重名归档使用独立后缀，不覆盖历史文件，不自动压缩或删除。部署时区与外部导入器接入见 [操作说明](history-storage-operations.md#daily-jsonl-rotation)。现有 import 继续读取 JSONL；新增字段不改变旧字段含义。本方案不承诺物理 JSONL 行或外部数据库 exactly-once。
 
 ## 5. 二进制 Key 协议 v1
 

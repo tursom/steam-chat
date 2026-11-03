@@ -1,11 +1,11 @@
-import { AppendOnlyJsonlWriter } from './history-jsonl';
+import { DailyJsonlWriter } from './daily-jsonl';
 import { SteamImageAliases } from './history-steam-alias';
 import { serializeStoredMessage, type StoredMessage } from './history-message';
 import { HistoryIdempotency, jsonlRecords } from './history-idempotency';
 
 // This module is loaded only by the forked writer, never by the HTTP process.
 let database: any;
-let log: AppendOnlyJsonlWriter | undefined;
+let log: DailyJsonlWriter | undefined;
 let aliases: SteamImageAliases;
 let idempotency: HistoryIdempotency;
 let serial = Promise.resolve();
@@ -13,7 +13,7 @@ let serial = Promise.resolve();
 async function run(method: string, value: any): Promise<any> {
   if (method === 'init') {
     aliases = new SteamImageAliases(`${value.path}.steam-image-aliases-v1`);
-    if (value.kind === 'jsonl') { log = new AppendOnlyJsonlWriter(value.path); await log.ready(); }
+    if (value.kind === 'jsonl') { log = new DailyJsonlWriter(value.path); await log.ready(); }
     else {
       const { RocksHistoryStore } = require('./rocks-history');
       database = new RocksHistoryStore(value.path);

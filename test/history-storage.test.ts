@@ -141,3 +141,19 @@ test('writer repairs a partial JSONL tail without touching complete records', as
   assert.equal(JSON.parse(lines[1]).message, 'hello');
   assert.equal((await fs.readdir(dir)).filter((name) => name.endsWith('.partial')).length, 1);
 });
+
+test('JSONL worker seals a stale active file and preserves independent database ingestion', async (t) => {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'history-rollover-'));
+  const logPath = path.join(dir, 'chat.jsonl');
+  const old = normalizeStoredMessage(message('previous day'));
+  await fs.writeFile(logPath, `${canonicalMessage(old)}\n`);
+  const previousDay = new Date(2020, 0, 2, 12);
+  await fs.utimes(logPath, previousDay, previousDay);
+  const storage = createHistoryStorage({ logPath, dbPath: path.join(dir, 'db') });
+  t.after(async () => { await storage.close(); await fs.rm(dir, { recursive: true, force: true }); });
+  const current = await storage.append(message('current write, historical timestamp'));
+  await until(() => storage.status().jsonl.durable === 1 && storage.status().rocksdb.durable === 1);
+  assert.equal(JSON.parse((await fs.readFile(path.join(dir, 'chat-20200102.jsonl'), 'utf8')).trim()).eventId, old.eventId);
+  assert.equal(JSON.parse((await fs.readFile(logPath, 'utf8')).trim()).eventId, current.eventId);
+  assert.equal((await storage.history({ steamAccountId: account, id: peer })).items[0].eventId, current.eventId);
+});
