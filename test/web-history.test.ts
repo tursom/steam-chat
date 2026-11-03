@@ -203,6 +203,127 @@ test('optimistic text appears before the response and reconciles response, WebSo
   assert.equal(messages.children.length, 1);
 });
 
+test('a confirmed realtime echo replaces its text placeholder before a delayed HTTP reply', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'hello';
+  const sending = api.sendText();
+  const confirmed = { ...item('echo-before-response'), message: 'hello', echo: true, sentAt: new Date().toISOString() };
+  api.receiveHistoryMessage(confirmed);
+  assert.equal(messages.children.length, 1, 'the confirmed echo and the pending placeholder represent one send');
+  assert.equal(messages.children[0].dataset.eventId, confirmed.eventId);
+  assert.equal(api.outgoing().length, 1, 'echo association must not invent an HTTP acknowledgement');
+  assert.equal(api.outgoing()[0].state, 'sending');
+  pending[0].resolve({ ok: true, item: confirmed });
+  await sending;
+  assert.equal(messages.children.length, 1);
+});
+
+test('one realtime event consumes at most one of two identical pending sends', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'same'; const first = api.sendText();
+  nodes['#messageInput'].value = 'same'; const second = api.sendText();
+  const confirmed = { ...item('first-identical'), message: 'same', echo: true, sentAt: new Date().toISOString() };
+  api.receiveHistoryMessage(confirmed); api.receiveHistoryMessage(confirmed);
+  assert.equal(messages.children.length, 2);
+  assert.equal(api.outgoing().length, 2);
+  const next = { ...confirmed, eventId: 'second-identical' };
+  api.receiveHistoryMessage(next);
+  assert.equal(messages.children.length, 2); assert.equal(api.outgoing().length, 2);
+  pending[1].resolve({ ok: true, item: next }); await second;
+  pending[0].resolve({ ok: true, item: confirmed }); await first;
+  assert.equal(messages.children.length, 2); assert.equal(api.items().length, 2);
+});
+
+test('an HTTP confirmation does not consume another identical send awaiting its own echo', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'same'; const first = api.sendText();
+  nodes['#messageInput'].value = 'same'; const second = api.sendText();
+  const confirmed = { ...item('http-first'), message: 'same', echo: true, sentAt: new Date().toISOString() };
+  pending[0].resolve({ ok: true, item: confirmed }); await first;
+  assert.equal(api.outgoing().length, 1); assert.equal(messages.children.length, 2);
+  api.receiveHistoryMessage(confirmed);
+  assert.equal(api.outgoing().length, 1);
+  const next = { ...confirmed, eventId: 'http-second' };
+  api.receiveHistoryMessage(next);
+  assert.equal(api.outgoing().length, 1);
+  pending[1].resolve({ ok: true, item: next }); await second;
+  assert.equal(api.items().length, 2);
+});
+
+test('a lost HTTP reply keeps uncertainty on one echo row without creating a second message', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'delivered'; const sending = api.sendText();
+  api.receiveHistoryMessage({ ...item('delivered'), echo: true, sentAt: new Date().toISOString() });
+  pending[0].reject(new Error('proxy connection reset'));
+  assert.equal(await sending, false);
+  assert.equal(messages.children.length, 1); assert.equal(api.outgoing().length, 1);
+  assert.equal(api.outgoing()[0].state, 'unknown');
+  assert.equal(pending.length, 1, 'no implicit retry follows a lost HTTP reply');
+});
+
+test('incoming, other-peer, other-account and old echoes cannot confirm a new text send', async () => {
+  const { api, pending, nodes } = harness(); api.state.steam.steamId = 'account';
+  nodes['#messageInput'].value = 'same'; const sending = api.sendText();
+  const confirmed = { ...item('candidate'), message: 'same', echo: true, steamAccountId: 'account', sentAt: new Date().toISOString() };
+  for (const candidate of [{ ...confirmed, eventId: 'incoming', echo: false }, { ...confirmed, eventId: 'other-peer', id: 'other' },
+    { ...confirmed, eventId: 'other-account', steamAccountId: 'other-account' }, { ...confirmed, eventId: 'old', sentAt: new Date(Date.now() - 60000).toISOString() }]) {
+    api.receiveHistoryMessage(candidate); assert.equal(api.outgoing().length, 1);
+  }
+  api.receiveHistoryMessage(confirmed); assert.equal(api.outgoing().length, 1);
+  pending[0].resolve({ ok: true, item: confirmed }); await sending;
+});
+
+test('a realtime canonical emoticon echo confirms the same locally typed Steam emoticon', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = ':smile:'; const sending = api.sendText();
+  const confirmed = { ...item('emoticon'), message: '[emoticon]smile[/emoticon]', echo: true, sentAt: new Date().toISOString() };
+  api.receiveHistoryMessage(confirmed);
+  assert.equal(messages.children.length, 1); assert.equal(api.outgoing().length, 1);
+  pending[0].resolve({ ok: true, item: confirmed }); await sending;
+});
+
+test('latest history reconciles a confirmed text when its WebSocket echo was missed', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'history confirmation'; const sending = api.sendText();
+  const confirmed = { ...item('history-confirmed'), message: 'history confirmation', echo: true, sentAt: new Date().toISOString() };
+  const loading = api.loadHistory(); pending[1].resolve({ items: [confirmed] }); await loading;
+  assert.equal(messages.children.length, 1); assert.equal(api.outgoing().length, 1);
+  pending[0].reject(new Error('HTTP reply lost'));
+  assert.equal(await sending, false); assert.equal(messages.children.length, 1);
+});
+
+test('an unconfirmed text request has a finite deadline without being sent again', async () => {
+  const { api, pending, nodes, timers } = harness(false, true);
+  nodes['#messageInput'].value = 'unconfirmed'; const sending = api.sendText();
+  assert.ok(pending[0].signal);
+  pending[0].signal!.addEventListener('abort', () => pending[0].reject(new Error('request deadline')));
+  const deadline = [...timers.values()].find(timer => timer.delay === 30000)!;
+  assert.ok(deadline); deadline.callback();
+  assert.equal(await sending, false); assert.equal(api.outgoing()[0].state, 'unknown');
+  assert.equal(pending.length, 1);
+});
+
+test('durable catch-up associates an echo while the text HTTP response is delayed', async () => {
+  const { api, pending, nodes, messages } = harness(); api.state.steam.steamId = 'account'; api.setSyncCursor('before');
+  nodes['#messageInput'].value = 'durable echo'; const sending = api.sendText();
+  const confirmed = { ...item('durable-echo'), message: 'durable echo', echo: true, steamAccountId: 'account', sentAt: new Date().toISOString() };
+  api.requestDurableSync(); const sync = api.syncTask();
+  pending[1].resolve({ steamAccountId: 'account', items: [confirmed], hasMore: false, nextCursor: 'after' }); await sync;
+  assert.equal(messages.children.length, 1); assert.equal(api.outgoing()[0].state, 'sending');
+  pending[0].resolve({ ok: true, item: confirmed }); await sending;
+  assert.equal(messages.children.length, 1); assert.equal(api.outgoing().length, 0);
+});
+
+test('a similar observed echo cannot turn an explicitly rejected request into a success', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'same text'; const sending = api.sendText();
+  api.receiveHistoryMessage({ ...item('observed-echo'), message: 'same text', echo: true, sentAt: new Date().toISOString() });
+  assert.equal(messages.children.length, 1);
+  pending[0].respond(400, { error: 'Rejected request' }); assert.equal(await sending, false);
+  assert.equal(api.outgoing()[0].state, 'failed'); assert.equal(api.items().length, 1);
+  assert.equal(messages.children.length, 2, 'the failed attempt stays distinct from the actual observed message');
+});
+
 test('image send has a provisional preview source and replaces it with the confirmed URL', async () => {
   const { api, pending, messages } = harness();
   const preview = 'data:image/png;base64,YWJj';

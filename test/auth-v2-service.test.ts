@@ -317,7 +317,7 @@ test('v2 pending HTTP and WS sends recheck downgrade and peer revocation after l
   assert.deepEqual(f.sent, []);
 });
 
-test('v2 text retry rechecks live grant before calling Steam again', async t => {
+test('v2 text acknowledgement loss does not retry, and later submissions recheck the revoked grant', async t => {
   const f = await fixture(t);
   let calls = 0;
   f.steamUser.chat.sendFriendMessage = (_id, _msg, callback) => {
@@ -326,12 +326,15 @@ test('v2 text retry rechecks live grant before calling Steam again', async t => 
     callback(new Error('network timeout'));
   };
   f.grant('chat');
+  const response = await f.request('/message', 'POST', { id: ALICE, msg: 'stop retry' });
+  assert.equal(response.status, 502); assert.equal((await response.json()).uncertain, true);
   await denied(await f.request('/message', 'POST', { id: ALICE, msg: 'stop retry' }), 'steam_grant_insufficient', 'chat');
   assert.equal(calls, 1);
   f.grant('chat');
   const ws = await connect(t, f.base, f.cookie);
   const reply = await ws.request({ type: 'send_message', id: ALICE, msg: 'stop retry' });
-  assert.equal(reply.code, 'steam_grant_insufficient');
+  assert.equal(reply.statusCode, 502); assert.equal(reply.uncertain, true);
+  assert.equal((await ws.request({ type: 'send_message', id: ALICE, msg: 'stop retry' })).code, 'steam_grant_insufficient');
   assert.equal(calls, 2);
 });
 

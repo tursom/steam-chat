@@ -1289,7 +1289,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     return webSessionRefresh;
   }
 
-  async function withSteamRetry<T>(operation: () => Promise<T> | T, needsWebSession = false): Promise<T> {
+  async function withSteamRetry<T>(operation: () => Promise<T> | T, needsWebSession = false, retryErrors = true): Promise<T> {
     requireSteamOnline();
     await resolveWaiter(waitForLogin);
     if (needsWebSession) {
@@ -1299,6 +1299,7 @@ function createChatService(options: ChatServiceOptions = {}) {
       return await operation();
     } catch (error) {
       if (isRecord(error) && [401, 403].includes(Number(error.statusCode))) throw error;
+      if (!retryErrors) throw error;
       if (isSessionExpiredError(error) && !(needsWebSession && isRecord(error) && error.imageUploadPhase === 'commit')) {
         logger.warn?.('Steam web session rejected; refreshing before one retry');
         await refreshSharedWebSession();
@@ -1461,13 +1462,23 @@ function createChatService(options: ChatServiceOptions = {}) {
     // Resolve the text classification before any waiter or retry can yield to a grant change.
     const level: SteamLevel = requiresFullLevel(message) ? 'full' : 'chat';
     authorize?.(level);
+    let submitted = false;
     const result = await withSteamRetry(() => {
       authorize?.(level);
       checkSend(steamAccountId);
       const sender = steamUser.chat?.sendFriendMessage || steamUser.sendFriendMessage;
       const context = steamUser.chat?.sendFriendMessage ? steamUser.chat : steamUser;
       if (!sender) throw new Error('Steam chat sender is unavailable');
+      submitted = true;
       return callMaybeCallback(sender, context, [id, message]);
+    }, false, false).catch(error => {
+      // Steam may deliver the message before its acknowledgement is lost. Text
+      // submissions have no idempotency token, so retrying can send another copy.
+      if (submitted && (isTransientSteamError(error) || /timed\s*out/i.test(errorMessage(error))
+        || isRecord(error) && Number(error.eresult) === 16)) {
+        throw Object.assign(new Error('文字发送结果未确认，请先检查聊天记录。', { cause: error }), { statusCode: 502, uncertain: true });
+      }
+      throw error;
     });
     const canonicalMessage = isRecord(result) && typeof result.modified_message === 'string'
       ? result.modified_message : message;

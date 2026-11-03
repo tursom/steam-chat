@@ -284,13 +284,14 @@ const state: AppState = {
 };
 
 type OutgoingState = 'sending' | 'sent' | 'failed' | 'unknown';
-type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string; retryText?: string };
+type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string; echoEventId?: string; retryText?: string };
 type ImageOperation = { id: string; peerId: string; steamAccountId: string; state: string; version: number;
   attempts: number; maxAttempts: number; nextRetryAt: number; phase: string; error?: string; retryable: boolean; hasImage: boolean; item?: MessageItem; cooldownUntil?: number; replacementId?: string };
 type ImageOperationEntry = OutgoingMessage & { operation?: ImageOperation; imagePayload?: Record<string, string>; transfer?: ImageTransfer;
   operationBusy?: boolean; operationQueryBusy?: boolean; operationQueryError?: boolean; lastOperationQuery?: number; operationMissing?: boolean; operationCreatingFailed?: boolean;
   uploadRejection?: string };
 const outgoingMessages = new Map<number, OutgoingMessage>();
+const claimedTextEvents = new Set<string>();
 let outgoingId = 0;
 let chatEpoch = 0;
 let historyRequest = 0;
@@ -510,6 +511,7 @@ function invalidateChat(purgePersistent = true) {
   imageEmoteError = '';
   imageTransfers.clear();
   outgoingMessages.clear();
+  claimedTextEvents.clear();
   clearImageDrafts();
   storageHealth = undefined;
   resetHistory();
@@ -3031,6 +3033,7 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
     const payload = await api(`/api/history?${params}`, { signal: options.signal });
     if (options.signal?.aborted || !current()) return;
     const items = uniqueMessages(asMessages(isRecord(payload) ? payload.items : payload));
+    if (mode === 'latest') for (const item of items) reconcileOutgoingText(item);
     historyLoaded = true;
     networkThreads.add(target);
     const confirmed = new Set(items.map((item) => item.eventId).filter(Boolean));
@@ -3241,6 +3244,7 @@ function receiveHistoryMessage(item: MessageItem) {
   if (!item.id || !steamAccessAllowed()) return;
   const account = state.steam.activeAccount?.steamId || state.steam.steamId;
   if (item.steamAccountId && item.steamAccountId !== account) return;
+  const confirmedOutgoing = reconcileOutgoingText(item);
   const unreadKey = item.eventId || `${item.id}|${item.sentAt || item.date}|${item.message}`;
   if (!item.echo && (item.id !== state.activeId || historyDetached || document.hidden) && !unreadEvents.has(unreadKey)) {
     unreadEvents.add(unreadKey); if (unreadEvents.size > 2000) unreadEvents.delete(unreadEvents.values().next().value!);
@@ -3263,8 +3267,12 @@ function receiveHistoryMessage(item: MessageItem) {
   if (item.id !== state.activeId) return;
   historyLive = uniqueMessages([...historyLive, item]).slice(-500);
   if (historyDetached) { updateHistoryControls(); return; }
-  if (item.eventId && historyItems.some((entry) => entry.eventId === item.eventId)) return;
+  if (item.eventId && historyItems.some((entry) => entry.eventId === item.eventId)) {
+    if (confirmedOutgoing) refreshOutgoing();
+    return;
+  }
   historyItems.push(item);
+  if (confirmedOutgoing) { refreshOutgoing(); return; }
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages) return;
   const atBottom = historyScroll ? historyScroll.following()
@@ -3346,6 +3354,35 @@ function watchHistoryLayout(messages: HTMLElement, follow: boolean) {
   settle();
 }
 
+function rememberClaimedText(eventId: string) {
+  claimedTextEvents.add(eventId);
+  if (claimedTextEvents.size > 1000) claimedTextEvents.delete(claimedTextEvents.values().next().value!);
+}
+
+function reconcileOutgoingText(item: MessageItem) {
+  if (!item.echo || !item.eventId || item.type && item.type !== 'message' || claimedTextEvents.has(item.eventId)) return false;
+  if (historyItems.some(previous => previous.eventId === item.eventId)) return false;
+  const account = state.steam.activeAccount?.steamId || state.steam.steamId;
+  if (item.steamAccountId && item.steamAccountId !== account) return false;
+  const sentAt = Date.parse(String(item.sentAt || item.date || '').replace(' ', 'T'));
+  if (!Number.isFinite(sentAt)) return false;
+  const normalize = (text: string) => text.replace(/(?<!\\)\[emoticon\]([^\[\]\r\n]+)\[\/emoticon\]/gi, ':$1:');
+  const text = normalize(item.message || '');
+  // Associate display only, one attempt per new Steam event. The request remains
+  // pending until its own response; matching text is not proof of its success.
+  for (const entry of outgoingMessages.values()) {
+    if (entry.context !== chatContext() || entry.item.id !== item.id || entry.item.type !== 'message'
+      || entry.state === 'failed' || entry.echoEventId || entry.retryText === undefined) continue;
+    const startedAt = Date.parse(entry.item.sentAt || '');
+    if (!Number.isFinite(startedAt) || sentAt < startedAt - 2000 || sentAt > startedAt + 30000) continue;
+    const candidates = [entry.retryText, entry.retryText.replace(/\[/g, '\\['), entry.item.message || ''];
+    if (!candidates.some(candidate => normalize(candidate) === text)) continue;
+    entry.echoEventId = item.eventId; rememberClaimedText(item.eventId);
+    return true;
+  }
+  return false;
+}
+
 function visibleOutgoing() {
   if (historyDetached) return [];
   return [...outgoingMessages.values()].filter(entry => entry.context === chatContext() && entry.item.id === state.activeId
@@ -3386,6 +3423,7 @@ function finishOutgoing(entry: OutgoingMessage, status: OutgoingState, response?
   if (entry.context !== chatContext() || !outgoingMessages.has(entry.localId)) return;
   entry.state = status;
   entry.error = error;
+  if (status === 'failed') entry.echoEventId = undefined;
   if (isRecord(response)) {
     const account = state.steam.activeAccount?.steamId || state.steam.steamId;
     const item = asMessages([response.item]).find(item => item.id === entry.item.id && item.echo
@@ -3394,6 +3432,7 @@ function finishOutgoing(entry: OutgoingMessage, status: OutgoingState, response?
       entry.item = item;
       if (item.eventId) {
         entry.eventId = item.eventId;
+        if (entry.retryText !== undefined) rememberClaimedText(item.eventId);
         outgoingMessages.delete(entry.localId);
         receiveHistoryMessage(item);
       }
@@ -3428,6 +3467,12 @@ function renderHistory(items: MessageItem[]) {
   } else {
     for (const item of items) {
       const row = (item.eventId && existing.get(item.eventId)) || renderedHistoryRows.get(item) || renderMessage(item);
+      const historyRow = row as HTMLElement;
+      if (historyRow.dataset.outgoingId) {
+        historyRow.querySelector('.local-outgoing-state')?.remove();
+        delete historyRow.dataset.outgoingId; delete historyRow.dataset.state;
+        historyRow.dataset.sendState = 'sent';
+      }
       renderedHistoryRows.set(item, row as HTMLElement);
       historyRows.set(item, row);
       desired.push(row);
@@ -3435,7 +3480,8 @@ function renderHistory(items: MessageItem[]) {
   }
   for (const entry of outgoing) {
     const localImage = entry.item.type === 'image' && (/^data:image\//i.test(entry.item.message || '') || (entry.item.message || '').startsWith('/api/image-emotes/file/') || (entry.item.message || '').startsWith('/api/send-operations/'));
-    const row = renderMessage(localImage ? { ...entry.item, message: '[图片]' } : entry.item);
+    const linkedRow = entry.echoEventId ? desired.find(row => (row as HTMLElement).dataset.eventId === entry.echoEventId) as HTMLElement | undefined : undefined;
+    const row = linkedRow || renderMessage(localImage ? { ...entry.item, message: '[图片]' } : entry.item);
     row.dataset.outgoingId = String(entry.localId);
     row.dataset.sendState = entry.state;
     row.dataset.state = (entry as ImageOperationEntry).operation?.state || entry.state;
@@ -3460,7 +3506,8 @@ function renderHistory(items: MessageItem[]) {
       status.append(create('span', 'outgoing-error', reason));
     }
     if (operationEntry.operationQueryError) status.append(create('span', 'outgoing-error', '暂时无法查询发送结果，连接恢复后会继续核对。'));
-    const bubble = row.querySelector('.msg-foot') || row.querySelector('.bubble') || row;
+    const foot = row.querySelector('.msg-foot') || row.querySelector('.bubble') || row;
+    const bubble = create('div', 'local-outgoing-state'); foot.append(bubble);
     bubble.append(status);
     if (operationEntry.operation || operationEntry.operationCreatingFailed) appendImageOperationActions(bubble as HTMLElement, operationEntry);
     if (entry.state === 'failed' && entry.retryText && !operationEntry.operation && !operationEntry.operationCreatingFailed && entry.item.type !== 'image' && grantAtLeast(requiresFullText(entry.retryText) ? 'full' : 'chat')) {
@@ -3479,6 +3526,7 @@ function renderHistory(items: MessageItem[]) {
       });
       bubble.append(dismiss);
     }
+    if (linkedRow) continue;
     // Insert local attempts at their send time instead of pinning them after all history.
     const sentAt = Date.parse(entry.item.sentAt || entry.item.date || '');
     const next = Number.isFinite(sentAt) ? items.find(item => {
@@ -4473,16 +4521,18 @@ async function sendText(explicitMessage?: string, previewMessage?: string): Prom
   const outgoing = beginOutgoing(id, previewMessage ?? msg.replace(/\[/g, '\\['));
   outgoing.retryText = msg;
   if (explicitMessage === undefined && input) { input.value = ''; resizeComposerInput(input); }
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), networkDeadlineMs);
   try {
     const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId;
-    const response = await api('/message', jsonBody({ id, msg, ...(steamAccountId ? { steamAccountId } : {}) }));
+    const response = await api('/message', { ...jsonBody({ id, msg, ...(steamAccountId ? { steamAccountId } : {}) }), signal: controller.signal });
     if (!isRecord(response) || response.ok !== true) throw new Error('文字发送结果未确认，请先检查聊天记录。');
     finishOutgoing(outgoing, 'sent', response);
     return true;
   } catch (error) {
     finishOutgoing(outgoing, outgoingFailure(error), undefined, errorMessage(error));
     return false;
-  }
+  } finally { clearTimeout(deadline); }
 }
 
 function getImageDrafts(): ImageDraft[] {
@@ -5283,6 +5333,7 @@ function sortHistoryItems(items: MessageItem[]) {
 function applyDurableMessages(items: MessageItem[]) {
   const account = state.steam.activeAccount?.steamId || state.steam.steamId;
   const accepted = items.filter(item => item.id && item.eventId && item.steamAccountId === account);
+  for (const item of accepted) reconcileOutgoingText(item);
   for (const item of accepted) { updateRecentConversation(item, false); updateCachedMessage(item); }
   if (accepted.length) { updateChatLists(); scheduleChatCache(); }
   const current = accepted.filter(item => item.id === state.activeId);

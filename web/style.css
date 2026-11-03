@@ -401,6 +401,7 @@ kbd { padding: 1px 6px; border: 1px solid var(--line-2); border-bottom-width: 2p
 .message-content a:hover { text-decoration: underline; }
 .bubble { position: relative; min-width: 0; max-width: 100%; background: transparent; color: var(--text); overflow-wrap: anywhere; }
 .msg-foot { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; max-width: 100%; }
+.local-outgoing-state { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .msg-tools { position: absolute; top: -12px; right: 8px; display: flex; opacity: 0; pointer-events: none; padding: 2px; border-radius: var(--radius-sm); background: var(--panel); border: 1px solid var(--line); box-shadow: var(--shadow); z-index: 2; }
 .msg:hover .msg-tools, .msg:focus-within .msg-tools, .msg.show-tools .msg-tools, .msg-tools:focus-within { opacity: 1; pointer-events: auto; }
 .msg.is-cont .msg-head, .msg-row[data-continued] .msg-head { position: absolute; width: 1px; height: 1px; margin: -1px; overflow: hidden; clip-path: inset(50%); white-space: nowrap; }

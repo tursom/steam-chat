@@ -87,6 +87,10 @@ async function run() {
       const item = { id: peer, eventId: 'confirmed-1', steamAccountId: account, name: 'Preview', type: 'message', echo: true, message: 'Optimistic text', sentAt: new Date().toISOString() };
       history.push(item);
       socket.send(JSON.stringify({ ...item, type: 'message' }));
+      await page.locator('[data-event-id="confirmed-1"]').waitFor({ timeout: 3000 });
+      assert.equal(await row.count(), 1, 'a realtime confirmation must replace the placeholder while HTTP is still pending');
+      assert.match(await row.innerText(), /发送中/, 'the request remains pending until its own HTTP acknowledgement');
+      assert.match(await queued.innerText(), /发送中/, 'the other pending send must retain its own state');
       await writes[0].route.fulfill({ json: { ok: true, item } });
       writes[0].done();
       await page.waitForTimeout(150);
@@ -185,6 +189,36 @@ async function run() {
         assert.match(await attempt.innerText(), phase === 'commit' ? /结果未确认/ : /发送失败/);
         await page.waitForTimeout(100); assert.equal(writes.length, writeIndex + 1, 'Client must not retry a server image result');
       }
+      const identicalIndex = writes.length;
+      for (let count = 0; count < 2; count++) {
+        await page.locator('#messageInput').fill('Intentional identical text'); await page.locator('#sendButton').click();
+      }
+      await page.waitForFunction(count => document.querySelectorAll('[data-outgoing-id]').length >= count, 2);
+      const identicalRows = page.locator('.msg-row').filter({ hasText: 'Intentional identical text' });
+      assert.equal(await identicalRows.count(), 2);
+      const one = { ...item, eventId: 'identical-one', message: 'Intentional identical text', sentAt: new Date().toISOString() };
+      const two = { ...one, eventId: 'identical-two', ordinal: 1 };
+      socket.send(JSON.stringify(one)); socket.send(JSON.stringify(one));
+      await page.locator('[data-event-id="identical-one"]').waitFor();
+      assert.equal(await identicalRows.count(), 2, 'one repeated echo must not consume both intentional sends');
+      assert.equal(await identicalRows.locator('.message-send-state').count(), 2);
+      socket.send(JSON.stringify(two)); await page.locator('[data-event-id="identical-two"]').waitFor();
+      assert.equal(await identicalRows.count(), 2); assert.equal(await identicalRows.locator('.message-send-state').count(), 2);
+      for (const [offset, confirmed] of [[1, two], [0, one]]) {
+        await writes[identicalIndex + offset].route.fulfill({ json: { ok: true, item: confirmed } }); writes[identicalIndex + offset].done();
+      }
+      await page.waitForFunction(() => ['identical-one', 'identical-two'].every(id => !document.querySelector(`[data-event-id="${id}"] .local-outgoing-state`)));
+      const lostIndex = writes.length;
+      await page.locator('#messageInput').fill('Confirmed despite lost HTTP'); await page.locator('#sendButton').click();
+      await page.waitForFunction(() => document.querySelector('.msg-row[data-send-state="sending"]'));
+      socket.send(JSON.stringify({ ...item, eventId: 'echo-lost-http', message: 'Confirmed despite lost HTTP', sentAt: new Date().toISOString() }));
+      await page.locator('[data-event-id="echo-lost-http"]').waitFor();
+      await writes[lostIndex].route.abort('failed'); writes[lostIndex].done();
+      await page.waitForTimeout(100);
+      const delivered = page.locator('.msg-row').filter({ hasText: 'Confirmed despite lost HTTP' });
+      assert.equal(await delivered.count(), 1); assert.doesNotMatch(await delivered.innerText(), /发送中|发送失败/);
+      assert.match(await delivered.innerText(), /未确认/, 'a lost response must not be treated as a proven successful request');
+      assert.equal(writes.length, lostIndex + 1, 'an echoed message must never be sent again after the HTTP reply is lost');
       assert.equal(await playerFrame.evaluate(() => window.playbackMarker), 'playing-42s');
       assert.deepEqual(errors, []);
       console.log(`PASS ${width}px: immediate sends, echo deduplication, image failure/unknown certainty and no client retries`);

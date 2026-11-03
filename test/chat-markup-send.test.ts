@@ -21,6 +21,21 @@ const cases = [
   { input: 'ordinary [text]', wire: 'ordinary \\[text]', canonical: 'ordinary \\[text]' }
 ];
 
+for (const failure of [Object.assign(new Error('connection reset'), { code: 'ECONNRESET' }), new Error('Timeout'),
+  new Error('Request timed out'), Object.assign(new Error('Timeout'), { eresult: 16 })]) {
+  test(`text acknowledgement loss never invokes the Steam sender twice: ${String((failure as Error & { code?: string }).code || failure.message)}`, async t => {
+    let calls = 0;
+    const user = Object.assign(new EventEmitter(), {
+      sendFriendMessage(_id: string, _text: string, callback: (error: Error) => void) { calls++; callback(failure); }
+    });
+    const service = createChatService({ steamUser: user, logger });
+    t.after(() => service.stop());
+    await assert.rejects(service.sendTextMessage(peer, 'do not resend', account),
+      (error: { statusCode?: number; uncertain?: boolean }) => error.statusCode === 502 && error.uncertain === true);
+    assert.equal(calls, 1);
+  });
+}
+
 for (const { input, wire, canonical } of cases) {
   test(`SDK default wire format and canonical server reply: ${input}`, async t => {
     const directory = await mkdtemp(join(tmpdir(), 'steam-chat-markup-'));

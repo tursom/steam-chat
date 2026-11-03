@@ -86,7 +86,7 @@ function harness() {
       createElement: (tag: string) => { const element = new Element(tag); elements.push(element); return element; }
     },
     localStorage: { getItem: (): null => null, setItem() {} },
-    FileReader: Reader, XMLHttpRequest: FetchXHR, URL: SandboxURL, URLSearchParams, Headers, console,
+    FileReader: Reader, XMLHttpRequest: FetchXHR, URL: SandboxURL, URLSearchParams, Headers, AbortController, console,
     setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
     fetch: async (url: string, init: { body?: string }) => {
       if (url === '/message') await new Promise<void>((resolve, reject) => textRequests.push({ body: JSON.parse(init?.body || '{}'), resolve, reject }));
