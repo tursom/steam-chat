@@ -2513,7 +2513,10 @@ function renderComposer() {
   const pickerControls = bindFloatingPanel(pickerButton, picker);
   pickerButton.addEventListener('click', () => {
     attachmentControls.close();
-    if (picker.hidden) { renderPicker(picker); void loadImageEmotes(); void loadChatInventory(); }
+    if (picker.hidden) {
+      if (usesTouchInput()) document.querySelector<HTMLTextAreaElement>('#messageInput')?.blur();
+      renderPicker(picker); void loadImageEmotes(); void loadChatInventory();
+    }
     pickerControls.toggle();
   });
 
@@ -5217,6 +5220,15 @@ function renderCustomImagePicker(container: HTMLElement) {
   tools.append(group, search); container.append(tools, grid); fill();
 }
 
+function usesTouchInput(): boolean {
+  return typeof matchMedia === 'function' && matchMedia('(pointer: coarse)').matches;
+}
+
+function focusComposerAfterPickerSelection(input: HTMLTextAreaElement) {
+  if (usesTouchInput()) input.blur();
+  else input.focus();
+}
+
 function renderPicker(container: HTMLElement) {
   clear(container);
   const tabs = create('div', 'picker-tabs');
@@ -5268,13 +5280,13 @@ function renderPicker(container: HTMLElement) {
           input.value += `:${name}:`;
           resizeComposerInput(input);
         }
-        input.focus();
+        focusComposerAfterPickerSelection(input);
       });
       grid.append(button);
     }
     if (type === 'emoticons') for (const emoji of ['😀', '😊', '😂', '🥰', '😎', '🥲', '🤔', '😭', '👍', '👋', '🎉', '❤️']) {
       const button = create('button', 'unicode-emote', emoji); button.type = 'button'; button.title = emoji; button.setAttribute('aria-label', emoji);
-      button.addEventListener('click', () => { const input = document.querySelector<HTMLTextAreaElement>('#messageInput'); if (input) { input.value += emoji; resizeComposerInput(input); input.focus(); } }); grid.append(button);
+      button.addEventListener('click', () => { const input = document.querySelector<HTMLTextAreaElement>('#messageInput'); if (input) { input.value += emoji; resizeComposerInput(input); focusComposerAfterPickerSelection(input); } }); grid.append(button);
     }
   }
   emoticons.type = 'button';

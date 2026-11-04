@@ -19,8 +19,8 @@ let browser;
 before(async () => { browser = await chromium.launch({ args: ['--no-sandbox'] }); });
 after(async () => { await browser?.close(); });
 
-async function fixture(t, identity = 'super', width = 1440, initialView = 'chat', colorScheme = 'light') {
-  const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 }, colorScheme, serviceWorkers: 'block' });
+async function fixture(t, identity = 'super', width = 1440, initialView = 'chat', colorScheme = 'light', touch = false) {
+  const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 }, colorScheme, serviceWorkers: 'block', hasTouch: touch, isMobile: touch });
   t.after(() => context.close());
   const page = await context.newPage(); page.setDefaultTimeout(6000);
   const errors = [], requests = [], writes = [];
@@ -86,6 +86,33 @@ async function noOverflow(page, label) {
   assert.ok(result.app <= result.appWidth + 1, `${label}: app ${JSON.stringify(result)}`);
   if (result.sheet) assert.ok(result.sheet.scroll <= result.sheet.width + 1, `${label}: sheet ${JSON.stringify(result)}`);
 }
+
+for (const touch of [true, false]) test(`${touch ? 'touch' : 'desktop'} picker preserves keyboard behavior for emoticons, emoji, stickers and effects`, async t => {
+  const { page, writes, errors } = await fixture(t, 'super', touch ? 390 : 1440, 'chat', 'light', touch);
+  const activate = locator => touch ? locator.tap() : locator.click();
+  await activate(page.locator('#chatListSections .conv').first());
+  const input = page.locator('#messageInput');
+  const isInputFocused = () => input.evaluate(node => document.activeElement === node);
+  await input.focus();
+  assert.equal(await isInputFocused(), true);
+  await activate(page.locator('#pickerToggle'));
+  if (touch) assert.equal(await isInputFocused(), false, 'opening the touch picker dismisses the typing keyboard');
+  await activate(page.locator('#picker .picker-grid button').filter({ hasText: 'Wave' }));
+  assert.equal(await input.inputValue(), ':wave:');
+  assert.equal(await isInputFocused(), !touch);
+  await activate(page.locator('#picker').getByRole('button', { name: '😀', exact: true }));
+  assert.equal(await input.inputValue(), ':wave:😀');
+  assert.equal(await isInputFocused(), !touch);
+  for (const [tab, title, command] of [['贴纸', 'Heart', '/sticker CatchHeart'], ['效果', 'Snow', '/roomeffect snow']]) {
+    await activate(page.locator('#picker .picker-tabs').getByRole('button', { name: tab, exact: true }));
+    const sent = page.waitForResponse(response => new URL(response.url()).pathname === '/message' && response.request().postDataJSON()?.msg === command);
+    await activate(page.locator('#picker .picker-grid button').filter({ hasText: title }));
+    await sent;
+    assert.equal(await isInputFocused(), !touch);
+    assert.ok(writes.some(write => write.path === '/message' && write.body.msg === command));
+  }
+  assert.deepEqual(errors, []);
+});
 
 test('forced password change keeps quick navigation and the console behind the password card', async t => {
   const { page, me, errors } = await fixture(t);
