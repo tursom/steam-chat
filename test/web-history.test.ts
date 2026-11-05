@@ -1196,6 +1196,24 @@ test('malformed inventory updates preserve every previous category', async () =>
   assert.equal(api.state.effects[0].name, 'Snow');
 });
 
+test('partial inventory refresh updates healthy categories and retains failed browser snapshots', async () => {
+  const { api, pending, advance } = harness(false, true);
+  api.state.steam.steamId = 'account'; api.state.steam.status = 'online';
+  const loading = api.loadChatInventory(); pending[0].resolve(savedInventory); await loading;
+  advance(10 * 60_000 + 1);
+  const refresh = api.loadChatInventory();
+  pending[1].resolve({ emoticons: [{ name: ':new:' }], stickers: [], effects: [],
+    cache: { stale: true, failedCategories: ['stickers'] } });
+  await refresh;
+  assert.equal(api.state.emoticons[0].name, ':new:');
+  assert.equal(api.state.stickers[0].name, 'Heart');
+  assert.equal(api.state.effects.length, 0, 'a successful empty category still removes old ownership');
+  advance(2001);
+  const recovered = api.loadChatInventory();
+  pending[2].resolve({ emoticons: [], stickers: [], effects: [] }); await recovered;
+  assert.equal(api.state.emoticons.length + api.state.stickers.length + api.state.effects.length, 0);
+});
+
 test('inventory refresh respects server freshness and retry cooldown without hiding cached items', async () => {
   const { api, pending, advance, now: clock } = harness(false, true);
   api.state.steam.steamId = 'account'; api.state.steam.status = 'online';

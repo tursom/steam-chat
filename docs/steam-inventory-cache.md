@@ -1,6 +1,6 @@
 # Steam 素材库存缓存
 
-表情、贴纸和聊天效果共用一份按 Steam 账号隔离的完整快照。HTTP
+表情、贴纸和聊天效果共用一份按 Steam 账号隔离的快照，各类别可以独立刷新。HTTP
 `/api/emoticons` 和 WebSocket `get_emoticons` 使用相同的缓存及刷新任务。
 
 ## 服务端
@@ -9,10 +9,17 @@
   标题、缩略图和协议别名，不保存 SDK 对象或登录凭据。已有数据卷即可持久化，
   不需要修改 Docker Compose。
 - 已有快照时立即返回。超过 10 分钟后在后台刷新，同一账号的并发请求共用刷新任务。
-- 刷新失败、超时、分页不完整、目录无法解析或返回结构无效时保留旧快照，30 秒后重试。
-  不把获取失败转换成成功的空库存。
-- 只有完整的新结果才通过临时文件和原子替换保存；确认成功的空库存可以替换旧列表。
-- 无缓存的第一次加载最多等待 15 秒，失败会返回错误；不能凭空构造未曾获取的素材。
+- 加载器通过 `SteamInventory.failedCategories?: Array<'emoticons' | 'stickers' | 'effects'>`
+  标记失败类别。成功类别更新，失败类别保留此前的数组；失败类别传入的数组不可信，直接忽略。
+  `complete: false` 仍表示整次刷新失败，不能接收其中任何类别的新数据。
+- 部分成功也通过临时文件和原子替换保存，持久化顶层 `failedCategories`。快照仍用
+  `version: 1`，兼容没有失败元数据的旧版完整快照。成功确认的空数组可以替换对应旧列表。
+- 部分失败时 `cache.stale` 始终为 `true`，`retryAt` 为 30 秒后；读取部分快照后即使
+  未达到 10 分钟 TTL，也会按此冷却时间重试。重启从快照时间恢复冷却时间，完整成功后清除失败元数据。
+- 无缓存的第一次加载最多等待 15 秒。有类别成功时返回并保存部分结果；没有旧数据的失败
+  类别仍以数组 `[]` 保持接口兼容，必须结合 `cache.failedCategories` 判断其不可用，不能视为成功空库存。
+  三个类别全部失败且没有旧快照时返回 503，不创建快照。
+- 整次加载拒绝、超时、`complete: false`、返回结构无效或写盘失败时保留原快照，30 秒后重试。
 - 读取缓存仍检查账号和访问权限，等待后再次校验。离线可以读取有权限账号的快照，
   发送操作仍按实时登录状态和授权执行。
 
@@ -21,17 +28,27 @@
 ```json
 {
   "updatedAt": 1800000000000,
-  "refreshing": true,
+  "refreshing": false,
   "stale": true,
-  "retryAt": 0
+  "retryAt": 1800000030000,
+  "failedCategories": ["stickers", "effects"]
 }
 ```
 
-`updatedAt` 是最后一次完整快照的时间；`retryAt` 是失败后的下一次允许刷新时间。
+`updatedAt` 是最后一次接收并保存快照的时间，可能包含保留旧数组的失败类别；`retryAt`
+是失败后的下一次允许刷新时间。`cache.failedCategories` 只在存在类别失败时返回，类别按
+`emoticons`、`stickers`、`effects` 排序并去重。完整成功响应省略该字段。
 目录缓存保留已验证的旧协议别名，但实际可用列表仍由当前账号拥有的物品决定。
 已下架但仍被拥有的素材可以复用此前快照中明确记录的协议别名；新增其他应用的物品
-或服务重启不会让它们阻断整份库存刷新。缺失物品描述的 SDK 响应属于不完整结果，
-不能据此判定贴纸和效果库存为空。
+或服务重启不会让它们阻断整份库存刷新。缺失物品描述的 SDK 响应属于贴纸和效果类别失败，
+不能据此判定这两个类别的库存为空，也不能阻断成功的表情类别。
+
+缓存诊断日志正文带固定阶段：`stage=load`、`fetch`、`validate`、`persist` 或 `partial`。
+部分失败只记录经过校验的类别名称；其他失败只记录白名单 `error.code`，从不记录原始错误信息、
+堆栈、响应或 Cookie。加载器抛出的错误可以使用 `EMOTICONS`、`COMMUNITY_INVENTORY`、
+`STICKERS`、`EFFECTS`、`CATALOG` 标记来源。其余允许值为 `UNAVAILABLE`、`TIMEOUT`、
+`STOPPED`、`INCOMPLETE`、`INVALID_MATERIAL`、`INVALID_SNAPSHOT`、`ALL_CATEGORIES_FAILED`、
+`EACCES`、`ENOTDIR`、`ENOSPC`、`EROFS`；未知值统一为 `UNKNOWN`。
 
 ## 浏览器
 

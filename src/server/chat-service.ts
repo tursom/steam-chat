@@ -107,10 +107,12 @@ type EmoticonPayload = {
   stickers: unknown[];
   effects?: unknown[];
   complete?: boolean;
+  failedCategories?: ('emoticons' | 'stickers' | 'effects')[];
 };
 
 type GetEmoticonsOptions = {
   previousInventory?: SteamInventory;
+  logger?: LoggerLike;
   steamCommunity?: SteamCommunityLike;
   steamUser?: SteamUserLike;
   waitForLogin: Waiter;
@@ -943,7 +945,7 @@ function createChatService(options: ChatServiceOptions = {}) {
         || !steamCommunity?.getUserInventoryContents)) {
         throw Object.assign(new Error('Steam inventory sources are unavailable'), { statusCode: 503 });
       }
-      const result = await getEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession, previousInventory });
+      const result = await getEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession, previousInventory, logger });
       checkAccount();
       // Historical injected helpers predate effects. Production must return all three arrays.
       return options.getEmoticons && result.effects === undefined ? { ...result, effects: [] } : result as EmoticonPayload & { effects: unknown[] };
@@ -2263,36 +2265,70 @@ function createChatService(options: ChatServiceOptions = {}) {
   };
 }
 
-async function defaultGetEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession, previousInventory }: GetEmoticonsOptions): Promise<EmoticonPayload> {
+async function defaultGetEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession, previousInventory, logger }: GetEmoticonsOptions): Promise<EmoticonPayload> {
   await resolveWaiter(waitForLogin);
-  await resolveWaiter(waitForWebSession);
-  const source = steamUser?.getEmoticonList || steamUser?.chat?.getEmoticonList;
-  const context = steamUser?.getEmoticonList ? steamUser : steamUser?.chat;
-  const response = source ? await callMaybeCallback(source, context, []) : null;
-  const entries = (value: unknown): unknown[] => Array.isArray(value) ? value : isRecord(value) ? Object.values(value) : [];
-  if (source && (!isRecord(response) || (!Array.isArray(response.emoticons ?? response.emoticon_list)
-    && !isRecord(response.emoticons ?? response.emoticon_list)))) {
-    throw new Error('Incomplete Steam emoticon inventory');
+  const result: EmoticonPayload = { emoticons: [], stickers: [], effects: [] };
+  const failed = new Set<'emoticons' | 'stickers' | 'effects'>();
+  // SDK/web inventory and reward catalog requests fail independently. Bound each
+  // branch below the outer cache deadline so a working branch can still be saved.
+  async function bounded<T>(work: () => Promise<T>, timeoutMs = 12_000): Promise<T> {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      return await Promise.race([Promise.resolve().then(work), new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error('Steam inventory source timed out')), timeoutMs);
+      })]);
+    } finally { clearTimeout(timer); }
   }
-  const emoticons = isRecord(response)
-    ? entries(response.emoticons || response.emoticon_list)
-    : [];
-  let stickers = isRecord(response)
-    ? entries(response.stickers || response.sticker_list)
-    : [];
-  let effects: unknown[] = [];
-  const steamId = steamUser?.steamID || steamCommunity?.steamID;
-  if (steamCommunity?.getUserInventoryContents && steamId) {
-    // The SDK joins asset descriptions and follows all inventory pages, including non-tradable items.
+  function fail(categories: ('emoticons' | 'stickers' | 'effects')[], error: unknown) {
+    for (const category of categories) failed.add(category);
+    // Log only fixed local diagnoses. Upstream errors may contain cookies or bodies.
+    const messages: Record<string, string> = {
+      'Incomplete Steam emoticon inventory': 'INVALID_EMOTICONS',
+      'Incomplete Steam community inventory': 'INCOMPLETE_DESCRIPTIONS',
+      'Incomplete sticker catalog for owned inventory': 'UNRESOLVED_OWNED_ALIAS',
+      'Unresolvable owned sticker inventory': 'INVALID_OWNED_ALIAS',
+      'Sticker catalog timed out': 'CATALOG_TIMEOUT',
+      'Steam inventory source timed out': 'SOURCE_TIMEOUT',
+      'This profile is private.': 'WEB_SESSION_PRIVATE',
+      'Incomplete sticker catalog': 'INCOMPLETE_CATALOG',
+      'Incomplete sticker catalog: page limit reached': 'CATALOG_PAGE_LIMIT'
+    };
+    const code = error instanceof Error ? messages[error.message] ?? 'UPSTREAM_FAILURE' : 'UPSTREAM_FAILURE';
+    logger?.warn?.(`Steam inventory ${categories.join('/')} refresh failed [${code}]; preserving cached materials`);
+  }
+  const emoticonTask = bounded(async () => {
+    const source = steamUser?.getEmoticonList || steamUser?.chat?.getEmoticonList;
+    const context = steamUser?.getEmoticonList ? steamUser : steamUser?.chat;
+    const response = source ? await callMaybeCallback(source, context, []) : null;
+    const entries = (value: unknown): unknown[] => Array.isArray(value) ? value : isRecord(value) ? Object.values(value) : [];
+    if (source && (!isRecord(response) || (!Array.isArray(response.emoticons ?? response.emoticon_list)
+      && !isRecord(response.emoticons ?? response.emoticon_list)))) throw new Error('Incomplete Steam emoticon inventory');
+    return { emoticons: isRecord(response) ? entries(response.emoticons ?? response.emoticon_list) : [],
+      stickers: isRecord(response) ? entries(response.stickers ?? response.sticker_list) : [] };
+  }).then(data => { result.emoticons = data.emoticons; return data; }, (error): undefined => { fail(['emoticons'], error); return undefined; });
+  const communityTask = bounded(async () => {
+    const steamId = steamUser?.steamID || steamCommunity?.steamID;
+    if (!steamCommunity?.getUserInventoryContents || !steamId) return undefined;
+    await resolveWaiter(waitForWebSession);
+    // The SDK joins descriptions and follows every ownership page.
     const inventory = await callMaybeCallback(steamCommunity.getUserInventoryContents, steamCommunity, [steamId, 753, 6, false]);
     if (!Array.isArray(inventory)) throw new Error('Incomplete Steam community inventory');
+    return inventory;
+  }, 8_000).then(async inventory => {
+    if (!inventory) return;
     const { resolveStickerInventory } = await import('./sticker-inventory.js');
-    [stickers, effects] = await Promise.all([
-      resolveStickerInventory(inventory, { previousInventory: previousInventory?.stickers }),
-      resolveStickerInventory(inventory, { itemClass: 12, previousInventory: previousInventory?.effects })
-    ]);
-  }
-  return { emoticons, stickers, effects };
+    await Promise.all((['stickers', 'effects'] as const).map(async category => {
+      try {
+        result[category] = await resolveStickerInventory(inventory, {
+          itemClass: category === 'stickers' ? 11 : 12, previousInventory: previousInventory?.[category]
+        });
+      } catch (error) { fail([category], error); }
+    }));
+  }, error => { fail(['stickers', 'effects'], error); });
+  const [emoticonData] = await Promise.all([emoticonTask, communityTask]);
+  if (!steamCommunity?.getUserInventoryContents && emoticonData) result.stickers = emoticonData.stickers;
+  if (failed.size) result.failedCategories = [...failed];
+  return result;
 }
 
 // Steam reports names only for non-Steam games; Steam apps are resolved from PICS app info.

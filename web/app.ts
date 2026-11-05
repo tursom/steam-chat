@@ -489,6 +489,7 @@ function invalidateChat(purgePersistent = true) {
   inventoryTask = null;
   inventoryContext = '';
   inventorySavedScope = '';
+  inventoryFailedCategories.clear();
   inventoryRefreshAt = 0;
   if (inventoryRefreshTimer) clearTimeout(inventoryRefreshTimer);
   inventoryRefreshTimer = null;
@@ -2688,6 +2689,7 @@ const inventoryStorageKey = 'steam-chat.inventory.v1';
 let inventorySavedScope = '';
 let inventoryRefreshAt = 0;
 let inventoryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+const inventoryFailedCategories = new Set<string>();
 const inventoryFreshMs = 10 * 60 * 1000;
 
 function restoreChatInventory() {
@@ -2696,6 +2698,7 @@ function restoreChatInventory() {
   if (inventorySavedScope) {
     state.emoticons = []; state.stickers = []; state.effects = [];
     inventoryContext = ''; inventoryRefreshAt = 0;
+    inventoryFailedCategories.clear();
   }
   inventorySavedScope = scope;
   try {
@@ -2744,10 +2747,17 @@ async function loadChatInventory() {
       if (context !== chatContext() || scope !== cacheScope() || !isRecord(inventory)) return;
       if (!Array.isArray(inventory.emoticons) || !Array.isArray(inventory.stickers)
         || inventory.effects !== undefined && !Array.isArray(inventory.effects)) throw new Error('素材列表不完整');
-      state.emoticons = asInventory(inventory.emoticons); state.stickers = asInventory(inventory.stickers);
-      if (Array.isArray(inventory.effects)) state.effects = asInventory(inventory.effects);
       inventoryContext = context;
       const cache = isRecord(inventory.cache) ? inventory.cache : {};
+      inventoryFailedCategories.clear();
+      if (Array.isArray(cache.failedCategories)) for (const category of cache.failedCategories) {
+        if (category === 'emoticons' || category === 'stickers' || category === 'effects') inventoryFailedCategories.add(category);
+      }
+      for (const category of ['emoticons', 'stickers', 'effects'] as const) {
+        if (Array.isArray(inventory[category]) && (!inventoryFailedCategories.has(category) || !state[category].length)) {
+          state[category] = asInventory(inventory[category]);
+        }
+      }
       const refreshing = cache.refreshing === true || cache.stale === true;
       const now = Date.now();
       const retryAt = typeof cache.retryAt === 'number' && Number.isFinite(cache.retryAt) ? Math.min(cache.retryAt, now + 60_000) : 0;
@@ -2764,7 +2774,10 @@ async function loadChatInventory() {
       // Keep the last usable lists while a failed/slow refresh is retried.
       if (context === chatContext() && scope === cacheScope()) {
         inventoryContext = context;
+        for (const category of ['emoticons', 'stickers', 'effects']) inventoryFailedCategories.add(category);
         inventoryRefreshAt = Date.now() + 30_000;
+        const picker = document.querySelector<HTMLElement>('#picker');
+        if (picker && !picker.hidden) renderPicker(picker);
         refreshReactionPickerInventories();
         scheduleInventoryRefresh(context);
       }
@@ -5424,8 +5437,12 @@ function renderPicker(container: HTMLElement) {
   const custom = create('button', '', '自定义'); custom.type = 'button';
   const grid = create('div', 'picker-grid');
   const customPanel = create('div', 'custom-emote-picker');
+  const status = create('div', 'notice inventory-status'); status.setAttribute('role', 'status');
   function fill(type: 'emoticons' | 'stickers' | 'effects' | 'custom') {
     container.dataset.inventoryType = type;
+    status.hidden = type === 'custom' || !inventoryFailedCategories.has(type);
+    const hasSaved = type !== 'custom' && state[type].length > 0;
+    status.textContent = hasSaved ? '此类 Steam 素材暂时刷新失败，已保留缓存，稍后自动重试。' : '此类 Steam 素材暂时加载失败，稍后自动重试。';
     grid.hidden = type === 'custom'; customPanel.hidden = type !== 'custom';
     for (const [button, selected] of [[emoticons, type === 'emoticons'], [stickers, type === 'stickers'], [effects, type === 'effects'], [custom, type === 'custom']] as const) button.setAttribute('aria-pressed', String(selected));
     if (type !== 'emoticons' && !grantAtLeast('full')) {
@@ -5435,7 +5452,7 @@ function renderPicker(container: HTMLElement) {
     clear(grid);
     const source = type === 'emoticons' ? state.emoticons : type === 'effects' ? state.effects : state.stickers;
     if (!source.length && type !== 'emoticons') {
-      grid.append(create('div', 'empty small', '暂无素材'));
+      grid.append(create('div', 'empty small', inventoryFailedCategories.has(type) ? '尚未加载成功，请稍后重试' : '暂无素材'));
       return;
     }
     for (const item of source) {
@@ -5482,7 +5499,7 @@ function renderPicker(container: HTMLElement) {
   custom.addEventListener('click', () => fill('custom'));
   effects.addEventListener('click', () => fill('effects'));
   tabs.append(emoticons, stickers, effects, custom);
-  container.append(tabs, grid, customPanel);
+  container.append(tabs, status, grid, customPanel);
   fill(container.dataset.inventoryType === 'effects' ? 'effects' : container.dataset.inventoryType === 'custom' ? 'custom' : container.dataset.inventoryType === 'stickers' ? 'stickers' : 'emoticons');
 }
 

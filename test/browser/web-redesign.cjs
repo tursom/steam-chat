@@ -121,6 +121,24 @@ test('saved picker inventory survives reload and can send stickers during a dela
   assert.deepEqual(f.errors, []);
 });
 
+test('cold partial inventory keeps healthy emoticons usable and reports the failed category', async t => {
+  const f = await fixture(t, 'super', 390, 'chat', 'light', true);
+  const { page } = f;
+  f.setInventory({ emoticons: [{ name: 'wave', title: 'Wave' }], stickers: [], effects: [],
+    cache: { stale: true, failedCategories: ['stickers'], retryAt: Date.now() + 60_000 } });
+  await page.locator('#chatListSections .conv').first().tap();
+  await page.locator('#pickerToggle').tap();
+  await page.locator('#picker .picker-grid button').filter({ hasText: 'Wave' }).tap();
+  assert.equal(await page.locator('#messageInput').inputValue(), ':wave:');
+  assert.equal(await page.locator('#messageInput').evaluate(node => node === document.activeElement), false);
+  await page.locator('#picker .picker-tabs').getByRole('button', { name: '贴纸', exact: true }).tap();
+  assert.match(await page.locator('#picker .inventory-status').innerText(), /加载失败/);
+  assert.match(await page.locator('#picker .picker-grid').innerText(), /尚未加载成功/);
+  assert.doesNotMatch(await page.locator('#picker .picker-grid').innerText(), /暂无素材/);
+  await noOverflow(page, 'partial inventory');
+  assert.deepEqual(f.errors, []);
+});
+
 async function enableReactions(page) {
   await page.route('http://redesign.test/api/message-reactions**', route => route.fulfill({ json: route.request().method() === 'POST'
     ? { users: [account] }

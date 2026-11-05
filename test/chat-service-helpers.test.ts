@@ -164,7 +164,7 @@ test('defaultGetEmoticons waits for login and supports callback-style chat APIs'
     }
   });
 
-  assert.deepEqual(order, ['login', 'web', 'source']);
+  assert.deepEqual(order, ['login', 'source']);
   assert.deepEqual(data.emoticons, [{ name: ':wave:' }]);
   assert.deepEqual(data.stickers, [{ name: 'sticker' }]);
 });
@@ -175,6 +175,32 @@ test('defaultGetEmoticons accepts the name-keyed inventory returned by steam-use
     steamUser: { getEmoticonList: async () => ({ emoticons: { ':steamhappy:': emoticon } }) }
   });
   assert.deepEqual(data.emoticons, [emoticon]);
+});
+
+test('community session failures do not discard usable Steam emoticons and diagnostics omit upstream data', async () => {
+  const warnings: string[] = [];
+  const data = await defaultGetEmoticons({
+    steamUser: { steamID: '76561198000000001', getEmoticonList: async () => ({ emoticons: [{ name: ':wave:' }] }) },
+    waitForWebSession: async () => { throw new Error('secret-cookie-and-response-body'); },
+    steamCommunity: { getUserInventoryContents: async () => { throw new Error('must not be reached'); } },
+    logger: { warn: (message: string) => warnings.push(message) }
+  });
+  assert.deepEqual(data.emoticons, [{ name: ':wave:' }]);
+  assert.deepEqual(data.failedCategories, ['stickers', 'effects']);
+  assert.match(warnings.join(''), /UPSTREAM_FAILURE/);
+  assert.doesNotMatch(warnings.join(''), /secret-cookie/);
+});
+
+test('emoticon failures do not block owned stickers and effects from the community source', async (t: import('node:test').TestContext) => {
+  mockStickerCatalog(t);
+  const data = await defaultGetEmoticons({
+    steamUser: { steamID: '76561198000000001', getEmoticonList: async () => { throw new Error('CM unavailable'); } },
+    steamCommunity: { getUserInventoryContents: async () => [{ name: 'Show Love', market_hash_name: '1203420-Show Love',
+      tags: [{ category: 'item_class', internal_name: 'item_class_11' }] }] }
+  });
+  assert.deepEqual(data.failedCategories, ['emoticons']);
+  assert.equal(data.stickers[0].name, 'show love');
+  assert.deepEqual(data.effects, []);
 });
 
 // Public reward definition 153568; adapter tests must not depend on live catalog availability.
@@ -235,15 +261,17 @@ test('owned sticker adaptation consumes actual SDK paginated CEconItems, includi
 
 test('malformed SDK results cannot masquerade as successful empty inventories', async () => {
   for (const response of [null, {}, { emoticons: null }, { emoticons: 'unavailable' }]) {
-    await assert.rejects(defaultGetEmoticons({
+    const data = await defaultGetEmoticons({
       steamUser: { getEmoticonList: async () => response }
-    }), /Incomplete Steam emoticon inventory/);
+    });
+    assert.deepEqual(data.failedCategories, ['emoticons']);
   }
   for (const response of [null, {}, undefined]) {
-    await assert.rejects(defaultGetEmoticons({
+    const data = await defaultGetEmoticons({
       steamUser: { steamID: '76561198000000001' },
       steamCommunity: { getUserInventoryContents: async () => response }
-    }), /Incomplete Steam community inventory/);
+    });
+    assert.deepEqual(data.failedCategories, ['stickers', 'effects']);
   }
 });
 
@@ -275,28 +303,32 @@ for (const paginated of [false, true]) {
     assert.equal(raw.at(-1)!.name, undefined);
     assert.equal(raw.at(-1)!.tags, undefined);
     pages.length = 0;
-    await assert.rejects(defaultGetEmoticons({
+    const data = await defaultGetEmoticons({
       steamUser: { steamID: '76561198000000001' }, steamCommunity: community
-    }), /Incomplete Steam community inventory/);
+    });
+    assert.deepEqual(data.failedCategories?.sort(), ['effects', 'stickers']);
     assert.deepEqual(pages, paginated ? [undefined, '10'] : [undefined]);
   });
 }
 
 test('malformed owned sticker data is reported instead of publishing a partial inventory', async () => {
-  await assert.rejects(defaultGetEmoticons({
+  const data = await defaultGetEmoticons({
     steamUser: { steamID: '76561198000000001' },
     steamCommunity: { getUserInventoryContents: async () => [{
       name: 'Malformed sticker',
       tags: [{ category: 'item_class', internal_name: 'item_class_11' }]
     }] }
-  }), /Unresolvable owned sticker inventory/);
+  });
+  assert.deepEqual(data.failedCategories, ['stickers']);
+  assert.deepEqual(data.effects, []);
 });
 
 test('owned inventory errors are reported rather than disguised as an empty inventory', async () => {
-  await assert.rejects(defaultGetEmoticons({
+  const data = await defaultGetEmoticons({
     steamUser: { steamID: '76561198000000001' },
     steamCommunity: { getUserInventoryContents: async () => { throw new Error('inventory unavailable'); } }
-  }), /inventory unavailable/);
+  });
+  assert.deepEqual(data.failedCategories, ['stickers', 'effects']);
 });
 
 test('previous snapshot aliases remain isolated between stickers and effects in the default helper', async (t: import('node:test').TestContext) => {
@@ -310,9 +342,10 @@ test('previous snapshot aliases remain isolated between stickers and effects in 
       steamCommunity: { getUserInventoryContents: async () => [owned] } };
     const own = itemClass === 11 ? 'stickers' : 'effects';
     const other = itemClass === 11 ? 'effects' : 'stickers';
-    await assert.rejects(defaultGetEmoticons({ ...input,
+    const failed = await defaultGetEmoticons({ ...input,
       previousInventory: { emoticons: [], stickers: [], effects: [], [other]: [material] }
-    }), /Incomplete sticker catalog/);
+    });
+    assert.deepEqual(failed.failedCategories, [own]);
     const data = await defaultGetEmoticons({ ...input,
       previousInventory: { emoticons: [], stickers: [], effects: [], [own]: [material] }
     });
