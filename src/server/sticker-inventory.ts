@@ -14,6 +14,8 @@ export type StickerInventoryOptions = {
   itemClass?: 11 | 12;
   /** Verified materials from the same account and item class's last complete snapshot. */
   previousInventory?: unknown[];
+  /** Receive a verified subset while retaining unresolved owned items in the caller's cache. */
+  onIncomplete?: (unresolved: number) => void;
 };
 
 type Definition = { name: string; title: string; aliases: string[] };
@@ -172,7 +174,7 @@ export async function resolveStickerAlias(type: string, options: StickerInventor
 export async function resolveStickerInventory(inventory: unknown[], options: StickerInventoryOptions = {}): Promise<InventorySticker[]> {
   // steamcommunity can successfully return CEconItems without joined descriptions.
   // Every asset must be classifiable before any can be excluded as a non-chat item.
-  if (inventory.some(item => !isRecord(item) || typeof item.name !== 'string' || !item.name.trim() ||
+  if (inventory.some(item => !isRecord(item) || typeof item.name !== 'string' ||
       !Array.isArray(item.tags) || !item.tags.some(tag => isRecord(tag) && tag.category === 'item_class' &&
         typeof tag.internal_name === 'string' && /^item_class_\d+$/.test(tag.internal_name)))) {
     throw new Error('Incomplete Steam community inventory');
@@ -188,7 +190,9 @@ export async function resolveStickerInventory(inventory: unknown[], options: Sti
     return [{ item, name, appid, hash: item.market_hash_name }];
   });
   if (!items.length) return [];
-  if (parsed.length !== items.length) throw new Error('Unresolvable owned sticker inventory');
+  let unresolved = items.length - parsed.length;
+  if (unresolved && !options.onIncomplete) throw new Error('Unresolvable owned sticker inventory');
+  if (!parsed.length) { options.onIncomplete?.(unresolved); return []; }
   const appids = [...new Set(parsed.filter(item => item.appid).map(item => item.appid))]
     .sort((a, b) => a - b);
   // Large inventories and unprefixed aliases use the bounded public catalog, not a truncated app list.
@@ -199,12 +203,12 @@ export async function resolveStickerInventory(inventory: unknown[], options: Sti
     // A stale directory may predate a newly owned reward. Never publish a partial
     // inventory while its refresh is in flight (or after an unsuccessful refresh).
     catalog = mergeCatalogs(previous, await getCatalog(catalogAppids, options, true));
-    if (parsed.some(({ hash }) => !catalog.get(hash))) throw new Error('Incomplete sticker catalog for owned inventory');
+    if (parsed.some(({ hash }) => !catalog.get(hash)) && !options.onIncomplete) throw new Error('Incomplete sticker catalog for owned inventory');
   }
   const owned = new Map<string, InventorySticker>();
   for (const { item, name: bareName, hash } of parsed) {
     const definition = catalog.get(hash);
-    if (!definition) throw new Error('Unresolvable owned sticker inventory');
+    if (!definition) { unresolved++; continue; }
     const name = definition.name;
     const aliases = [...new Set([hash, bareName, ...definition.aliases])]
       .filter(alias => alias !== name && catalog.get(alias)?.name === name);
@@ -217,5 +221,6 @@ export async function resolveStickerInventory(inventory: unknown[], options: Sti
       aliases: [...new Set([...(previous?.aliases ?? []), ...aliases])]
     });
   }
+  if (unresolved) options.onIncomplete?.(unresolved);
   return [...owned.values()];
 }

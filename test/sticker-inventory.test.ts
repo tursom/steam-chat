@@ -129,6 +129,16 @@ test('unprefixed inventory uses authoritative global aliases', async () => {
   assert.deepEqual(result.map(sticker => sticker.name), ['Cat talking']);
 });
 
+test('opt-in partial inventory exposes verified items without inventing blank or retired protocol names', async () => {
+  let unresolved = 0;
+  const result = await resolveStickerInventory([
+    item(), { ...item(''), name: '' }, item('2271980-a5_love')
+  ], { fetchImpl: async () => response([talking]), onIncomplete: count => { unresolved = count; } });
+  assert.equal(unresolved, 2);
+  assert.deepEqual(result.map(value => value.name), ['Cat talking']);
+  assert.ok(result.every(value => !value.aliases.includes('2271980-a5_love')));
+});
+
 test('all owned appids, including bare titles, are queried in sorted order', async () => {
   await resolveStickerInventory([item(), item('1203420-Show Love'), item('2022180-Unhappy')], {
     fetchImpl: async input => {
@@ -513,10 +523,15 @@ test('snapshot conflicts with current definitions or other snapshot aliases fail
 
 test('unclassifiable assets fail before catalog lookup, including mixed complete and incomplete ownership', async () => {
   const fetchImpl: typeof fetch = async () => { throw new Error('must not fetch'); };
-  for (const bad of [null, { ...item(), name: undefined }, { ...item(), name: '' }, { ...item(), tags: undefined },
+  for (const bad of [null, { ...item(), name: undefined as string | undefined }, { ...item(), tags: undefined },
     { ...item(), tags: [] }, { ...item(), tags: [{ category: 'item_class' }] }]) {
     for (const inventory of [[bad], [item(), bad]]) {
       await assert.rejects(resolveStickerInventory(inventory, { fetchImpl }), /Incomplete Steam community inventory/);
     }
   }
+});
+
+test('an empty display name does not block a fully classified and resolvable owned reward', async () => {
+  const result = await resolveStickerInventory([{ ...item(), name: '' }], { fetchImpl: async () => response([talking]) });
+  assert.deepEqual(result.map(value => value.name), ['Cat talking']);
 });

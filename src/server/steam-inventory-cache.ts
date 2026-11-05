@@ -9,6 +9,8 @@ export type SteamInventory = {
   emoticons: unknown[]; stickers: unknown[]; effects: unknown[]; complete?: boolean;
   /** Failed loader arrays are ignored; the cache retains saved materials for these categories. */
   failedCategories?: SteamInventoryCategory[];
+  /** Resolver-validated subsets merge by name, retaining saved materials missing from the subset. */
+  partialCategories?: SteamInventoryCategory[];
 };
 type FetchInventory = (previousInventory: SteamInventory | undefined) => Promise<SteamInventory>;
 type Snapshot = SteamInventory & { updatedAt: number };
@@ -42,13 +44,13 @@ function diagnosticCode(error: unknown): string {
 }
 
 // Persist only display/protocol fields. SDK objects may carry credentials or huge descriptions.
-function materials(value: unknown): unknown[] {
+function materials(value: unknown): Array<{ name: string; [key: string]: unknown }> {
   if (!Array.isArray(value)) throw unavailable('Incomplete Steam inventory', 'INCOMPLETE');
   return value.map(item => {
     if (!isRecord(item) || typeof item.name !== 'string' || !item.name || item.name.length > 2048) {
       throw unavailable('Invalid Steam inventory material', 'INVALID_MATERIAL');
     }
-    const result: Record<string, unknown> = { name: item.name };
+    const result: { name: string; [key: string]: unknown } = { name: item.name };
     for (const key of ['title', 'imageUrl']) {
       if (typeof item[key] === 'string' && item[key].length <= 8192) result[key] = item[key];
     }
@@ -62,15 +64,25 @@ function materials(value: unknown): unknown[] {
 function inventory(value: unknown, refresh?: { previous?: SteamInventory }): SteamInventory {
   if (!isRecord(value) || value.complete === false) throw unavailable('Incomplete Steam inventory', 'INCOMPLETE');
   const reportedFailures = value.failedCategories === undefined ? [] : value.failedCategories;
-  if (!Array.isArray(reportedFailures) || reportedFailures.some(category => !categories.includes(category))) {
+  const reportedPartials = value.partialCategories === undefined ? [] : value.partialCategories;
+  if (!Array.isArray(reportedFailures) || reportedFailures.some(category => !categories.includes(category)) ||
+      !Array.isArray(reportedPartials) || reportedPartials.some(category => !categories.includes(category)) ||
+      reportedPartials.some(category => reportedFailures.includes(category))) {
     throw unavailable('Invalid Steam inventory failure metadata', 'INCOMPLETE');
   }
-  const failedCategories = categories.filter(category => reportedFailures.includes(category));
+  const failedCategories = categories.filter(category => reportedFailures.includes(category) || reportedPartials.includes(category));
   const result = {} as SteamInventory;
   for (const category of categories) {
     // Failed loader arrays are untrusted. Disk snapshots already contain the retained materials.
-    result[category] = materials(refresh && failedCategories.includes(category)
+    const incoming = materials(refresh && reportedFailures.includes(category)
       ? refresh.previous?.[category] ?? [] : value[category]);
+    if (refresh && reportedPartials.includes(category)) {
+      const merged = new Map(materials(refresh.previous?.[category] ?? []).map(item => [item.name, item]));
+      for (const item of incoming) merged.set(item.name, item);
+      result[category] = [...merged.values()];
+    } else {
+      result[category] = incoming;
+    }
   }
   if (failedCategories.length) result.failedCategories = failedCategories;
   return result;
@@ -127,7 +139,8 @@ export class SteamInventoryCache {
         const result = await Promise.race([Promise.resolve().then(() => fetchInventory(previousInventory)), timeout, cancelled]);
         stage = 'validate';
         const data = inventory(result, { previous: entry.snapshot });
-        if (data.failedCategories?.length === categories.length && !entry.snapshot) {
+        if (data.failedCategories?.length === categories.length && !entry.snapshot &&
+            !categories.some(category => data[category].length > 0)) {
           throw unavailable('Steam inventory unavailable: all categories failed', 'ALL_CATEGORIES_FAILED');
         }
         if (this.closed) throw unavailable('Steam inventory cache stopped', 'STOPPED');
@@ -148,7 +161,7 @@ export class SteamInventoryCache {
         entry.error = undefined;
         entry.retryAt = data.failedCategories?.length ? snapshot.updatedAt + (this.options.retryMs ?? 30_000) : 0;
         if (data.failedCategories?.length) {
-          this.options.logger?.warn?.(`Steam inventory refresh incomplete [stage=partial failedCategories=${data.failedCategories.join(',')}]; keeping saved materials for failed categories`, { account });
+          this.options.logger?.warn?.(`Steam inventory refresh incomplete [stage=partial failedCategories=${data.failedCategories.join(',')}]; retaining saved materials for incomplete categories`, { account });
         }
       } catch (error) {
         entry.error = error;

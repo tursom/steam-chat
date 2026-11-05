@@ -108,6 +108,7 @@ type EmoticonPayload = {
   effects?: unknown[];
   complete?: boolean;
   failedCategories?: ('emoticons' | 'stickers' | 'effects')[];
+  partialCategories?: ('emoticons' | 'stickers' | 'effects')[];
 };
 
 type GetEmoticonsOptions = {
@@ -2320,7 +2321,11 @@ async function defaultGetEmoticons({ steamUser, steamCommunity, waitForLogin, wa
     await Promise.all((['stickers', 'effects'] as const).map(async category => {
       try {
         result[category] = await resolveStickerInventory(inventory, {
-          itemClass: category === 'stickers' ? 11 : 12, previousInventory: previousInventory?.[category]
+          itemClass: category === 'stickers' ? 11 : 12, previousInventory: previousInventory?.[category],
+          onIncomplete: unresolved => {
+            (result.partialCategories ??= []).push(category);
+            logger?.warn?.(`Steam inventory ${category} has unresolved items [count=${unresolved}]; retaining known materials`);
+          }
         });
       } catch (error) { fail([category], error); }
     }));

@@ -211,6 +211,107 @@ test('partial cold snapshots survive restart, retry at 30s, and merge changing f
   assert.deepEqual(await f.cache().get(A, loader), updated);
 });
 
+for (const category of categories) {
+  test(`validated partial ${category} merge by name, survive restart, and allow complete recovery removals`, async t => {
+    const f = await fixture(t);
+    const cache = f.cache();
+    const saved = { ...empty, [category]: [{ name: 'unresolved-old' }, { name: 'known', title: 'Old' }] };
+    await cache.get(A, async () => saved);
+    f.advance(600_000);
+    const loader = async (): Promise<SteamInventory> => ({ ...empty, partialCategories: [category, category],
+      [category]: [{ name: 'known', title: 'Updated', cookie: 'secret' }, { name: 'new', aliases: ['new-hash'] }] });
+    await cache.get(A, loader);
+    await until(async () => !(await cache.get(A, loader)).cache.refreshing);
+    const updated = await cache.get(A, loader);
+    const expected = [{ name: 'unresolved-old' }, { name: 'known', title: 'Updated' }, { name: 'new', aliases: ['new-hash'] }];
+    assert.deepEqual(updated[category], expected);
+    assert.deepEqual(updated.cache, { updatedAt: f.now(), refreshing: false, stale: true,
+      retryAt: f.now() + 30_000, failedCategories: [category] });
+    const disk = JSON.parse(await readFile(join(f.dir, `${A}.json`), 'utf8'));
+    assert.equal(disk.version, 1);
+    assert.deepEqual(disk[category], expected);
+    assert.deepEqual(disk.failedCategories, [category]);
+    assert.equal(disk.partialCategories, undefined);
+    assert.doesNotMatch(JSON.stringify(disk), /cookie|secret/);
+    await cache.close();
+    const restarted = f.cache();
+    const never = async (): Promise<SteamInventory> => { throw new Error('must respect cooldown'); };
+    assert.deepEqual(await restarted.get(A, never), updated);
+    f.advance(29_999);
+    assert.deepEqual(await restarted.get(A, never), updated);
+    f.advance(1);
+    const recovered = { ...empty, [category]: [{ name: 'new' }] };
+    const recover = async (previous: SteamInventory | undefined) => {
+      assert.deepEqual(previous?.[category], expected);
+      assert.deepEqual(previous?.failedCategories, [category]);
+      assert.equal(previous?.partialCategories, undefined);
+      return recovered;
+    };
+    await restarted.get(A, recover);
+    await until(async () => !(await restarted.get(A, recover)).cache.refreshing);
+    const result = await restarted.get(A, recover);
+    assert.deepEqual(result[category], recovered[category]);
+    assert.equal(result.cache.stale, false);
+    assert.equal(result.cache.retryAt, 0);
+    assert.equal(result.cache.failedCategories, undefined);
+    const completeDisk = JSON.parse(await readFile(join(f.dir, `${A}.json`), 'utf8'));
+    assert.equal(completeDisk.failedCategories, undefined);
+    assert.equal(completeDisk.partialCategories, undefined);
+    assert.deepEqual((await f.cache().get(A, never))[category], recovered[category]);
+  });
+}
+
+test('cold known subsets persist with failed categories ignored even when every category is incomplete', async t => {
+  const f = await fixture(t);
+  const cache = f.cache();
+  const result = await cache.get(A, async () => ({
+    emoticons: [{ raw: 'untrusted' }], stickers: [{ name: 'known' }], effects: [{ name: 'ignored' }],
+    failedCategories: ['effects', 'emoticons'], partialCategories: ['stickers']
+  }));
+  assert.deepEqual(result.emoticons, []);
+  assert.deepEqual(result.stickers, [{ name: 'known' }]);
+  assert.deepEqual(result.effects, []);
+  assert.deepEqual(result.cache.failedCategories, categories);
+  assert.equal(result.cache.stale, true);
+  assert.equal(result.cache.retryAt, f.now() + 30_000);
+  const disk = JSON.parse(await readFile(join(f.dir, `${A}.json`), 'utf8'));
+  assert.deepEqual(disk.stickers, [{ name: 'known' }]);
+  assert.deepEqual(disk.failedCategories, categories);
+  assert.equal(disk.partialCategories, undefined);
+  assert.doesNotMatch(JSON.stringify(disk), /untrusted|ignored/);
+  assert.deepEqual(await f.cache().get(A, async () => { throw new Error('must not fetch'); }), result);
+});
+
+test('invalid partial subsets and metadata cannot overwrite any saved materials', async t => {
+  const f = await fixture(t);
+  const cache = f.cache();
+  await cache.get(A, async () => items('saved'));
+  const original = await readFile(join(f.dir, `${A}.json`), 'utf8');
+  const invalid: unknown[] = [
+    { ...empty, partialCategories: ['stickers'], stickers: [{ name: 'valid-new' }, { market_hash_name: 'raw' }] },
+    { ...empty, partialCategories: ['stickers'], stickers: [{ name: '' }] },
+    { ...empty, partialCategories: ['stickers'], stickers: null },
+    { ...empty, partialCategories: ['unknown'] },
+    { ...empty, partialCategories: 'stickers' },
+    { ...empty, partialCategories: null },
+    { ...items('new'), partialCategories: ['stickers'], failedCategories: ['stickers'] }
+  ];
+  for (const payload of invalid) {
+    f.advance(600_000);
+    const loader = async () => payload as SteamInventory;
+    await cache.get(A, loader);
+    await until(async () => !(await cache.get(A, loader)).cache.refreshing);
+    const result = await cache.get(A, loader);
+    for (const category of categories) assert.deepEqual(result[category], items('saved')[category]);
+    assert.equal(result.cache.stale, true);
+    assert.equal(result.cache.retryAt, f.now() + 30_000);
+    assert.equal(await readFile(join(f.dir, `${A}.json`), 'utf8'), original);
+  }
+  const cold = f.cache();
+  await assert.rejects(cold.get(B, async () => invalid[0] as SteamInventory), { code: 'INVALID_MATERIAL' });
+  assert.deepEqual(await readdir(f.dir), [`${A}.json`]);
+});
+
 test('old version 1 complete snapshots load without failure metadata or refresh', async t => {
   const f = await fixture(t);
   await writeFile(join(f.dir, `${A}.json`), JSON.stringify({ version: 1, account: A, updatedAt: f.now(), ...items('legacy') }));

@@ -1202,11 +1202,12 @@ test('partial inventory refresh updates healthy categories and retains failed br
   const loading = api.loadChatInventory(); pending[0].resolve(savedInventory); await loading;
   advance(10 * 60_000 + 1);
   const refresh = api.loadChatInventory();
-  pending[1].resolve({ emoticons: [{ name: ':new:' }], stickers: [], effects: [],
+  pending[1].resolve({ emoticons: [{ name: ':new:' }], stickers: [{ name: 'New Heart' }], effects: [],
     cache: { stale: true, failedCategories: ['stickers'] } });
   await refresh;
   assert.equal(api.state.emoticons[0].name, ':new:');
   assert.equal(api.state.stickers[0].name, 'Heart');
+  assert.equal(api.state.stickers[1].name, 'New Heart', 'verified partial additions remain usable alongside cached items');
   assert.equal(api.state.effects.length, 0, 'a successful empty category still removes old ownership');
   advance(2001);
   const recovered = api.loadChatInventory();

@@ -2754,8 +2754,10 @@ async function loadChatInventory() {
         if (category === 'emoticons' || category === 'stickers' || category === 'effects') inventoryFailedCategories.add(category);
       }
       for (const category of ['emoticons', 'stickers', 'effects'] as const) {
-        if (Array.isArray(inventory[category]) && (!inventoryFailedCategories.has(category) || !state[category].length)) {
-          state[category] = asInventory(inventory[category]);
+        if (Array.isArray(inventory[category])) {
+          const incoming = asInventory(inventory[category]);
+          state[category] = inventoryFailedCategories.has(category)
+            ? [...new Map([...state[category], ...incoming].map(item => [item.name, item])).values()] : incoming;
         }
       }
       const refreshing = cache.refreshing === true || cache.stale === true;

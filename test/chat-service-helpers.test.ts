@@ -311,7 +311,7 @@ for (const paginated of [false, true]) {
   });
 }
 
-test('malformed owned sticker data is reported instead of publishing a partial inventory', async () => {
+test('unresolvable owned sticker metadata is explicitly reported as partial', async () => {
   const data = await defaultGetEmoticons({
     steamUser: { steamID: '76561198000000001' },
     steamCommunity: { getUserInventoryContents: async () => [{
@@ -319,8 +319,33 @@ test('malformed owned sticker data is reported instead of publishing a partial i
       tags: [{ category: 'item_class', internal_name: 'item_class_11' }]
     }] }
   });
-  assert.deepEqual(data.failedCategories, ['stickers']);
+  assert.deepEqual(data.partialCategories, ['stickers']);
   assert.deepEqual(data.effects, []);
+});
+
+test('real SDK blank descriptions and retired catalog entries preserve the usable sticker subset', async (t: import('node:test').TestContext) => {
+  mockStickerCatalog(t);
+  const SteamCommunity = require('steamcommunity');
+  const community = new SteamCommunity();
+  community.httpRequest = (_options: unknown, callback: (error: unknown, response: unknown, body: unknown) => void) => {
+    queueMicrotask(() => callback(null, {}, { success: 1, total_inventory_count: 3,
+      assets: ['1', '2', '3'].map(classid => ({ assetid: classid, appid: 753, classid, instanceid: '0', amount: '1' })),
+      descriptions: [
+        { classid: '1', name: 'Show Love', market_hash_name: '1203420-Show Love' },
+        { classid: '2', name: '', market_hash_name: '', market_name: '' },
+        { classid: '3', name: 'Retired reward', market_hash_name: '2271980-a5_love' }
+      ].map(item => ({ ...item, instanceid: '0', tags: [{ category: 'item_class', internal_name: 'item_class_11' }] }))
+    }));
+  };
+  const data = await defaultGetEmoticons({
+    steamUser: { steamID: '76561198000000001', getEmoticonList: async () => ({ emoticons: [{ name: ':wave:' }] }) },
+    steamCommunity: community
+  });
+  assert.deepEqual(data.emoticons, [{ name: ':wave:' }]);
+  assert.deepEqual(data.stickers.map((item: { name: string }) => item.name), ['show love']);
+  assert.deepEqual(data.effects, []);
+  assert.deepEqual(data.partialCategories, ['stickers']);
+  assert.equal(data.failedCategories, undefined);
 });
 
 test('owned inventory errors are reported rather than disguised as an empty inventory', async () => {
@@ -345,7 +370,7 @@ test('previous snapshot aliases remain isolated between stickers and effects in 
     const failed = await defaultGetEmoticons({ ...input,
       previousInventory: { emoticons: [], stickers: [], effects: [], [other]: [material] }
     });
-    assert.deepEqual(failed.failedCategories, [own]);
+    assert.deepEqual(failed.partialCategories, [own]);
     const data = await defaultGetEmoticons({ ...input,
       previousInventory: { emoticons: [], stickers: [], effects: [], [own]: [material] }
     });
