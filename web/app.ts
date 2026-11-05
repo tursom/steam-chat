@@ -139,7 +139,7 @@ type OpenGraphPreview = {
   description: string;
 };
 
-const supportedBbcodeTags = ['og', 'url', 'img', 'video', 'emoticon', 'sticker', 'roomeffect'] as const;
+const supportedBbcodeTags = ['og', 'url', 'img', 'video', 'youtube', 'emoticon', 'sticker', 'roomeffect'] as const;
 type SupportedBbcodeTag = (typeof supportedBbcodeTags)[number];
 const supportedBbcodeTagSet = new Set<string>(supportedBbcodeTags);
 const supportedBbcodePattern = new RegExp(`\\[(${supportedBbcodeTags.join('|')})(?=[\\s=\\]])`, 'gi');
@@ -3903,7 +3903,8 @@ function appendMessageText(container: HTMLElement, text: string) {
     const attributes = text.slice(start + tag.length + 1, openEnd);
     const body = text.slice(openEnd + 1, closeStart);
     if (!appendSupportedBbcode(container, tag, attributes, body)) {
-      appendInlineMessageText(container, text.slice(start, blockEnd));
+      if (tag === 'youtube') container.append(document.createTextNode(text.slice(start, blockEnd)));
+      else appendInlineMessageText(container, text.slice(start, blockEnd));
     }
     lastIndex = blockEnd;
   }
@@ -3997,6 +3998,15 @@ function appendSupportedBbcode(
     const source = parseSteamVideoSource(attributes, body);
     if (!source) return false;
     container.append(steamVideoNode(source));
+    return true;
+  }
+
+  if (tag === 'youtube') {
+    const video = parseYoutubeBbcode(attributes, body);
+    if (!video) return false;
+    const player = youtubePlayer(video.url);
+    if (!player) return false;
+    container.append(player);
     return true;
   }
 
@@ -4407,8 +4417,86 @@ function bilibiliPlayer(url: string): HTMLElement | null {
   return shell;
 }
 
+type YoutubeVideo = { id: string; start: number; url: string };
+
+function youtubeVideo(value: string): YoutubeVideo | null {
+  try {
+    const url = new URL(value);
+    if (!['https:', 'http:'].includes(url.protocol) || url.username || url.password || url.port) return null;
+    let id = '';
+    if (['youtu.be', 'www.youtu.be'].includes(url.hostname)) id = /^\/([A-Za-z0-9_-]{11})\/?$/.exec(url.pathname)?.[1] || '';
+    else if (['youtube.com', 'www.youtube.com', 'm.youtube.com', 'music.youtube.com'].includes(url.hostname)) {
+      if (/^\/watch\/?$/.test(url.pathname) && url.searchParams.getAll('v').length === 1) id = url.searchParams.get('v') || '';
+      else id = /^\/(?:shorts|live|embed)\/([A-Za-z0-9_-]{11})\/?$/.exec(url.pathname)?.[1] || '';
+    } else if (['youtube-nocookie.com', 'www.youtube-nocookie.com'].includes(url.hostname)) {
+      id = /^\/embed\/([A-Za-z0-9_-]{11})\/?$/.exec(url.pathname)?.[1] || '';
+    }
+    if (!/^[A-Za-z0-9_-]{11}$/.test(id)) return null;
+    const time = url.searchParams.get('start') || url.searchParams.get('t') || new URLSearchParams(url.hash.slice(1)).get('t') || '';
+    const units = /^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$/.exec(time);
+    const seconds = /^\d+$/.test(time) ? Number(time) : units && time ? Number(units[1] || 0) * 3600 + Number(units[2] || 0) * 60 + Number(units[3] || 0) : 0;
+    return { id, start: Number.isSafeInteger(seconds) && seconds >= 0 && seconds <= 2147483647 ? seconds : 0, url: url.href };
+  } catch { return null; }
+}
+
+function parseYoutubeBbcode(attributes: string, body: string): YoutubeVideo | null {
+  const source = attributes.trim();
+  const values = parseBbcodeAttributes(source.startsWith('=') ? `url${source}` : source, new Set(['url', 'v']));
+  if (!values || values.v !== undefined && !/^[A-Za-z0-9_-]{11}$/.test(values.v)) return null;
+  const parse = (value: string) => youtubeVideo(/^[A-Za-z0-9_-]{11}$/.test(value) ? `https://www.youtube.com/watch?v=${value}` : value);
+  const sourceVideo = values.url === undefined ? null : parse(values.url);
+  if (values.url !== undefined && !sourceVideo) return null;
+  let video = sourceVideo || (values.v ? parse(values.v) : null);
+  let content = body.trim();
+  if (/^\[url(?=[=\]])/i.test(content)) {
+    const end = findBbcodeTagEnd(content, 4);
+    const close = content.toLowerCase().indexOf('[/url]', end + 1);
+    if (end < 0 || close < 0) return null;
+    const target = parseUrlTarget(content.slice(4, end), content.slice(end + 1, close));
+    if (!target || !bbcodeLinkMatchesSource(content, target)) return null;
+    content = target;
+  }
+  if (content) {
+    const target = parse(content);
+    if (!target || video && video.id !== target.id) return null;
+    video ||= target;
+  }
+  if (!video || values.v && values.v !== video.id) return null;
+  return video;
+}
+
+function youtubePlayer(url: string): HTMLElement | null {
+  const video = youtubeVideo(url);
+  if (!video) return null;
+  const shell = create('div', 'youtube-player');
+  const button = create('button', 'ghost-btn', '▶ 播放 YouTube 视频'); button.type = 'button';
+  const original = externalLink('youtube-original', video.url, '打开原视频');
+  const note = create('p', 'muted', '通过 YouTube 官方播放器播放；若无法播放，请打开原视频。');
+  note.setAttribute('role', 'status');
+  button.addEventListener('click', () => {
+    if (shell.querySelector('iframe')) return;
+    const frame = create('iframe');
+    const params = new URLSearchParams({ autoplay: '0', playsinline: '1' });
+    if (video.start) params.set('start', String(video.start));
+    frame.src = `https://www.youtube-nocookie.com/embed/${video.id}?${params}`;
+    frame.title = 'YouTube 视频播放器'; frame.allowFullscreen = true;
+    frame.setAttribute('allow', 'encrypted-media; fullscreen; picture-in-picture; presentation');
+    frame.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-presentation allow-popups allow-popups-to-escape-sandbox');
+    // YouTube requires a referring origin to identify embedded players (error 153).
+    frame.referrerPolicy = 'strict-origin-when-cross-origin';
+    frame.addEventListener('error', () => { note.textContent = '播放器加载失败，请打开原视频。'; });
+    const close = create('button', 'ghost-btn', '关闭播放器'); close.type = 'button';
+    close.addEventListener('click', () => { frame.remove(); close.remove(); button.hidden = false; });
+    button.hidden = true;
+    note.textContent = '若视频需要登录或不允许嵌入播放，请打开原视频。';
+    shell.append(frame, close);
+  });
+  shell.append(button, original, note);
+  return shell;
+}
+
 function externalMediaPlayer(url: string): HTMLElement | null {
-  return neteasePlayer(url) || bilibiliPlayer(url);
+  return neteasePlayer(url) || bilibiliPlayer(url) || youtubePlayer(url);
 }
 
 function openGraphNode(preview: OpenGraphPreview) {

@@ -237,6 +237,7 @@ function loadWebTestApi(): WebTestApi & {
     location: { protocol: 'http:', host: 'localhost' },
     Node: FakeElement,
     URL,
+    URLSearchParams,
     Headers,
     FormData,
     Date,
@@ -325,6 +326,78 @@ test('Bilibili full video and share links have one click-to-load player in plain
     'https://www.bilibili.com/video/BVbad', 'https://www.bilibili.com/video/av170001?p=-1', 'https://b23.tv/foo/bar',
     'https://b23.tv.evil.test/AbC123', 'https://user:pass@www.bilibili.com/video/av170001']) {
     assert.equal(renderMessage({ id: 'peer', message: url }).findByClass('bilibili-player'), null, url);
+  }
+});
+
+test('Steam YouTube BBCode, including default URL plus v metadata, renders one video card', () => {
+  const { renderMessage } = loadWebTestApi();
+  const id = '_mLzFeqWePo';
+  const url = `https://www.youtube.com/watch?v=${id}`;
+  for (const message of [
+    `[youtube=${url} v=${id}]${url}[/youtube]`,
+    `[youtube="${url}" v="${id}"]${url}[/youtube]`,
+    `[YOUTUBE='${url}' V='${id}'][url=${url}]${url}[/url][/YOUTUBE]`,
+    `[youtube=${url}]${url}[/youtube]`, `[youtube]${url}[/youtube]`,
+    `[youtube v=${id}][/youtube]`, `[youtube=${id}]${id}[/youtube]`
+  ]) {
+    const row = renderMessage({ id: 'peer', message });
+    assert.equal(row.findAllByClass('youtube-player').length, 1, message);
+    assert.equal(row.findByClass('youtube-original')!.href, url);
+    assert.equal(row.findByTag('iframe'), null);
+    assert.doesNotMatch(row.textContent, /\[\/?youtube|\[\/?url/i);
+  }
+});
+
+test('YouTube watch, short, Shorts, live and embed links work in plain text, URL BBCode and previews', () => {
+  const { renderMessage } = loadWebTestApi();
+  const id = '_mLzFeqWePo';
+  for (const url of [`https://www.youtube.com/watch?v=${id}`, `https://m.youtube.com/watch?v=${id}`,
+    `https://music.youtube.com/watch?v=${id}`, `https://youtu.be/${id}?t=90`,
+    `https://www.youtube.com/shorts/${id}`, `https://www.youtube.com/live/${id}`,
+    `https://www.youtube.com/embed/${id}`, `https://www.youtube-nocookie.com/embed/${id}`]) {
+    for (const message of [url, `[url=${url}]视频[/url]`, `[og url="${url}" title="视频"]${url}[/og]`]) {
+      const row = renderMessage({ id: 'peer', message });
+      assert.equal(row.findAllByClass('youtube-player').length, 1, message);
+      assert.equal(row.findByTag('iframe'), null);
+      assert.equal(row.findByClass('youtube-original')!.href, url);
+    }
+  }
+});
+
+test('YouTube players load only on click, preserve start time and can close and reopen', async () => {
+  const { renderMessage } = loadWebTestApi();
+  for (const [time, seconds] of [['90', 90], ['1h2m3s', 3723], ['0', 0], ['bad', 0]] as const) {
+    const row = renderMessage({ id: 'peer', message: `https://youtu.be/_mLzFeqWePo?t=${time}` });
+    const player = row.findByClass('youtube-player')!;
+    const play = player.findByTag('button')!;
+    assert.equal(player.findByTag('iframe'), null);
+    await play.dispatch('click');
+    const frame = player.findByTag('iframe')!;
+    assert.equal(frame.src, `https://www.youtube-nocookie.com/embed/_mLzFeqWePo?autoplay=0&playsinline=1${seconds ? `&start=${seconds}` : ''}`);
+    assert.equal((frame as unknown as { referrerPolicy: string }).referrerPolicy, 'strict-origin-when-cross-origin');
+    assert.match(frame.attributes.sandbox, /allow-presentation/);
+    await play.dispatch('click'); assert.equal(player.findAllByTag('iframe').length, 1);
+    await player.findAllByTag('button').find(button => button.textContent === '关闭播放器')!.dispatch('click');
+    assert.equal(player.findByTag('iframe'), null); assert.equal(play.hidden, false);
+    await play.dispatch('click'); assert.equal(player.findAllByTag('iframe').length, 1);
+  }
+});
+
+test('YouTube detection rejects other hosts, malformed IDs and conflicting BBCode metadata', () => {
+  const { renderMessage } = loadWebTestApi();
+  const url = 'https://www.youtube.com/watch?v=_mLzFeqWePo';
+  for (const message of ['https://www.youtube.com.evil.test/watch?v=_mLzFeqWePo',
+    'https://user:pass@www.youtube.com/watch?v=_mLzFeqWePo', 'https://www.youtube.com:8443/watch?v=_mLzFeqWePo',
+    'https://www.youtube.com/watch?v=short', 'https://www.youtube.com/watch?v=_mLzFeqWePo&v=dQw4w9WgXcQ',
+    'https://youtu.be/_mLzFeqWePo/more', 'https://www.youtube.com/playlist?list=PL123',
+    `[youtube=${url} v=dQw4w9WgXcQ]${url}[/youtube]`,
+    `[youtube=${url}]https://youtu.be/dQw4w9WgXcQ[/youtube]`,
+    `[youtube=${url} onload=alert(1)]${url}[/youtube]`,
+    '[youtube=javascript:alert(1)]bad[/youtube]']) {
+    const row = renderMessage({ id: 'peer', message });
+    assert.equal(row.findByClass('youtube-player'), null, message);
+    assert.equal(row.findByTag('iframe'), null);
+    assert.ok(row.textContent.includes(message), message);
   }
 });
 

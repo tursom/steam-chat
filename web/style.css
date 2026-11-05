@@ -522,12 +522,12 @@ html.video-web-fullscreen, html.video-web-fullscreen body { overflow: hidden; }
 .steam-video-link, .steam-video-status { margin: 0; font-size: 12px; overflow-wrap: anywhere; }
 .netease-player { display: grid; gap: 8px; padding: 10px; min-width: 0; width: min(100%, 420px); white-space: normal; }
 .netease-player iframe { display: block; width: 100%; height: 86px; border: 0; }
-.netease-player p, .bilibili-player p, .bilibili-original { font-size: 12px; margin: 0; overflow-wrap: anywhere; }
-.netease-player button, .bilibili-player button { justify-self: start; }
-.bilibili-player { display: grid; grid-template-columns: minmax(0, 1fr); width: min(560px, 100%); min-width: 0; gap: 8px; padding: 10px; white-space: normal; }
-.bilibili-player iframe { width: 100%; aspect-ratio: 16 / 9; border: 0; border-radius: var(--radius); background: var(--media-bg); }
+.netease-player p, .bilibili-player p, .bilibili-original, .youtube-player p, .youtube-original { font-size: 12px; margin: 0; overflow-wrap: anywhere; }
+.netease-player button, .bilibili-player button, .youtube-player button { justify-self: start; }
+.bilibili-player, .youtube-player { display: grid; grid-template-columns: minmax(0, 1fr); width: min(560px, 100%); min-width: 0; gap: 8px; padding: 10px; white-space: normal; }
+.bilibili-player iframe, .youtube-player iframe { width: 100%; aspect-ratio: 16 / 9; border: 0; border-radius: var(--radius); background: var(--media-bg); }
 .msg-body:has(> .steam-video), .message-content:has(> .steam-video) { width: min(420px, 100%); }
-.msg-body:has(> .bilibili-player), .message-content:has(> .bilibili-player) { width: min(560px, 100%); }
+.msg-body:has(> .bilibili-player, > .youtube-player), .message-content:has(> .bilibili-player, > .youtube-player) { width: min(560px, 100%); }
 .message-reactions { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; max-width: 100%; padding: 0; }
 .message-reactions:empty { display: none; }
 .react, .reaction-chip { display: inline-flex; align-items: center; gap: 4px; min-height: 24px; padding: 1px 8px 1px 5px; border: 1px solid var(--line); border-radius: 999px; background: var(--panel); color: var(--text); font-size: 12px; font-weight: 600; }
