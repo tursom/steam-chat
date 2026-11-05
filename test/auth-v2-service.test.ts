@@ -49,7 +49,7 @@ async function fixture(t: TestContext, options: { storage?: HistoryStorage; wait
   const status = { status: 'online', steamId: ACCOUNT };
   const service = createChatService({ config: { host: '127.0.0.1', port: 0, wsPath: '/ws', wsHeartbeatMs: 0 },
     authStore: options.legacy ? undefined : store, sessionManager: options.legacy ? undefined : sessions,
-    logPath: join(dir, 'chat.jsonl'), imageEmoteDir: join(dir, 'emotes'),
+    logPath: join(dir, 'chat.jsonl'), imageEmoteDir: join(dir, 'emotes'), inventoryCacheDir: join(dir, 'inventory'),
     historyStorage: options.storage, waitForLogin: options.waiter,
     sendOperationOptions: { tickMs: 5 },
     steamUser, steamCommunity: options.community || { sendImageToUser(_id: unknown, _buffer: unknown, callback: (error: Error | null, result: string) => void) {

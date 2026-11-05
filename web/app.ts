@@ -466,6 +466,7 @@ function chatContext() {
 }
 
 function resetHistory() {
+  reactionPickerRefreshers.clear();
   document.querySelector('.room-effect-overlay')?.remove();
   for (const reader of pendingImageReaders) reader.abort();
   pendingImageReaders.clear();
@@ -487,6 +488,13 @@ function invalidateChat(purgePersistent = true) {
   clearChatCache(purgePersistent);
   inventoryTask = null;
   inventoryContext = '';
+  inventorySavedScope = '';
+  inventoryRefreshAt = 0;
+  if (inventoryRefreshTimer) clearTimeout(inventoryRefreshTimer);
+  inventoryRefreshTimer = null;
+  if (purgePersistent) {
+    try { localStorage.removeItem?.(inventoryStorageKey); } catch { /* Optional browser cache. */ }
+  }
   state.emoticons = []; state.stickers = []; state.effects = [];
   stopImageOperationPolling();
   resetDurableSync();
@@ -687,10 +695,12 @@ function updateSteamStatus(status: SteamStatus) {
   const wasOnline = steamOnline();
   const previousAccess = steamAccessAllowed();
   const previousGrant = JSON.stringify([state.steam.steamGrant, state.steam.accessRevision]);
-  const previousAccount = `${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}`;
+  const previousAccount = `${state.steam.activeAccount?.id || ''}|${state.steam.steamId || state.steam.activeAccount?.steamId || ''}`;
   state.steam = { ...defaultSteamStatus, ...status };
   if (steamOnline() || state.steam.status === 'waiting_qr') steamQrError = '';
-  const accountChanged = previousAccount !== `${state.steam.activeAccount?.id || ''}|${state.steam.steamId || ''}`;
+  // The live Steam ID may disappear during reconnect while the active account
+  // remains the same. That transition must not purge its persisted inventory.
+  const accountChanged = previousAccount !== `${state.steam.activeAccount?.id || ''}|${state.steam.steamId || state.steam.activeAccount?.steamId || ''}`;
   const grantChanged = previousGrant !== JSON.stringify([state.steam.steamGrant, state.steam.accessRevision]);
   if (accountChanged || !steamAccessAllowed() || grantChanged) {
     invalidateChat(previousAccount !== '|' || !steamAccessAllowed());
@@ -2674,22 +2684,96 @@ function updateChatAvailability() {
 
 let inventoryContext = '';
 let inventoryTask: Promise<void> | null = null;
+const inventoryStorageKey = 'steam-chat.inventory.v1';
+let inventorySavedScope = '';
+let inventoryRefreshAt = 0;
+let inventoryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+const inventoryFreshMs = 10 * 60 * 1000;
+
+function restoreChatInventory() {
+  const scope = cacheScope();
+  if (!scope || inventorySavedScope === scope) return;
+  if (inventorySavedScope) {
+    state.emoticons = []; state.stickers = []; state.effects = [];
+    inventoryContext = ''; inventoryRefreshAt = 0;
+  }
+  inventorySavedScope = scope;
+  try {
+    const saved: unknown = JSON.parse(localStorage.getItem(inventoryStorageKey) || 'null');
+    if (!isRecord(saved) || saved.version !== 1 || saved.scope !== scope || !isRecord(saved.inventory)) return;
+    const inventory = saved.inventory;
+    if (![inventory.emoticons, inventory.stickers, inventory.effects].every(Array.isArray)) return;
+    state.emoticons = asInventory(inventory.emoticons);
+    state.stickers = asInventory(inventory.stickers);
+    state.effects = asInventory(inventory.effects);
+  } catch { /* Corrupt, unavailable or private-mode storage falls back to the API. */ }
+}
+
+function saveChatInventory() {
+  const scope = cacheScope();
+  if (!scope) return;
+  // Only fields used to show and send picker items are needed in browser storage.
+  const entries = (items: InventoryItem[]) => items.map(({ name, title, imageUrl }) => ({ name, title, imageUrl }));
+  const saved = JSON.stringify({ version: 1, scope, inventory: {
+    emoticons: entries(state.emoticons), stickers: entries(state.stickers), effects: entries(state.effects)
+  } });
+  if (saved.length > 2 * 1024 * 1024) return;
+  try { localStorage.setItem(inventoryStorageKey, saved); } catch { /* Optional cache; in-memory data stays usable. */ }
+}
+
+function scheduleInventoryRefresh(context: string) {
+  if (inventoryRefreshTimer) clearTimeout(inventoryRefreshTimer);
+  inventoryRefreshTimer = setTimeout(() => {
+    inventoryRefreshTimer = null;
+    if (context !== chatContext() || !steamAccessAllowed()) return;
+    const picker = document.querySelector<HTMLElement>('#picker');
+    if ((picker && !picker.hidden) || document.querySelector('.reaction-picker')) void loadChatInventory();
+  }, Math.max(100, inventoryRefreshAt - Date.now()));
+}
+
 async function loadChatInventory() {
   const context = chatContext();
-  if (!steamOnline() || !steamAccessAllowed() || inventoryContext === context) return;
+  const scope = cacheScope();
+  if (!steamAccessAllowed()) return;
+  restoreChatInventory();
+  if (!steamOnline() || inventoryContext === context && Date.now() < inventoryRefreshAt) return;
   if (inventoryTask) return inventoryTask;
   const task = (async () => {
     try {
       const inventory = await api('/api/emoticons');
-      if (context !== chatContext() || !isRecord(inventory)) return;
-      state.emoticons = asInventory(inventory.emoticons); state.stickers = asInventory(inventory.stickers); state.effects = asInventory(inventory.effects);
+      if (context !== chatContext() || scope !== cacheScope() || !isRecord(inventory)) return;
+      if (!Array.isArray(inventory.emoticons) || !Array.isArray(inventory.stickers)
+        || inventory.effects !== undefined && !Array.isArray(inventory.effects)) throw new Error('素材列表不完整');
+      state.emoticons = asInventory(inventory.emoticons); state.stickers = asInventory(inventory.stickers);
+      if (Array.isArray(inventory.effects)) state.effects = asInventory(inventory.effects);
       inventoryContext = context;
+      const cache = isRecord(inventory.cache) ? inventory.cache : {};
+      const refreshing = cache.refreshing === true || cache.stale === true;
+      const now = Date.now();
+      const retryAt = typeof cache.retryAt === 'number' && Number.isFinite(cache.retryAt) ? Math.min(cache.retryAt, now + 60_000) : 0;
+      const updatedAt = typeof cache.updatedAt === 'number' && Number.isFinite(cache.updatedAt)
+        && cache.updatedAt > 0 && cache.updatedAt <= now ? cache.updatedAt : now;
+      inventoryRefreshAt = refreshing ? Math.max(now + 2000, retryAt) : Math.max(now + 1000, updatedAt + inventoryFreshMs);
+      inventorySavedScope = cacheScope();
+      saveChatInventory();
       const picker = document.querySelector<HTMLElement>('#picker');
       if (picker && !picker.hidden) renderPicker(picker);
-    } catch { /* Opening the picker again retries. */ }
+      refreshReactionPickerInventories();
+      scheduleInventoryRefresh(context);
+    } catch {
+      // Keep the last usable lists while a failed/slow refresh is retried.
+      if (context === chatContext() && scope === cacheScope()) {
+        inventoryContext = context;
+        inventoryRefreshAt = Date.now() + 30_000;
+        refreshReactionPickerInventories();
+        scheduleInventoryRefresh(context);
+      }
+    }
   })();
   inventoryTask = task;
-  try { await task; } finally { if (inventoryTask === task) inventoryTask = null; }
+  try { await task; } finally {
+    if (inventoryTask === task) { inventoryTask = null; refreshReactionPickerInventories(); }
+  }
 }
 
 async function refreshChatData(includeConversations = true) {
@@ -2732,9 +2816,6 @@ async function refreshChatData(includeConversations = true) {
       if (context !== chatContext() || request !== listRequest) return;
       state.friends = [];
       state.groups = [];
-      state.emoticons = [];
-      state.stickers = [];
-    state.effects = [];
     }
     if (document.querySelector('#chatLayout')) {
       updateChatLists();
@@ -3612,6 +3693,14 @@ let reactionGeneration = 0;
 let reactionLastLoad = 0;
 let reactionLoading = false;
 const reactionPending = new Set<string>();
+const reactionPickerRefreshers = new Map<HTMLElement, () => void>();
+
+function refreshReactionPickerInventories() {
+  for (const [picker, refresh] of reactionPickerRefreshers) {
+    if (!picker.isConnected) reactionPickerRefreshers.delete(picker);
+    else refresh();
+  }
+}
 
 function messageReactionKey(item: MessageItem) {
   const timestamp = Math.floor(Date.parse(item.sentAt || item.date || '') / 1000);
@@ -3621,6 +3710,7 @@ function messageReactionKey(item: MessageItem) {
 }
 
 function refreshReactionBars() {
+  refreshReactionPickerInventories();
   const nodes = document.querySelectorAll<HTMLElement>('#messages [data-event-id]');
   const items = new Map(historyItems.map(item => [item.eventId, item]));
   for (const node of Array.from(nodes)) {
@@ -3654,6 +3744,8 @@ async function loadReactionSnapshots(force = false) {
 }
 
 function renderReactionBar(bar: HTMLElement, item: MessageItem) {
+  const oldPicker = bar.querySelector<HTMLElement>('.reaction-picker');
+  if (oldPicker) reactionPickerRefreshers.delete(oldPicker);
   clear(bar);
   const key = messageReactionKey(item);
   if (!key || !reactionSnapshots.has(key) || isCommunityGroup(item.id)) return;
@@ -3663,7 +3755,7 @@ function renderReactionBar(bar: HTMLElement, item: MessageItem) {
   const reactorName = (id: string) => id === account ? '你' : state.friends.find(friend => friend.id === id)?.name || (id === item.id ? resolvedChatEntry({ id }).name : '') || id;
   const icon = (type: number, name: string) => type === 1 ? emoticonNode(name.replace(/^:|:$/g, '')) : stickerNode(name);
   const change = async (type: number, name: string, add: boolean) => {
-    if (!grantAtLeast('full') || reactionPending.has(key)) return;
+    if (!steamOnline() || !grantAtLeast('full') || reactionPending.has(key)) return;
     const context = chatContext();
     reactionGeneration++; reactionPending.add(key); renderReactionBar(bar, item);
     try {
@@ -3695,34 +3787,39 @@ function renderReactionBar(bar: HTMLElement, item: MessageItem) {
   }
   const add = create('button', 'reaction-add', '☺'); add.type = 'button'; add.disabled = !eligible;
   add.title = grantAtLeast('full') ? '添加表情回应' : '表情回应需要「完整」授权'; add.setAttribute('aria-label', '添加表情回应');
-  add.addEventListener('click', async () => {
-    const existing = bar.querySelector('.reaction-picker');
-    if (existing) { existing.remove(); return; }
+  add.addEventListener('click', () => {
+    const existing = bar.querySelector<HTMLElement>('.reaction-picker');
+    if (existing) { reactionPickerRefreshers.delete(existing); existing.remove(); return; }
     const context = chatContext();
     const picker = create('div', 'reaction-picker');
-    picker.append(create('p', 'muted', '正在加载表情…')); bar.append(picker);
-    add.disabled = true;
-    await loadChatInventory();
-    if (context !== chatContext() || !bar.isConnected || !picker.isConnected) return;
-    add.disabled = !grantAtLeast('full');
-    if (!grantAtLeast('full')) { picker.remove(); return; }
-    clear(picker);
-    const close = create('button', 'ghost-btn', '关闭'); close.type = 'button'; close.addEventListener('click', () => picker.remove());
-    picker.append(close);
-    const grid = create('div', 'picker-grid');
-    for (const [type, inventory] of [[1, state.emoticons], [2, state.stickers]] as const) {
-      for (const entry of inventory) {
-        const emoticon = normalizeEmoticonName(String(entry.name || ''));
-        const name = type === 1 ? (emoticon ? `:${emoticon}:` : '') : String(entry.name || '');
-        if (!name) continue;
-        const button = create('button'); button.type = 'button'; button.title = String(entry.title || name);
-        button.append(icon(type, name));
-        const mine = reactions.some(reaction => reaction.type === type && reaction.name === name && reaction.users.includes(account || ''));
-        button.addEventListener('click', () => void change(type, name, !mine)); grid.append(button);
+    const close = () => { reactionPickerRefreshers.delete(picker); picker.remove(); };
+    const refresh = () => {
+      if (context !== chatContext() || !bar.isConnected || !picker.isConnected || !grantAtLeast('full')) { close(); return; }
+      clear(picker);
+      const closeButton = create('button', 'ghost-btn', '关闭'); closeButton.type = 'button'; closeButton.addEventListener('click', close);
+      picker.append(closeButton);
+      const grid = create('div', 'picker-grid');
+      for (const [type, inventory] of [[1, state.emoticons], [2, state.stickers]] as const) {
+        for (const entry of inventory) {
+          const emoticon = normalizeEmoticonName(String(entry.name || ''));
+          const name = type === 1 ? (emoticon ? `:${emoticon}:` : '') : String(entry.name || '');
+          if (!name) continue;
+          const button = create('button'); button.type = 'button'; button.title = String(entry.title || name);
+          button.disabled = !steamOnline() || !grantAtLeast('full') || reactionPending.has(key);
+          button.append(icon(type, name));
+          const mine = reactions.some(reaction => reaction.type === type && reaction.name === name && reaction.users.includes(account || ''));
+          button.addEventListener('click', () => void change(type, name, !mine)); grid.append(button);
+        }
       }
-    }
-    if (!grid.children.length) grid.append(create('span', 'muted', '暂无可用表情，请稍后重试'));
-    picker.append(grid); bar.append(picker);
+      if (!grid.children.length) grid.append(create('span', 'muted', inventoryTask ? '正在加载表情…' : '暂无可用表情，请稍后重试'));
+      picker.append(grid);
+    };
+    bar.append(picker);
+    reactionPickerRefreshers.set(picker, refresh);
+    restoreChatInventory();
+    const loading = loadChatInventory();
+    refresh();
+    void loading.then(refresh);
   });
   bar.append(add);
 }
@@ -5230,6 +5327,7 @@ function focusComposerAfterPickerSelection(input: HTMLTextAreaElement) {
 }
 
 function renderPicker(container: HTMLElement) {
+  restoreChatInventory();
   clear(container);
   const tabs = create('div', 'picker-tabs');
   const emoticons = create('button', '', '表情');

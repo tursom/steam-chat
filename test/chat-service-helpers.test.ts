@@ -196,7 +196,7 @@ test('defaultGetEmoticons loads owned community stickers through the installed i
     steamCommunity: { getUserInventoryContents(...args: unknown[]) {
       const callback = args.pop() as (error: unknown, items: unknown[]) => void;
       calls.push(args);
-      callback(null, [sticker, sticker, { ...sticker, tags: [] }, { ...sticker, market_hash_name: undefined }]);
+      callback(null, [sticker, sticker, { ...sticker, tags: [{ category: 'item_class', internal_name: 'item_class_2' }] }]);
     } }
   });
   assert.deepEqual(calls, [['76561198000000001', 753, 6, false]]);
@@ -233,11 +233,92 @@ test('owned sticker adaptation consumes actual SDK paginated CEconItems, includi
   assert.ok(data.stickers[0].aliases.includes('1203420-Show Love'));
 });
 
+test('malformed SDK results cannot masquerade as successful empty inventories', async () => {
+  for (const response of [null, {}, { emoticons: null }, { emoticons: 'unavailable' }]) {
+    await assert.rejects(defaultGetEmoticons({
+      steamUser: { getEmoticonList: async () => response }
+    }), /Incomplete Steam emoticon inventory/);
+  }
+  for (const response of [null, {}, undefined]) {
+    await assert.rejects(defaultGetEmoticons({
+      steamUser: { steamID: '76561198000000001' },
+      steamCommunity: { getUserInventoryContents: async () => response }
+    }), /Incomplete Steam community inventory/);
+  }
+});
+
+for (const paginated of [false, true]) {
+  test(`actual SDK missing asset descriptions rejects the whole ownership response (${paginated ? 'paginated' : 'single page'})`, async (t: import('node:test').TestContext) => {
+    mockStickerCatalog(t);
+    const SteamCommunity = require('steamcommunity');
+    const community = new SteamCommunity();
+    const pages: unknown[] = [];
+    community.httpRequest = (options: { qs: { start_assetid?: string } }, callback: (error: unknown, response: unknown, body: unknown) => void) => {
+      pages.push(options.qs.start_assetid);
+      const described = paginated && !options.qs.start_assetid;
+      queueMicrotask(() => callback(null, {}, {
+        success: 1, total_inventory_count: paginated ? 2 : 1,
+        more_items: described, last_assetid: '10',
+        assets: [{ assetid: described ? '10' : '20', appid: 753,
+          classid: described ? '1' : '2', instanceid: '0', amount: '1' }],
+        descriptions: described ? [{ classid: '1', instanceid: '0', name: 'Show Love',
+          market_hash_name: '1203420-Show Love',
+          tags: [{ category: 'item_class', internal_name: 'item_class_11' }] }] : []
+      }));
+    };
+    const raw: Array<Record<string, unknown>> = await new Promise((resolve, reject) => {
+      community.getUserInventoryContents('76561198000000001', 753, 6, false,
+        (error: unknown, items: Array<Record<string, unknown>>) => error ? reject(error) : resolve(items));
+    });
+    assert.equal(raw.length, paginated ? 2 : 1);
+    assert.equal(raw.at(-1)!.constructor.name, 'CEconItem');
+    assert.equal(raw.at(-1)!.name, undefined);
+    assert.equal(raw.at(-1)!.tags, undefined);
+    pages.length = 0;
+    await assert.rejects(defaultGetEmoticons({
+      steamUser: { steamID: '76561198000000001' }, steamCommunity: community
+    }), /Incomplete Steam community inventory/);
+    assert.deepEqual(pages, paginated ? [undefined, '10'] : [undefined]);
+  });
+}
+
+test('malformed owned sticker data is reported instead of publishing a partial inventory', async () => {
+  await assert.rejects(defaultGetEmoticons({
+    steamUser: { steamID: '76561198000000001' },
+    steamCommunity: { getUserInventoryContents: async () => [{
+      name: 'Malformed sticker',
+      tags: [{ category: 'item_class', internal_name: 'item_class_11' }]
+    }] }
+  }), /Unresolvable owned sticker inventory/);
+});
+
 test('owned inventory errors are reported rather than disguised as an empty inventory', async () => {
   await assert.rejects(defaultGetEmoticons({
     steamUser: { steamID: '76561198000000001' },
     steamCommunity: { getUserInventoryContents: async () => { throw new Error('inventory unavailable'); } }
   }), /inventory unavailable/);
+});
+
+test('previous snapshot aliases remain isolated between stickers and effects in the default helper', async (t: import('node:test').TestContext) => {
+  t.mock.method(globalThis, 'fetch', async () => Response.json({ response: { definitions: [], total_count: 0 } }));
+  const hash = '637310-Cat Cam talking (Sticker)-37';
+  const material = { name: 'Cat talking', title: 'Cat Cam talking', aliases: [hash] };
+  for (const itemClass of [11, 12]) {
+    const owned = { name: 'Localized title', market_hash_name: hash,
+      tags: [{ category: 'item_class', internal_name: `item_class_${itemClass}` }] };
+    const input = { steamUser: { steamID: '76561198000000001' },
+      steamCommunity: { getUserInventoryContents: async () => [owned] } };
+    const own = itemClass === 11 ? 'stickers' : 'effects';
+    const other = itemClass === 11 ? 'effects' : 'stickers';
+    await assert.rejects(defaultGetEmoticons({ ...input,
+      previousInventory: { emoticons: [], stickers: [], effects: [], [other]: [material] }
+    }), /Incomplete sticker catalog/);
+    const data = await defaultGetEmoticons({ ...input,
+      previousInventory: { emoticons: [], stickers: [], effects: [], [own]: [material] }
+    });
+    assert.deepEqual(data[own].map((value: { name: string }) => value.name), ['Cat talking']);
+    assert.deepEqual(data[other], []);
+  }
 });
 
 test('decodeBase64Image accepts data URLs and readRequestBody enforces byte limits', async () => {

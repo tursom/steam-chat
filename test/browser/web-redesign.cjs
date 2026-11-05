@@ -38,6 +38,9 @@ async function fixture(t, identity = 'super', width = 1440, initialView = 'chat'
   const roles = [{ id: 'super', name: '超级管理员', description: '全部权限', permissions, builtin: true, memberCount: 1 },
     { id: 'member', name: '成员', description: '默认成员', permissions: ['chat.use', 'self.password.change'], builtin: true, memberCount: 1 }];
   let denial = null;
+  let inventoryHold = null;
+  let releaseInventory = null;
+  let inventoryPayload = { emoticons: [{ name: 'wave', title: 'Wave' }], stickers: [{ name: 'CatchHeart', title: 'Heart' }], effects: [{ name: 'snow', title: 'Snow' }] };
   await page.addInitScript(view => {
     localStorage.setItem('steam-chat.view', view);
     localStorage.setItem('steam-chat.list-tab', 'recent');
@@ -49,6 +52,10 @@ async function fixture(t, identity = 'super', width = 1440, initialView = 'chat'
       if (denial) return route.fulfill({ status: 403, json: denial });
       return route.fulfill({ json: { ok: true } });
     }
+    if (url.pathname === '/api/emoticons' && inventoryHold) {
+      await inventoryHold;
+      return route.fulfill({ status: 503, json: { error: 'Inventory refresh failed' } });
+    }
     const data = {
       '/api/auth/me': me, '/api/config': me.config, '/api/steam/status': steam,
       '/api/friends': friends, '/api/groups': [], '/api/conversations': { items: conversations },
@@ -56,7 +63,7 @@ async function fixture(t, identity = 'super', width = 1440, initialView = 'chat'
         sentAt: '2027-01-15T08:00:00.000Z' }], hasMore: false },
       '/api/messages/sync': { items: [], steamAccountId: account, liveCursor: 'fixture-cursor', nextCursor: 'fixture-cursor', hasMore: false },
       '/api/message-reactions': { items: [] }, '/api/history/status': { jsonl: { state: 'healthy', queued: 0 }, rocksdb: { state: 'healthy', queued: 0 } },
-      '/api/emoticons': { emoticons: [{ name: 'wave', title: 'Wave' }], stickers: [{ name: 'CatchHeart', title: 'Heart' }], effects: [{ name: 'snow', title: 'Snow' }] },
+      '/api/emoticons': inventoryPayload,
       '/api/image-emotes': { groups: [], images: [] }, '/api/steam/accounts': { steamAccounts: [{ id: 1, steamId: account, label: '主号', enabled: true, active: true }] },
       '/api/steam/grants': { accounts: [], users: [] }, '/api/users': { users: [user] }, '/api/roles': { roles }, '/api/audit-logs': { logs: [] }
     };
@@ -71,7 +78,10 @@ async function fixture(t, identity = 'super', width = 1440, initialView = 'chat'
   await page.goto('http://redesign.test/');
   await page.locator('.shell#chatLayout').waitFor();
   await page.waitForFunction(() => document.querySelectorAll('#chatListSections .conv').length > 0);
-  return { page, context, profile, me, steam, requests, writes, errors, deny: code => {
+  return { page, context, profile, me, steam, requests, writes, errors,
+    holdInventory: () => { inventoryHold = new Promise(resolve => { releaseInventory = resolve; }); },
+    setInventory: payload => { inventoryPayload = payload; },
+    releaseInventory: () => releaseInventory?.(), deny: code => {
     denial = { code, error: '授权已调整，请联系管理员' };
     steam.steamGrant = { ...steam.steamGrant, level: 'read', scope: 'some', peerCount: 1, peers: [alice] };
     me.permissions = ['chat.use', 'self.password.change'];
@@ -86,6 +96,71 @@ async function noOverflow(page, label) {
   assert.ok(result.app <= result.appWidth + 1, `${label}: app ${JSON.stringify(result)}`);
   if (result.sheet) assert.ok(result.sheet.scroll <= result.sheet.width + 1, `${label}: sheet ${JSON.stringify(result)}`);
 }
+
+test('saved picker inventory survives reload and can send stickers during a delayed, failed refresh', async t => {
+  const f = await fixture(t, 'super', 390, 'chat', 'light', true);
+  const { page, writes } = f;
+  await page.locator('#chatListSections .conv').first().tap();
+  await page.locator('#pickerToggle').tap();
+  await page.locator('#picker .picker-grid button').filter({ hasText: 'Wave' }).waitFor();
+  await page.waitForFunction(() => localStorage.getItem('steam-chat.inventory.v1'));
+  f.holdInventory();
+  await page.reload();
+  await page.locator('#chatListSections .conv').first().tap();
+  await page.locator('#pickerToggle').tap();
+  await page.locator('#picker .picker-grid button').filter({ hasText: 'Wave' }).waitFor();
+  await page.locator('#picker .picker-tabs').getByRole('button', { name: '贴纸', exact: true }).tap();
+  const heart = page.locator('#picker .picker-grid button').filter({ hasText: 'Heart' });
+  const sent = page.waitForResponse(response => new URL(response.url()).pathname === '/message');
+  await heart.tap(); await sent;
+  assert.ok(writes.some(write => write.path === '/message' && write.body.msg === '/sticker CatchHeart'));
+  const failed = page.waitForResponse(response => new URL(response.url()).pathname === '/api/emoticons' && response.status() === 503);
+  f.releaseInventory(); await failed;
+  assert.equal(await heart.isEnabled(), true);
+  assert.equal(await page.locator('#messageInput').evaluate(node => node === document.activeElement), false);
+  assert.deepEqual(f.errors, []);
+});
+
+async function enableReactions(page) {
+  await page.route('http://redesign.test/api/message-reactions**', route => route.fulfill({ json: route.request().method() === 'POST'
+    ? { users: [account] }
+    : { items: [{ timestamp: Math.floor(Date.parse('2027-01-15T08:00:00.000Z') / 1000), ordinal: 0, reactions: [] }] } }));
+}
+
+test('reaction picker can use saved inventory without waiting for a slow refresh', async t => {
+  const f = await fixture(t);
+  const { page } = f;
+  await page.locator('#chatListSections .conv').first().click();
+  await page.locator('#pickerToggle').click();
+  await page.locator('#picker .picker-grid button').filter({ hasText: 'Wave' }).waitFor();
+  await page.waitForFunction(() => localStorage.getItem('steam-chat.inventory.v1'));
+  f.holdInventory();
+  await page.reload(); await enableReactions(page);
+  await page.locator('#chatListSections .conv').first().click();
+  await page.locator('#messages .reaction-add').first().click();
+  const heart = page.locator('.reaction-picker button[title="Heart"]');
+  await heart.waitFor(); assert.equal(await heart.isEnabled(), true);
+  const reacted = page.waitForResponse(response => new URL(response.url()).pathname === '/api/message-reactions' && response.request().method() === 'POST');
+  await heart.click(); await reacted;
+  const failed = page.waitForResponse(response => new URL(response.url()).pathname === '/api/emoticons' && response.status() === 503);
+  f.releaseInventory(); await failed;
+  assert.deepEqual(f.errors, []);
+});
+
+test('background inventory refresh updates an open reaction picker and removes obsolete materials', async t => {
+  const f = await fixture(t);
+  const { page } = f;
+  await enableReactions(page);
+  f.setInventory({ emoticons: [], stickers: [{ name: 'CatchHeart', title: 'Old Heart' }], effects: [], cache: { stale: true, refreshing: true } });
+  await page.locator('#chatListSections .conv').first().click();
+  await page.locator('#messages .reaction-add').first().click();
+  await page.locator('.reaction-picker button[title="Old Heart"]').waitFor();
+  f.setInventory({ emoticons: [], stickers: [{ name: 'NewHeart', title: 'New Heart' }], effects: [], cache: { stale: false, refreshing: false } });
+  await page.locator('.reaction-picker button[title="New Heart"]').waitFor();
+  assert.equal(await page.locator('.reaction-picker button[title="Old Heart"]').count(), 0);
+  assert.equal(await page.locator('.reaction-picker button[title="New Heart"]').isEnabled(), true);
+  assert.deepEqual(f.errors, []);
+});
 
 for (const touch of [true, false]) test(`${touch ? 'touch' : 'desktop'} picker preserves keyboard behavior for emoticons, emoji, stickers and effects`, async t => {
   const { page, writes, errors } = await fixture(t, 'super', touch ? 390 : 1440, 'chat', 'light', touch);

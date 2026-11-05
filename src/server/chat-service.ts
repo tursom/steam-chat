@@ -5,6 +5,7 @@ import { handleDeployWebhook } from './deploy-webhook';
 import { readMessageReactions, updateMessageReaction, type ReactionClient } from './message-reactions';
 import { resolveBilibiliLink } from './bilibili-links';
 import { resolveStickerAlias } from './sticker-inventory';
+import { SteamInventoryCache, type SteamInventory } from './steam-inventory-cache';
 import { settleMetadata } from '../steam/metadata';
 import { steamEventKey } from '../storage/history-message';
 import type { HistoryStorage } from '../storage/history-storage';
@@ -105,9 +106,11 @@ type EmoticonPayload = {
   emoticons: unknown[];
   stickers: unknown[];
   effects?: unknown[];
+  complete?: boolean;
 };
 
 type GetEmoticonsOptions = {
+  previousInventory?: SteamInventory;
   steamCommunity?: SteamCommunityLike;
   steamUser?: SteamUserLike;
   waitForLogin: Waiter;
@@ -115,6 +118,7 @@ type GetEmoticonsOptions = {
 };
 
 type ChatServiceOptions = {
+  inventoryCacheDir?: string;
   sendOperationOptions?: Partial<Pick<SendOperationOptions, 'tickMs' | 'windowMs' | 'delaysMs' | 'maxAttempts' | 'random' | 'preparedMs' | 'imageMs' | 'resultMs' | 'maxBytes' | 'userBytes' | 'maxTasks'>>;
   imageEmoteDir?: string;
   deploymentWebhookUrl?: string;
@@ -630,6 +634,7 @@ function createChatService(options: ChatServiceOptions = {}) {
   const getUserInfo: (value: unknown) => Promise<Persona> = options.getUserInfo || (async () => ({ player_name: 'Unknown' }));
   const getSelfName = options.getSelfName || (async () => 'Me');
   const getEmoticons = options.getEmoticons || defaultGetEmoticons;
+  const inventoryCache = new SteamInventoryCache({ dir: options.inventoryCacheDir || path.join(DATA_DIR, 'steam-inventory'), logger });
   const fetchImpl = options.fetchImpl;
   const authStore = options.authStore;
   const sessionManager = options.sessionManager;
@@ -912,6 +917,40 @@ function createChatService(options: ChatServiceOptions = {}) {
 
   function requireSteamOnline() {
     steamLoginService?.ensureOnline?.();
+  }
+
+  function inventoryAccount(access: SteamAccessContext): string | undefined {
+    const identities = [steamIdToString(steamUser?.steamID), steamIdToString(steamCommunity?.steamID), currentSteamStatus().steamId].filter(Boolean);
+    const account = access.steamAccountId || identities[0] || undefined;
+    if (identities.some(identity => identity !== account)) {
+      throw Object.assign(new Error('Steam account changed during inventory request'), { statusCode: 409 });
+    }
+    return account;
+  }
+
+  async function readInventory(access: SteamAccessContext) {
+    const account = inventoryAccount(access);
+    const checkAccount = () => {
+      const current = { ...access, steamAccountId: ensureActiveSteamAccount()?.steamId || currentSteamStatus().steamId || account };
+      if (inventoryAccount(current) !== account) {
+        throw Object.assign(new Error('Steam account changed during inventory refresh'), { statusCode: 409 });
+      }
+    };
+    const fetchInventory = async (previousInventory: SteamInventory | undefined) => {
+      requireSteamOnline();
+      checkAccount();
+      if (!options.getEmoticons && (!(steamUser?.getEmoticonList || steamUser?.chat?.getEmoticonList)
+        || !steamCommunity?.getUserInventoryContents)) {
+        throw Object.assign(new Error('Steam inventory sources are unavailable'), { statusCode: 503 });
+      }
+      const result = await getEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession, previousInventory });
+      checkAccount();
+      // Historical injected helpers predate effects. Production must return all three arrays.
+      return options.getEmoticons && result.effects === undefined ? { ...result, effects: [] } : result as EmoticonPayload & { effects: unknown[] };
+    };
+    // Identity-free test helpers get only a service-local memory entry, never a disk scope.
+    if (!account && !options.getEmoticons) throw steamAccountUnavailable();
+    return inventoryCache.get(account, fetchInventory);
   }
 
   function writeAuthError(req: IncomingMessage, res: ServerResponse, error: unknown) {
@@ -1817,10 +1856,13 @@ function createChatService(options: ChatServiceOptions = {}) {
           return;
         }
         if (url.pathname === '/api/emoticons') {
-          const access = requireSteamAccountAccess(req, true);
-          const data = await getEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession });
-          recheckReadAccess(req, access, true);
-          jsonResponse(res, 200, data);
+          const access = requireSteamAccountAccess(req, false);
+          const account = inventoryAccount(access);
+          const data = await readInventory(access);
+          if (inventoryAccount(recheckReadAccess(req, access)) !== account) {
+            throw Object.assign(new Error('Steam account changed during inventory request'), { statusCode: 409 });
+          }
+          jsonResponse(res, 200, data, { 'Cache-Control': 'no-store' });
           return;
         }
         if (url.pathname === '/api/friends') {
@@ -2065,8 +2107,14 @@ function createChatService(options: ChatServiceOptions = {}) {
         return;
       }
       if (type === 'get_emoticons' || type === 'emoticons') {
-        wsAccessContext(ws, true);
-        reply({ type: 'emoticons', ...(await getEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession })) });
+        const access = wsAccessContext(ws, false);
+        const account = inventoryAccount(access);
+        const data = await readInventory(access);
+        const current = wsAccessContext(ws, false);
+        if (current.steamAccountId !== access.steamAccountId || inventoryAccount(current) !== account) {
+          throw Object.assign(new Error('Steam account changed during inventory request'), { statusCode: 409 });
+        }
+        reply({ type: 'emoticons', ...data });
         return;
       }
       if (type === 'get_friends' || type === 'friends') {
@@ -2194,6 +2242,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     async stop() {
       stopping = true;
       if (heartbeat) clearInterval(heartbeat);
+      await inventoryCache.close();
       await sendOperations.close();
       disposeSteamEvents();
       for (const ws of clients) ws.terminate();
@@ -2214,13 +2263,17 @@ function createChatService(options: ChatServiceOptions = {}) {
   };
 }
 
-async function defaultGetEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession }: GetEmoticonsOptions): Promise<EmoticonPayload> {
+async function defaultGetEmoticons({ steamUser, steamCommunity, waitForLogin, waitForWebSession, previousInventory }: GetEmoticonsOptions): Promise<EmoticonPayload> {
   await resolveWaiter(waitForLogin);
   await resolveWaiter(waitForWebSession);
   const source = steamUser?.getEmoticonList || steamUser?.chat?.getEmoticonList;
   const context = steamUser?.getEmoticonList ? steamUser : steamUser?.chat;
   const response = source ? await callMaybeCallback(source, context, []) : null;
   const entries = (value: unknown): unknown[] => Array.isArray(value) ? value : isRecord(value) ? Object.values(value) : [];
+  if (source && (!isRecord(response) || (!Array.isArray(response.emoticons ?? response.emoticon_list)
+    && !isRecord(response.emoticons ?? response.emoticon_list)))) {
+    throw new Error('Incomplete Steam emoticon inventory');
+  }
   const emoticons = isRecord(response)
     ? entries(response.emoticons || response.emoticon_list)
     : [];
@@ -2232,10 +2285,11 @@ async function defaultGetEmoticons({ steamUser, steamCommunity, waitForLogin, wa
   if (steamCommunity?.getUserInventoryContents && steamId) {
     // The SDK joins asset descriptions and follows all inventory pages, including non-tradable items.
     const inventory = await callMaybeCallback(steamCommunity.getUserInventoryContents, steamCommunity, [steamId, 753, 6, false]);
+    if (!Array.isArray(inventory)) throw new Error('Incomplete Steam community inventory');
     const { resolveStickerInventory } = await import('./sticker-inventory.js');
     [stickers, effects] = await Promise.all([
-      resolveStickerInventory(entries(inventory)),
-      resolveStickerInventory(entries(inventory), { itemClass: 12 })
+      resolveStickerInventory(inventory, { previousInventory: previousInventory?.stickers }),
+      resolveStickerInventory(inventory, { itemClass: 12, previousInventory: previousInventory?.effects })
     ]);
   }
   return { emoticons, stickers, effects };

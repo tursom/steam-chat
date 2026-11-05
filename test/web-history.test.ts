@@ -41,7 +41,7 @@ class Element {
 
 type Item = { id: string; eventId: string; message: string; echo?: boolean; name?: string; sentAt?: string; steamAccountId?: string; type?: string };
 type Pending = { url: URL; body?: string; signal?: AbortSignal; resolve: (value: unknown) => void; respond: (status: number, value: unknown) => void; reject: (error: Error) => void };
-function harness(withLayout = false, withRealtime = false, disk?: Map<string, unknown>) {
+function harness(withLayout = false, withRealtime = false, disk?: Map<string, unknown>, browserStorage = new Map<string, string>()) {
   let now = Date.now();
   const timers = new Map<number, { delay: number; callback: () => unknown }>();
   let timerId = 0;
@@ -87,7 +87,8 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
       Promise.resolve().then(() => request.onsuccess()); return request;
     } } } : {}),
     ...(withRealtime ? { Date: class Clock extends Date { static now() { return now; } } } : {}),
-    localStorage: { getItem: (): null => null, setItem() {} },
+    localStorage: { getItem: (key: string) => browserStorage.get(key) ?? null,
+      setItem: (key: string, value: string) => browserStorage.set(key, value), removeItem: (key: string) => browserStorage.delete(key) },
     ...(withLayout ? { ResizeObserver: LayoutObserver,
       requestAnimationFrame: (callback: () => void) => { frames.set(++frameId, callback); return frameId; },
       cancelAnimationFrame: (id: number) => frames.delete(id) } : {}),
@@ -108,7 +109,7 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     state.me = {id: 1}; state.permissions = ['chat.use', 'self.password.change']; state.activeId = 'peer'; state.steam.accessAllowed = true;
     state.steam.steamGrant = {level:'full', scope:'all', peerCount:0, expiresAt:null};
     resizeComposerInput = () => {};
-    globalThis.__test = {refreshChatData, loadChatInventory, sendText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
+    globalThis.__test = {refreshChatData, loadChatInventory, updateSteamStatus, sendText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
       openConversation, rememberThread, restoreThread, scheduleChatCache, restoreChatCache, clearChatCache,
       bootstrap: () => { setupAppInstallation = () => {}; renderShell = () => {}; restoreImageOperations = () => {}; return bootstrap(); },
       requestDurableSync, ensureWebSocket, stopWebSocket, startStatusPolling, stopStatusPolling, setupRealtimeResume,
@@ -117,8 +118,9 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
       switchPeer: (id) => { state.activeId = id; resetHistory(); },
       detached: () => historyDetached, busy: () => historyBusy};`, sandbox);
   const api = sandbox.__test as {
-    refreshChatData: () => Promise<void>;
+    refreshChatData: (includeConversations?: boolean) => Promise<void>;
     loadChatInventory: () => Promise<void>;
+    updateSteamStatus: (status: Record<string, unknown>) => void;
     bootstrap: () => Promise<void>;
     openConversation: (id: string) => void;
     rememberThread: () => void;
@@ -136,8 +138,9 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     resetHistory: () => void;
     invalidateChat: () => void;
     switchPeer: (id: string) => void;
-    state: { me: { id: number; sessionVersion?: number }; sendOperations: boolean; imageOperationUpload: boolean; activeId: string; view: string; steam: { steamId: string; status: string; accessAllowed: boolean; accessRevision?: string; steamGrant?: { level: string; scope: string; peerCount: number } }; friends: Array<{id: string; name: string}>; activeName: string;
-      conversations: Array<{id: string; name?: string; preview?: string; updatedAt?: string}>; feedback: string };
+    state: { me: { id: number; sessionVersion?: number }; sendOperations: boolean; imageOperationUpload: boolean; activeId: string; view: string; steam: { steamId: string | null; activeAccount?: { id: number; steamId: string; label: string }; status: string; accessAllowed: boolean; accessRevision?: string; steamGrant?: { level: string; scope: string; peerCount: number } }; friends: Array<{id: string; name: string}>; activeName: string;
+      conversations: Array<{id: string; name?: string; preview?: string; updatedAt?: string}>; feedback: string;
+      emoticons: Array<Record<string, unknown>>; stickers: Array<Record<string, unknown>>; effects: Array<Record<string, unknown>> };
     outgoing: () => Array<{ state: string; item: Item; context: string }>;
     items: () => Item[];
     detached: () => boolean;
@@ -152,7 +155,7 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     syncCursor: () => string;
     setSyncCursor: (cursor: string) => void;
   };
-  return { api, pending, messages: nodes['#messages'], nodes, sockets, timers, events, advance: (ms: number) => { now += ms; },
+  return { api, pending, messages: nodes['#messages'], nodes, sockets, timers, events, now: () => now, advance: (ms: number) => { now += ms; },
     setVisibility: (value: string) => { sandbox.document.visibilityState = value; },
     flushFrames,
     resize: () => { for (const observer of [...observers]) if (observer.active) observer.callback(); flushFrames(); } };
@@ -1127,6 +1130,114 @@ test('inventory loads on demand and coalesces simultaneous picker requests', asy
   assert.equal(pending.length, 1); assert.equal(pending[0].url.pathname, '/api/emoticons');
   pending[0].resolve({ emoticons: [], stickers: [], effects: [] }); await Promise.all([first, second]);
   await api.loadChatInventory(); assert.equal(pending.length, 1);
+});
+
+const savedInventory = { emoticons: [{ name: ':wave:' }], stickers: [{ name: 'Heart' }], effects: [{ name: 'Snow' }] };
+
+test('inventory survives a page refresh and remains usable while refresh is pending or fails', async () => {
+  const storage = new Map<string, string>();
+  const first = harness(false, true, undefined, storage);
+  first.api.state.steam.steamId = 'account'; first.api.state.steam.status = 'online';
+  const loading = first.api.loadChatInventory(); first.pending[0].resolve(savedInventory); await loading;
+  assert.ok(storage.get('steam-chat.inventory.v1'));
+  const reloaded = harness(false, true, undefined, storage);
+  reloaded.api.state.steam.steamId = 'account'; reloaded.api.state.steam.status = 'online';
+  const refresh = reloaded.api.loadChatInventory();
+  assert.equal(reloaded.api.state.emoticons[0].name, ':wave:');
+  assert.equal(reloaded.api.state.stickers[0].name, 'Heart');
+  assert.equal(reloaded.api.state.effects[0].name, 'Snow');
+  reloaded.pending[0].respond(503, { error: 'Steam temporarily unavailable' }); await refresh;
+  assert.equal(reloaded.api.state.stickers[0].name, 'Heart');
+  reloaded.api.state.steam.status = 'reconnecting';
+  await reloaded.api.refreshChatData(false);
+  assert.equal(reloaded.api.state.emoticons[0].name, ':wave:');
+  assert.equal(reloaded.api.state.effects[0].name, 'Snow');
+});
+
+test('a stale inventory response triggers another fetch and a complete empty refresh replaces old data', async () => {
+  const { api, pending, advance } = harness(false, true);
+  api.state.steam.steamId = 'account'; api.state.steam.status = 'online';
+  const loading = api.loadChatInventory();
+  pending[0].resolve({ ...savedInventory, cache: { stale: true, refreshing: true } }); await loading;
+  assert.equal(api.state.stickers[0].name, 'Heart');
+  await api.loadChatInventory(); assert.equal(pending.length, 1);
+  advance(2001);
+  const refresh = api.loadChatInventory(); assert.equal(pending.length, 2);
+  assert.equal(api.state.effects[0].name, 'Snow');
+  pending[1].resolve({ emoticons: [], stickers: [], effects: [], cache: { stale: false, refreshing: false } }); await refresh;
+  assert.equal(api.state.emoticons.length + api.state.stickers.length + api.state.effects.length, 0);
+});
+
+test('same-account reconnect keeps saved inventory when the live Steam ID temporarily disappears', async () => {
+  const storage = new Map<string, string>();
+  const { api, pending } = harness(false, true, undefined, storage);
+  api.state.steam.steamId = 'account'; api.state.steam.status = 'online';
+  api.state.steam.activeAccount = { id: 1, steamId: 'account', label: 'Main' };
+  const loading = api.loadChatInventory(); pending[0].resolve(savedInventory); await loading;
+  const snapshot = storage.get('steam-chat.inventory.v1');
+  const previous = { ...api.state.steam };
+  api.updateSteamStatus({ ...previous, status: 'reconnecting', steamId: null });
+  assert.equal(api.state.stickers[0].name, 'Heart');
+  assert.equal(storage.get('steam-chat.inventory.v1'), snapshot);
+  await api.loadChatInventory(); assert.equal(pending.length, 1);
+  api.updateSteamStatus({ ...previous, status: 'online' });
+  assert.equal(api.state.effects[0].name, 'Snow');
+  assert.equal(storage.get('steam-chat.inventory.v1'), snapshot);
+});
+
+test('malformed inventory updates preserve every previous category', async () => {
+  const { api, pending, advance } = harness(false, true);
+  api.state.steam.steamId = 'account'; api.state.steam.status = 'online';
+  const loading = api.loadChatInventory(); pending[0].resolve(savedInventory); await loading;
+  advance(10 * 60_000 + 1);
+  const refresh = api.loadChatInventory(); pending[1].resolve({ emoticons: [], effects: [] }); await refresh;
+  assert.equal(api.state.emoticons[0].name, ':wave:');
+  assert.equal(api.state.stickers[0].name, 'Heart');
+  assert.equal(api.state.effects[0].name, 'Snow');
+});
+
+test('inventory refresh respects server freshness and retry cooldown without hiding cached items', async () => {
+  const { api, pending, advance, now: clock } = harness(false, true);
+  api.state.steam.steamId = 'account'; api.state.steam.status = 'online';
+  const now = clock();
+  const loading = api.loadChatInventory();
+  pending[0].resolve({ ...savedInventory, cache: { updatedAt: now - 9 * 60_000, stale: false, refreshing: false } }); await loading;
+  advance(60_001);
+  const refreshing = api.loadChatInventory(); assert.equal(pending.length, 2);
+  pending[1].resolve({ ...savedInventory, cache: { stale: true, refreshing: false, retryAt: now + 90_001 } }); await refreshing;
+  advance(2001); await api.loadChatInventory(); assert.equal(pending.length, 2);
+  assert.equal(api.state.stickers[0].name, 'Heart');
+  advance(28_000);
+  const retry = api.loadChatInventory(); assert.equal(pending.length, 3);
+  pending[2].resolve(savedInventory); await retry;
+});
+
+test('persisted inventory is isolated by user, session version and Steam account', async () => {
+  const storage = new Map<string, string>();
+  const original = harness(false, true, undefined, storage);
+  original.api.state.steam.steamId = 'account'; original.api.state.steam.status = 'online';
+  const loading = original.api.loadChatInventory(); original.pending[0].resolve(savedInventory); await loading;
+  const snapshot = storage.get('steam-chat.inventory.v1')!;
+  for (const [userId, sessionVersion, account] of [[2, 0, 'account'], [1, 1, 'account'], [1, 0, 'other-account']] as const) {
+    storage.set('steam-chat.inventory.v1', snapshot);
+    const next = harness(false, true, undefined, storage);
+    next.api.state.me = { id: userId, sessionVersion };
+    next.api.state.steam.steamId = account; next.api.state.steam.status = 'online';
+    const refreshing = next.api.loadChatInventory();
+    assert.equal(next.api.state.stickers.length, 0);
+    next.pending[0].resolve({ emoticons: [], stickers: [], effects: [] }); await refreshing;
+  }
+});
+
+test('an account change invalidates pending inventory and clears the persistent snapshot', async () => {
+  const storage = new Map<string, string>();
+  const { api, pending } = harness(false, true, undefined, storage);
+  api.state.steam.steamId = 'account'; api.state.steam.status = 'online';
+  const old = api.loadChatInventory(); api.invalidateChat(); api.state.steam.steamId = 'other-account';
+  const current = api.loadChatInventory(); pending[1].resolve({ emoticons: [{ name: ':new:' }], stickers: [], effects: [] }); await current;
+  pending[0].resolve(savedInventory); await old;
+  assert.equal(api.state.emoticons[0].name, ':new:');
+  assert.doesNotMatch(storage.get('steam-chat.inventory.v1')!, /Heart/);
 });
 
 test('one-phase image upload sends its operation identity and bytes together, then only queries on lost response', async () => {
