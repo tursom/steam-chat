@@ -1493,9 +1493,14 @@ function createChatService(options: ChatServiceOptions = {}) {
   }
 
   async function reconcileTextSend(id: string, message: string, steamAccountId: string | undefined,
-    submittedAt: number, selfName: Promise<string>, authorize: () => void) {
+    submittedAt: number, selfName: Promise<string>, authorize: () => void,
+    options: { manual?: boolean } = {}): Promise<HistoryItem[]> {
     const chat = steamUser?.chat;
-    if (!steamAccountId || !chat?.getFriendMessageHistory) return;
+    const unavailable = () => Object.assign(new Error('暂时无法查询 Steam 发送记录，请稍后重试。'), { statusCode: 503 });
+    if (!steamAccountId || !chat?.getFriendMessageHistory) {
+      if (options.manual) throw unavailable();
+      return [];
+    }
     const guard = () => {
       authorize();
       checkSend(steamAccountId);
@@ -1506,25 +1511,31 @@ function createChatService(options: ChatServiceOptions = {}) {
       }
     };
     guard();
-    const deadline = Date.now() + 3000;
+    // The SDK first reads active sessions, then recent messages. A healthy
+    // production read can take five seconds; leave room for its 10-second bound.
+    const deadline = Date.now() + 12_000;
+    const maxCount = options.manual ? 100 : 20;
     let timer: NodeJS.Timeout | undefined;
     let response: unknown;
     try {
       // The read has no side effects. Racing it here also consumes late SDK
       // fulfillment/rejection without allowing late results to reach persistence.
       response = await Promise.race([
-        callMaybeCallback(chat.getFriendMessageHistory, chat, [id, { maxCount: 20, wantBbcode: true }]),
-        new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 3000); })
+        callMaybeCallback(chat.getFriendMessageHistory, chat, [id, { maxCount, wantBbcode: true }]),
+        new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 12_000); })
       ]).catch((): undefined => undefined);
     } finally { if (timer) clearTimeout(timer); }
     guard();
-    if (Date.now() >= deadline || !isRecord(response) || !Array.isArray(response.messages)) return;
+    if (Date.now() >= deadline || !isRecord(response) || !Array.isArray(response.messages)) {
+      if (options.manual) throw unavailable();
+      return [];
+    }
     const readAt = Date.now();
     // sendFriendMessage's default BBCode mode escapes literal brackets before
     // submission. Only Steam's returned wrappers may be projected as markup.
     const expected = replayMessage(message.replace(/\[/g, '\\['));
     const records: HistoryRecordInput[] = [];
-    for (const item of response.messages.slice(0, 20)) {
+    for (const item of response.messages.slice(0, maxCount)) {
       if (!isRecord(item) || steamIdToString(item.sender) !== steamAccountId
         || typeof item.message !== 'string' || replayMessage(item.message) !== expected
         || !(item.server_timestamp instanceof Date)
@@ -1537,19 +1548,20 @@ function createChatService(options: ChatServiceOptions = {}) {
       records.push({ type: 'message', echo: true, steamAccountId, id, message: item.message,
         ordinal: item.ordinal, sentAt: item.server_timestamp.toISOString(), steamEventKey: key });
     }
-    if (!records.length) return;
+    if (!records.length) return [];
+    const items: HistoryItem[] = [];
     const name = await selfName;
     guard();
     records.sort((a, b) => a.sentAt!.localeCompare(b.sentAt!) || Number(a.ordinal) - Number(b.ordinal));
     for (const record of records) {
       guard();
-      if (Date.now() >= deadline) return;
+      if (Date.now() >= deadline) break;
       // Durable storage deduplicates by Steam identity. The legacy JSONL path
       // needs the same protection when overlapping failed sends read one event.
       const legacyKey = `reconciled:${record.steamEventKey}`;
       if (!historyStorage && isRecent(recentSentText, legacyKey)) continue;
       if (!historyStorage) remember(recentSentText, legacyKey);
-      try { await persistSent({ ...record, name }, guard); }
+      try { items.push(await persistSent({ ...record, name }, guard)); }
       catch (error) {
         if (!historyStorage) recentSentText.delete(legacyKey);
         if (isRecord(error) && [401, 403, 409].includes(Number(error.statusCode))) throw error;
@@ -1558,23 +1570,26 @@ function createChatService(options: ChatServiceOptions = {}) {
       }
     }
     guard();
+    return items;
   }
 
   async function sendTextMessage(id: unknown, msg: unknown, steamAccountId?: string, authorize?: (level?: SteamLevel) => void): Promise<HistoryItem> {
     rejectGroupRecipient(id);
     steamAccountId = steamAccountId || ensureActiveSteamAccount()?.steamId || currentSteamStatus().steamId || undefined;
-    checkSend(steamAccountId);
+    try { checkSend(steamAccountId); }
+    catch (error) { throw Object.assign(error instanceof Error ? error : new Error(errorMessage(error)), { uncertain: false }); }
     const selfName = settleMetadata(getSelfName(steamAccountId), 'Me');
     if (!id || !String(msg || '').trim()) {
       throw Object.assign(new Error('id and msg are required'), { statusCode: 400 });
     }
     if (!steamUser?.chat?.sendFriendMessage && !steamUser?.sendFriendMessage) {
-      throw new Error('Steam chat sender is unavailable');
+      throw Object.assign(new Error('Steam chat sender is unavailable'), { uncertain: false });
     }
     const message = String(msg);
     // Resolve the text classification before any waiter or retry can yield to a grant change.
     const level: SteamLevel = requiresFullLevel(message) ? 'full' : 'chat';
-    authorize?.(level);
+    try { authorize?.(level); }
+    catch (error) { throw Object.assign(error instanceof Error ? error : new Error(errorMessage(error)), { uncertain: false }); }
     let submittedAt: number | undefined;
     const result = await withSteamRetry(() => {
       authorize?.(level);
@@ -1585,6 +1600,11 @@ function createChatService(options: ChatServiceOptions = {}) {
       submittedAt = Date.now();
       return callMaybeCallback(sender, context, [id, message]);
     }, false, false).catch(async error => {
+      // These protocol responses explicitly reject the request. Transport loss
+      // and generic SDK failures remain uncertain once submission has started.
+      if (submittedAt === undefined || isRecord(error) && [8, 15, 17, 25, 84].includes(Number(error.eresult))) {
+        throw Object.assign(error instanceof Error ? error : new Error(errorMessage(error)), { uncertain: false });
+      }
       // Steam may deliver the message before its acknowledgement is lost. Text
       // submissions have no idempotency token, so retrying can send another copy.
       if (submittedAt !== undefined && (isTransientSteamError(error) || /timed\s*out/i.test(errorMessage(error))
@@ -1884,6 +1904,25 @@ function createChatService(options: ChatServiceOptions = {}) {
 
       requireLegacyOrSession(req);
 
+      if (url.pathname === '/api/messages/check') {
+        if (req.method !== 'POST') { jsonResponse(res, 405, { error: 'Method not allowed' }); return; }
+        const access = requireSteamAccountAccess(req, true);
+        const body = await readJsonBody(req);
+        const authorize = httpSendAuthorization(req, access, body.steamAccountId, 'read', body.id);
+        authorize();
+        const submittedAt = typeof body.sentAt === 'string' ? Date.parse(body.sentAt) : NaN;
+        if (typeof body.id !== 'string' || !/^\d{17}$/.test(body.id) || typeof body.msg !== 'string' || !body.msg.trim()
+          || !Number.isFinite(submittedAt) || submittedAt < Date.now() - 24 * 60 * 60 * 1000 || submittedAt > Date.now() + 120_000) {
+          throw Object.assign(new Error('有效的会话、原始消息和发送时间不能为空'), { statusCode: 400 });
+        }
+        rejectGroupRecipient(body.id);
+        const items = await reconcileTextSend(body.id, body.msg, access.steamAccountId, submittedAt,
+          settleMetadata(getSelfName(access.steamAccountId), 'Me'), authorize, { manual: true });
+        authorize();
+        jsonResponse(res, 200, { items }, { 'Cache-Control': 'private, no-store' });
+        return;
+      }
+
       if (url.pathname === '/api/message-reactions') {
         const access = requireSteamAccountAccess(req, true);
         if (!steamUser || !access.steamAccountId) throw Object.assign(new Error('Steam is not online'), { statusCode: 503 });
@@ -2036,10 +2075,11 @@ function createChatService(options: ChatServiceOptions = {}) {
       }
 
       if (req.method === 'POST' && (url.pathname === '/' || url.pathname === '/message')) {
-        const access = requireSteamAccountAccess(req, true);
+        let access: SteamAccessContext;
+        try { access = requireSteamAccountAccess(req, true); }
+        catch (error) { throw Object.assign(error instanceof Error ? error : new Error(errorMessage(error)), { uncertain: false }); }
         const body = await readJsonBody(req);
         const authorize = httpSendAuthorization(req, access, body.steamAccountId, requiresFullLevel(body.msg) ? 'full' : 'chat', body.id);
-        authorize();
         const item = await sendTextMessage(body.id, body.msg, access.steamAccountId, authorize);
         jsonResponse(res, 200, { ok: true, item });
         return;
@@ -2105,7 +2145,9 @@ function createChatService(options: ChatServiceOptions = {}) {
       }
       if (sessionManager) responseAccount = wsAccessContext(ws, false).steamAccountId;
       if (type === 'send_message' || type === 'msg') {
-        const access = wsAccessContext(ws, true);
+        let access: SteamAccessContext;
+        try { access = wsAccessContext(ws, true); }
+        catch (error) { throw Object.assign(error instanceof Error ? error : new Error(errorMessage(error)), { uncertain: false }); }
         const text = payload.msg || payload.message || '';
         const level = requiresFullLevel(text) ? 'full' : 'chat';
         checkAccountPrecondition(access, payload.steamAccountId);

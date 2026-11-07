@@ -40,7 +40,8 @@ class Element {
 }
 
 type Item = { id: string; eventId: string; message: string; echo?: boolean; name?: string; sentAt?: string; steamAccountId?: string; type?: string };
-type Pending = { url: URL; body?: string; signal?: AbortSignal; resolve: (value: unknown) => void; respond: (status: number, value: unknown) => void; reject: (error: Error) => void };
+type OutgoingEntry = { localId: number; state: string; item: Item; context: string; readonly retryText?: string; textCheckBusy?: boolean; textCheckReason?: string; replacementLocalId?: number };
+type Pending = { url: URL; method?: string; body?: string; signal?: AbortSignal; resolve: (value: unknown) => void; respond: (status: number, value: unknown) => void; reject: (error: Error) => void };
 function harness(withLayout = false, withRealtime = false, disk?: Map<string, unknown>, browserStorage = new Map<string, string>()) {
   let now = Date.now();
   const timers = new Map<number, { delay: number; callback: () => unknown }>();
@@ -98,6 +99,7 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     setInterval: (callback: () => unknown, delay: number) => { if (!withRealtime) return 0; timers.set(++timerId, { callback, delay }); return timerId; },
     clearInterval: (id: number) => timers.delete(id),
     fetch: (url: string, options: RequestInit = {}) => new Promise((resolve, reject) => pending.push({ url: new URL(url, 'http://test'),
+      method: options.method,
       body: typeof options.body === 'string' ? options.body : undefined,
       respond: (status, payload) => resolve({ ok: status < 400, status, json: async () => payload }),
       signal: options.signal || undefined, resolve: (payload) => resolve({ ok: true, json: async () => payload }), reject })),
@@ -109,7 +111,7 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     state.me = {id: 1}; state.permissions = ['chat.use', 'self.password.change']; state.activeId = 'peer'; state.steam.accessAllowed = true;
     state.steam.steamGrant = {level:'full', scope:'all', peerCount:0, expiresAt:null};
     resizeComposerInput = () => {};
-    globalThis.__test = {refreshChatData, loadChatInventory, updateSteamStatus, sendText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
+    globalThis.__test = {refreshChatData, loadChatInventory, updateSteamStatus, sendText, retryOutgoingText, resendOutgoingText, checkOutgoingText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
       openConversation, rememberThread, restoreThread, scheduleChatCache, restoreChatCache, clearChatCache,
       bootstrap: () => { setupAppInstallation = () => {}; renderShell = () => {}; restoreImageOperations = () => {}; return bootstrap(); },
       requestDurableSync, ensureWebSocket, stopWebSocket, startStatusPolling, stopStatusPolling, setupRealtimeResume,
@@ -129,6 +131,9 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     restoreChatCache: () => Promise<void>;
     clearChatCache: () => void;
     sendText: (explicitMessage?: string, previewMessage?: string) => Promise<boolean>;
+    retryOutgoingText: (entry: OutgoingEntry) => Promise<boolean>;
+    resendOutgoingText: (entry: OutgoingEntry) => Promise<boolean>;
+    checkOutgoingText: (entry: OutgoingEntry) => Promise<void>;
     sendImage: (payload: Record<string, string>) => Promise<void>;
     loadHistory: (mode?: string, date?: string, options?: { preserve?: boolean; cacheRefresh?: boolean }) => Promise<void>;
     loadConversations: (more?: boolean) => Promise<void>;
@@ -138,10 +143,10 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     resetHistory: () => void;
     invalidateChat: () => void;
     switchPeer: (id: string) => void;
-    state: { me: { id: number; sessionVersion?: number }; sendOperations: boolean; imageOperationUpload: boolean; activeId: string; view: string; steam: { steamId: string | null; activeAccount?: { id: number; steamId: string; label: string }; status: string; accessAllowed: boolean; accessRevision?: string; steamGrant?: { level: string; scope: string; peerCount: number } }; friends: Array<{id: string; name: string}>; activeName: string;
+    state: { me: { id: number; sessionVersion?: number }; permissions: string[]; sendOperations: boolean; imageOperationUpload: boolean; activeId: string; view: string; steam: { steamId: string | null; activeAccount?: { id: number; steamId: string; label: string }; status: string; accessAllowed: boolean; accessRevision?: string; steamGrant?: { level: string; scope: string; peerCount: number } }; friends: Array<{id: string; name: string}>; activeName: string;
       conversations: Array<{id: string; name?: string; preview?: string; updatedAt?: string}>; feedback: string;
       emoticons: Array<Record<string, unknown>>; stickers: Array<Record<string, unknown>>; effects: Array<Record<string, unknown>> };
-    outgoing: () => Array<{ state: string; item: Item; context: string }>;
+    outgoing: () => OutgoingEntry[];
     items: () => Item[];
     detached: () => boolean;
     busy: () => boolean;
@@ -446,6 +451,172 @@ for (const status of [400, 500, undefined]) {
     assert.equal(pending.length, 1);
   });
 }
+
+async function manualTextAttempt(status: 'failed' | 'unknown') {
+  const h = harness();
+  h.api.state.steam.steamId = 'account';
+  h.api.state.steam.status = 'online';
+  h.nodes['#messageInput'].value = 'original [body]';
+  const sending = h.api.sendText();
+  h.pending[0].respond(status === 'failed' ? 400 : 502, { error: 'send error', uncertain: status === 'unknown' });
+  assert.equal(await sending, false);
+  const entry = h.api.outgoing()[0];
+  assert.equal(entry.state, status);
+  return { ...h, entry };
+}
+
+test('manual failed retry keeps its bubble and immutable original body without touching the later draft', async () => {
+  const { api, pending, nodes, messages, entry } = await manualTextAttempt('failed');
+  nodes['#messageInput'].value = 'edited draft';
+  const retrying = api.retryOutgoingText(entry);
+  assert.equal(entry.state, 'sending');
+  assert.equal(await api.retryOutgoingText(entry), false, 'repeated clicks cannot start another attempt');
+  assert.equal(pending.length, 2);
+  assert.equal(api.outgoing()[0], entry);
+  assert.equal(messages.children.length, 1);
+  assert.equal(messages.children[0].dataset.outgoingId, String(entry.localId));
+  assert.deepEqual(JSON.parse(pending[1].body!), { id: 'peer', msg: 'original [body]', steamAccountId: 'account' });
+  assert.equal(nodes['#messageInput'].value, 'edited draft');
+  pending[1].respond(400, { error: 'still rejected', uncertain: false });
+  assert.equal(await retrying, false);
+  assert.equal(entry.state, 'failed');
+  assert.equal(entry.retryText, 'original [body]');
+  assert.equal(nodes['#messageInput'].value, 'edited draft');
+  assert.equal(await api.resendOutgoingText(entry), false, 'a rejected send cannot masquerade as an unknown replacement');
+  await api.checkOutgoingText(entry);
+  assert.equal(pending.length, 2);
+});
+
+for (const stale of ['peer', 'account', 'active account', 'access', 'permission', 'read grant', 'invalidate', 'dismissed'] as const) {
+  test(`manual text actions refuse stale ${stale} contexts`, async () => {
+    for (const state of ['failed', 'unknown'] as const) {
+      const { api, pending, messages, entry } = await manualTextAttempt(state);
+      if (stale === 'peer') api.state.activeId = 'other';
+      if (stale === 'account') api.state.steam.steamId = 'other';
+      if (stale === 'active account') api.state.steam.activeAccount = { id: 2, steamId: 'other', label: 'Other' };
+      if (stale === 'access') api.state.steam.accessAllowed = false;
+      if (stale === 'permission') api.state.permissions = [];
+      if (stale === 'read grant') api.state.steam.steamGrant = { level: 'read', scope: 'all', peerCount: 0 };
+      if (stale === 'invalidate') api.invalidateChat();
+      if (stale === 'dismissed') {
+        const dismiss = messages.children[0].children.flatMap(node => node.children).find(node => node.textContent === '移除此提示');
+        assert.ok(dismiss);
+        dismiss.dispatch('click');
+      }
+      assert.equal(await api.retryOutgoingText(entry), false);
+      assert.equal(await api.resendOutgoingText(entry), false);
+      await api.checkOutgoingText(entry);
+      assert.equal(pending.length, 1, 'stale actions must neither check nor send');
+    }
+  });
+}
+
+test('manual unknown check posts original attempt metadata and only actual history clears it', async () => {
+  const { api, pending, nodes, entry } = await manualTextAttempt('unknown');
+  nodes['#messageInput'].value = 'later draft';
+  const checking = api.checkOutgoingText(entry);
+  await api.checkOutgoingText(entry);
+  assert.equal(await api.resendOutgoingText(entry), false, 'a check in flight blocks replacement');
+  assert.equal(pending.length, 2);
+  assert.equal(pending[1].url.pathname, '/api/messages/check');
+  assert.equal(pending[1].method, 'POST');
+  assert.deepEqual(JSON.parse(pending[1].body!), { id: 'peer', msg: 'original [body]', sentAt: entry.item.sentAt, steamAccountId: 'account' });
+  pending[1].resolve({ items: [] });
+  await checking;
+  assert.equal(entry.state, 'unknown');
+  assert.match(entry.textCheckReason!, /未找到.*仍可能已发送/);
+  assert.equal(api.items().length, 0);
+  const again = api.checkOutgoingText(entry);
+  const confirmed = { ...entry.item, eventId: 'checked', steamAccountId: 'account', message: 'original \\[body]' };
+  pending[2].resolve({ items: [confirmed] });
+  await again;
+  assert.equal(api.outgoing().length, 0);
+  assert.equal(api.items()[0].eventId, 'checked');
+  assert.equal(nodes['#messageInput'].value, 'later draft');
+  assert.equal(pending.filter(request => request.url.pathname === '/message').length, 1, 'check never calls /message');
+});
+
+for (const result of ['failure', 'rejected check', 'malformed', 'wrong peer', 'wrong account', 'incoming', 'missing event', 'wrong type', 'missing time', 'other body'] as const) {
+  test(`manual unknown check ${result} never invents success or failure`, async () => {
+    const { api, pending, entry } = await manualTextAttempt('unknown');
+    const checking = api.checkOutgoingText(entry);
+    const candidate = { ...entry.item, eventId: 'candidate', steamAccountId: 'account' };
+    if (result === 'failure') pending[1].respond(503, { error: 'History unavailable' });
+    else if (result === 'rejected check') pending[1].respond(400, { error: 'Check rejected', uncertain: false });
+    else if (result === 'malformed') pending[1].resolve({ ok: true });
+    else {
+      if (result === 'wrong peer') candidate.id = 'other';
+      if (result === 'wrong account') candidate.steamAccountId = 'other';
+      if (result === 'incoming') candidate.echo = false;
+      if (result === 'missing event') candidate.eventId = '';
+      if (result === 'wrong type') candidate.type = 'image';
+      if (result === 'missing time') candidate.sentAt = '';
+      if (result === 'other body') candidate.message = 'different body';
+      pending[1].resolve({ items: [candidate] });
+    }
+    await checking;
+    assert.equal(entry.state, 'unknown');
+    assert.equal(api.outgoing().length, 1);
+    assert.equal(entry.textCheckBusy, false);
+    assert.match(entry.textCheckReason!, result === 'failure' || result === 'rejected check' || result === 'malformed' ? /检查失败/ : /未找到/);
+    assert.equal(pending.length, 2);
+  });
+}
+
+for (const stale of ['peer', 'account', 'access', 'invalidate'] as const) {
+  test(`check ignores a response after ${stale} changes`, async () => {
+    const { api, pending, entry } = await manualTextAttempt('unknown');
+    const checking = api.checkOutgoingText(entry);
+    if (stale === 'peer') api.state.activeId = 'other';
+    if (stale === 'account') api.state.steam.steamId = 'other';
+    if (stale === 'access') api.state.steam.accessAllowed = false;
+    if (stale === 'invalidate') api.invalidateChat();
+    pending[1].resolve({ items: [{ ...entry.item, eventId: 'stale-check' }] });
+    await checking;
+    assert.equal(api.items().length, 0);
+    assert.equal(entry.state, 'unknown');
+  });
+}
+
+test('explicit unknown resend creates only one new attempt and preserves the original until its own confirmation', async () => {
+  const { api, pending, nodes, entry } = await manualTextAttempt('unknown');
+  nodes['#messageInput'].value = 'new draft';
+  const resending = api.resendOutgoingText(entry);
+  assert.equal(await api.resendOutgoingText(entry), false);
+  assert.equal(pending.length, 2);
+  const replacement = api.outgoing()[1];
+  assert.equal(entry.state, 'unknown');
+  assert.equal(entry.replacementLocalId, replacement.localId);
+  assert.notEqual(entry.localId, replacement.localId);
+  assert.equal(replacement.state, 'sending');
+  assert.equal(nodes['#messageInput'].value, 'new draft');
+  assert.deepEqual(JSON.parse(pending[1].body!), { id: 'peer', msg: 'original [body]', steamAccountId: 'account' });
+  const confirmed = { ...replacement.item, eventId: 'replacement-confirmed' };
+  api.receiveHistoryMessage(confirmed);
+  assert.equal(api.outgoing()[0], entry);
+  assert.equal(entry.state, 'unknown', 'replacement echo must not consume the original');
+  pending[1].resolve({ ok: true, item: confirmed });
+  assert.equal(await resending, true);
+  assert.equal(api.outgoing().length, 1);
+  assert.equal(api.outgoing()[0], entry);
+  assert.equal(await api.resendOutgoingText(entry), false, 'replacement guard survives its confirmation');
+  const checking = api.checkOutgoingText(entry);
+  pending[2].resolve({ items: [{ ...entry.item, eventId: 'original-confirmed' }] });
+  await checking;
+  assert.equal(api.outgoing().length, 0);
+  assert.equal(api.items().length, 2);
+});
+
+test('a rejected replacement leaves the old attempt unknown and the new one failed', async () => {
+  const { api, pending, entry } = await manualTextAttempt('unknown');
+  const resending = api.resendOutgoingText(entry);
+  pending[1].respond(400, { error: 'Actually rejected', uncertain: false });
+  assert.equal(await resending, false);
+  assert.equal(api.outgoing()[0].state, 'unknown');
+  assert.equal(api.outgoing()[1].state, 'failed');
+  assert.equal(await api.resendOutgoingText(entry), false);
+  assert.equal(pending.length, 2);
+});
 
 test('outgoing rows survive peer switches, but account invalidation discards stale completions', async () => {
   const { api, pending, nodes, messages } = harness();

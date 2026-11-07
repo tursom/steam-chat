@@ -169,7 +169,8 @@ test('backend auth gates chat HTTP APIs and reports Steam offline as 503', async
   assert.equal(sendResponse.status, 503);
   assert.deepEqual(await sendResponse.json(), {
     error: 'Steam is not logged in',
-    steamStatus: 'logged_out'
+    steamStatus: 'logged_out',
+    uncertain: false
   });
 });
 

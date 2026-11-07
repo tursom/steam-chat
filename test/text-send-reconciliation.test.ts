@@ -215,6 +215,19 @@ test('real SDK 10-second acknowledgement timeout triggers one read and never res
   t.mock.timers.reset();
 });
 
+test('explicit Steam rejections are failed rather than uncertain and never retried automatically', async t => {
+  for (const eresult of [8, 15, 17, 25, 84]) {
+    const { service, user, records, counts } = probe(t, async () => ({ messages: [entry()] }));
+    let sends = 0;
+    user.chat.sendFriendMessage = (_id, _message, callback) => {
+      sends++; callback(Object.assign(new Error('Steam rejected the request'), { eresult }));
+    };
+    await assert.rejects(service.sendTextMessage(peer, 'lost ack', account),
+      (error: { uncertain?: boolean }) => error.uncertain === false);
+    assert.equal(sends, 1); assert.equal(counts().reads, 0); assert.equal(records.length, 0);
+  }
+});
+
 test('successful sends, permanent failures and pre-submission failures never read history', async t => {
   for (const kind of ['success', 'permanent', 'before submission']) {
     const { service, user, records, counts } = probe(t, async () => ({ messages: [entry()] }), {
@@ -320,8 +333,22 @@ test('revocation during a failed history read still surfaces the authorization e
   assert.deepEqual(records, []);
 });
 
+test('a healthy five-second history lookup still reconciles the delivered message', async t => {
+  let complete!: (error: unknown, result?: unknown) => void;
+  const { service, records } = probe(t, (_id, _opts, callback) => { complete = callback; });
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const actual = entry();
+  const sending = assert.rejects(service.sendTextMessage(peer, 'lost ack', account), uncertain);
+  await turn();
+  t.mock.timers.tick(4900);
+  complete(null, { messages: [actual] });
+  await sending;
+  assert.equal(records.length, 1);
+  assert.equal(records[0].ordinal, actual.ordinal);
+});
+
 for (const late of ['callback', 'resolve', 'reject'] as const) {
-  test(`3-second history bound discards late ${late} without persistence`, async t => {
+  test(`12-second history bound discards late ${late} without persistence`, async t => {
     let complete!: (error: unknown, result?: unknown) => void;
     let resolve!: (value: unknown) => void;
     let reject!: (error: unknown) => void;
@@ -333,7 +360,7 @@ for (const late of ['callback', 'resolve', 'reject'] as const) {
     let finished = false;
     const sending = assert.rejects(service.sendTextMessage(peer, 'lost ack', account), uncertain).then(() => { finished = true; });
     await turn();
-    t.mock.timers.tick(2999);
+    t.mock.timers.tick(11_999);
     await turn();
     assert.equal(finished, false);
     t.mock.timers.tick(1);

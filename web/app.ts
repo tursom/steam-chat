@@ -284,7 +284,8 @@ const state: AppState = {
 };
 
 type OutgoingState = 'sending' | 'sent' | 'failed' | 'unknown';
-type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string; echoEventId?: string; retryText?: string };
+type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string; echoEventId?: string;
+  readonly retryText?: string; readonly textSteamAccountId?: string; textCheckBusy?: boolean; textCheckReason?: string; replacementLocalId?: number; previousLocalId?: number };
 type ImageOperation = { id: string; peerId: string; steamAccountId: string; state: string; version: number;
   attempts: number; maxAttempts: number; nextRetryAt: number; phase: string; error?: string; retryable: boolean; hasImage: boolean; item?: MessageItem; cooldownUntil?: number; replacementId?: string };
 type ImageOperationEntry = OutgoingMessage & { operation?: ImageOperation; imagePayload?: Record<string, string>; transfer?: ImageTransfer;
@@ -3476,7 +3477,10 @@ function reconcileOutgoingText(item: MessageItem) {
   // Associate display only, one attempt per new Steam event. A recorded message
   // is displayed normally even if its HTTP acknowledgement was lost. Keep an
   // in-flight request until its own response so an explicit rejection stays distinct.
-  for (const entry of outgoingMessages.values()) {
+  // An explicit extra copy owns its confirmation before the older unknown row.
+  // Ordinary identical sends retain their original insertion order.
+  const attempts = [...outgoingMessages.values()].sort((a, b) => Number(b.previousLocalId !== undefined) - Number(a.previousLocalId !== undefined));
+  for (const entry of attempts) {
     if (entry.context !== chatContext() || entry.item.id !== item.id || entry.item.type !== 'message'
       || entry.state === 'failed' || entry.echoEventId || entry.retryText === undefined) continue;
     const startedAt = Date.parse(entry.item.sentAt || '');
@@ -3508,7 +3512,7 @@ function refreshOutgoing(forceBottom = false) {
   }
 }
 
-function beginOutgoing(id: string, message: string, type = 'message') {
+function beginOutgoing(id: string, message: string, type = 'message', retryText?: string) {
   const returnToLatest = historyDetached || historyBrowsingRequest;
   if (returnToLatest) {
     if (historyDetached) historyItems = [];
@@ -3518,7 +3522,8 @@ function beginOutgoing(id: string, message: string, type = 'message') {
     const date = document.querySelector<HTMLInputElement>('#historyDate');
     if (date) date.value = '';
   }
-  const entry: OutgoingMessage = { localId: ++outgoingId, context: chatContext(), state: 'sending',
+  const entry: OutgoingMessage = { localId: ++outgoingId, context: chatContext(), state: 'sending', retryText,
+    textSteamAccountId: retryText === undefined ? undefined : state.steam.activeAccount?.steamId || state.steam.steamId || '',
     item: { id, message, type, echo: true, name: '我', sentAt: new Date().toISOString() } };
   outgoingMessages.set(entry.localId, entry);
   refreshOutgoing(true);
@@ -3609,10 +3614,10 @@ function renderHistory(items: MessageItem[]) {
     if (operationEntry.operation) row.dataset.operationId = operationEntry.operation.id;
     const status = create('span', 'message-send-state');
     if (operationEntry.operation) status.append(create('span', 'outgoing-status-label', imageOperationLabel(operationEntry.operation, operationEntry.uploadRejection)));
-    else status.textContent = labels[entry.state];
+    else status.textContent = entry.state === 'unknown' && entry.retryText !== undefined ? '结果未确认' : labels[entry.state];
     if (entry.state !== 'sent') status.prepend(chatIcon(operationEntry.operation?.state === 'retry_wait' ? 'refresh-cw' : entry.state === 'failed' ? 'circle-alert' : entry.state === 'unknown' ? 'circle-help' : 'clock'));
     status.setAttribute('role', 'status');
-    if (entry.error) {
+    if (entry.error && !(entry.state === 'unknown' && entry.retryText !== undefined && /^(?:文字)?发送结果未确认，请先检查聊天记录。?$/.test(entry.error))) {
       status.title = entry.error;
       const reason = entry.error === 'RateLimitExceeded' ? 'Steam 发送频率受限，请稍后再试' : entry.error;
       status.append(create('span', 'outgoing-error', reason));
@@ -3622,10 +3627,7 @@ function renderHistory(items: MessageItem[]) {
     const bubble = create('div', 'local-outgoing-state'); foot.append(bubble);
     bubble.append(status);
     if (operationEntry.operation || operationEntry.operationCreatingFailed) appendImageOperationActions(bubble as HTMLElement, operationEntry);
-    if (entry.state === 'failed' && entry.retryText && !operationEntry.operation && !operationEntry.operationCreatingFailed && entry.item.type !== 'image' && grantAtLeast(requiresFullText(entry.retryText) ? 'full' : 'chat')) {
-      const retry = create('button', 'ghost-btn outgoing-retry', '重试');
-      retry.addEventListener('click', () => { outgoingMessages.delete(entry.localId); void sendText(entry.retryText, entry.item.message); }); bubble.append(retry);
-    }
+    if (entry.retryText !== undefined && !operationEntry.operation && !operationEntry.operationCreatingFailed) appendTextOutgoingActions(bubble, entry);
     if (entry.state === 'failed' || entry.state === 'unknown') {
       const dismiss = create('button', 'ghost-btn outgoing-dismiss', '移除此提示');
       dismiss.type = 'button';
@@ -4734,14 +4736,90 @@ async function sendText(explicitMessage?: string, previewMessage?: string): Prom
   const msg = draft.trim();
   if (!id || !msg || isCommunityGroup(id)) return false;
   if (requiresFullText(msg) && !grantAtLeast('full')) { setFeedback('贴纸和聊天效果需要「完整」授权', 'warn'); return false; }
-  const outgoing = beginOutgoing(id, previewMessage ?? msg.replace(/\[/g, '\\['));
-  outgoing.retryText = msg;
+  const outgoing = beginOutgoing(id, previewMessage ?? msg.replace(/\[/g, '\\['), 'message', msg);
   if (explicitMessage === undefined && input) { input.value = ''; resizeComposerInput(input); }
+  return sendOutgoingText(outgoing);
+}
+
+function canActOnOutgoingText(entry: OutgoingMessage) {
+  const account = state.steam.activeAccount?.steamId || state.steam.steamId;
+  return outgoingMessages.get(entry.localId) === entry && entry.context === chatContext() && !!state.me
+    && entry.item.id === state.activeId && !isCommunityGroup(entry.item.id) && entry.item.type === 'message'
+    && entry.retryText !== undefined && !!account && account === entry.textSteamAccountId
+    && grantAtLeast(requiresFullText(entry.retryText) ? 'full' : 'chat');
+}
+
+async function retryOutgoingText(entry: OutgoingMessage): Promise<boolean> {
+  if (!canActOnOutgoingText(entry) || !steamOnline() || entry.state !== 'failed' || entry.textCheckBusy) return false;
+  entry.state = 'sending';
+  entry.error = entry.textCheckReason = entry.echoEventId = undefined;
+  entry.item = { ...entry.item, sentAt: new Date().toISOString() };
+  refreshOutgoing();
+  return sendOutgoingText(entry);
+}
+
+async function resendOutgoingText(entry: OutgoingMessage): Promise<boolean> {
+  if (!canActOnOutgoingText(entry) || !steamOnline() || entry.state !== 'unknown' || entry.textCheckBusy || entry.replacementLocalId !== undefined) return false;
+  const replacement = beginOutgoing(entry.item.id, entry.item.message || '', 'message', entry.retryText);
+  replacement.previousLocalId = entry.localId;
+  entry.replacementLocalId = replacement.localId;
+  refreshOutgoing(true);
+  return sendOutgoingText(replacement);
+}
+
+async function checkOutgoingText(entry: OutgoingMessage): Promise<void> {
+  if (!canActOnOutgoingText(entry) || entry.state !== 'unknown' || entry.textCheckBusy) return;
+  entry.textCheckBusy = true;
+  entry.textCheckReason = undefined;
+  refreshOutgoing();
   const controller = new AbortController();
   const deadline = setTimeout(() => controller.abort(), networkDeadlineMs);
   try {
     const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId;
-    const response = await api('/message', { ...jsonBody({ id, msg, ...(steamAccountId ? { steamAccountId } : {}) }), signal: controller.signal });
+    const response = await api('/api/messages/check', { ...jsonBody({ id: entry.item.id, msg: entry.retryText, sentAt: entry.item.sentAt, steamAccountId }), signal: controller.signal });
+    if (!canActOnOutgoingText(entry) || entry.state !== 'unknown') return;
+    if (!isRecord(response) || !Array.isArray(response.items)) throw new Error('检查接口未返回消息记录');
+    const items = asMessages(response.items).filter(item => item.id === entry.item.id && item.echo === true
+      && typeof item.eventId === 'string' && !!item.eventId && (!item.type || item.type === 'message')
+      && typeof item.message === 'string' && Number.isFinite(Date.parse(item.sentAt || item.date || ''))
+      && (!item.steamAccountId || item.steamAccountId === steamAccountId));
+    for (const item of items) receiveHistoryMessage(item);
+    if (outgoingMessages.get(entry.localId) === entry) entry.textCheckReason = '未找到可确认的发送记录，消息仍可能已发送；请稍后再检查。';
+  } catch (error) {
+    if (canActOnOutgoingText(entry) && entry.state === 'unknown') entry.textCheckReason = `检查失败：${errorMessage(error)}。发送结果仍未确认。`;
+  } finally {
+    clearTimeout(deadline);
+    entry.textCheckBusy = false;
+    if (entry.context === chatContext() && entry.item.id === state.activeId) refreshOutgoing();
+  }
+}
+
+function appendTextOutgoingActions(container: HTMLElement, entry: OutgoingMessage) {
+  if (entry.state !== 'failed' && entry.state !== 'unknown') return;
+  const allowed = canActOnOutgoingText(entry);
+  const action = (label: string, className: string, enabled: boolean, run: () => Promise<unknown>) => {
+    const button = create('button', `ghost-btn ${className}`, label);
+    button.type = 'button';
+    button.disabled = !enabled;
+    button.addEventListener('click', () => { if (!button.disabled) { button.disabled = true; void run(); } });
+    container.append(button);
+  };
+  if (entry.state === 'failed') action('重试发送', 'outgoing-retry', allowed && steamOnline(), () => retryOutgoingText(entry));
+  else {
+    container.append(create('span', 'outgoing-duplicate-risk', '消息可能已经送达，仍要发送一份可能产生重复消息。'));
+    if (entry.textCheckReason) container.append(create('span', 'outgoing-check-reason', entry.textCheckReason));
+    action(entry.textCheckBusy ? '正在检查…' : '检查发送结果', 'outgoing-check', allowed && !entry.textCheckBusy, () => checkOutgoingText(entry));
+    action('仍要发送一份', 'outgoing-resend', allowed && steamOnline() && !entry.textCheckBusy && entry.replacementLocalId === undefined, () => resendOutgoingText(entry));
+    if (entry.replacementLocalId !== undefined) container.append(create('span', 'outgoing-replacement', '已另发一份，请查看新消息的发送状态。'));
+  }
+}
+
+async function sendOutgoingText(outgoing: OutgoingMessage): Promise<boolean> {
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), networkDeadlineMs);
+  try {
+    const steamAccountId = outgoing.textSteamAccountId;
+    const response = await api('/message', { ...jsonBody({ id: outgoing.item.id, msg: outgoing.retryText, ...(steamAccountId ? { steamAccountId } : {}) }), signal: controller.signal });
     if (!isRecord(response) || response.ok !== true) throw new Error('文字发送结果未确认，请先检查聊天记录。');
     finishOutgoing(outgoing, 'sent', response);
     return true;
