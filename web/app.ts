@@ -3465,10 +3465,17 @@ function reconcileOutgoingText(item: MessageItem) {
   if (item.steamAccountId && item.steamAccountId !== account) return false;
   const sentAt = Date.parse(String(item.sentAt || item.date || '').replace(' ', 'T'));
   if (!Number.isFinite(sentAt)) return false;
-  const normalize = (text: string) => text.replace(/(?<!\\)\[emoticon\]([^\[\]\r\n]+)\[\/emoticon\]/gi, ':$1:');
+  const normalize = (text: string) => text
+    .replace(/(?<!\\)\[emoticon\]([^\[\]\r\n]+)\[\/emoticon\]/gi, ':$1:')
+    .replace(/(?<!\\)\[url(?:=(?:"([^"\r\n]+)"|'([^'\r\n]+)'|([^\]\s]+)))?\](https?:\/\/[^\s\[\]<>"']+)\[\/url\]/gi,
+      (original, quoted: string | undefined, singleQuoted: string | undefined, bare: string | undefined, body: string) => {
+        const target = quoted ?? singleQuoted ?? bare;
+        return target === undefined || target === body ? body : original;
+      });
   const text = normalize(item.message || '');
-  // Associate display only, one attempt per new Steam event. The request remains
-  // pending until its own response; matching text is not proof of its success.
+  // Associate display only, one attempt per new Steam event. A recorded message
+  // is displayed normally even if its HTTP acknowledgement was lost. Keep an
+  // in-flight request until its own response so an explicit rejection stays distinct.
   for (const entry of outgoingMessages.values()) {
     if (entry.context !== chatContext() || entry.item.id !== item.id || entry.item.type !== 'message'
       || entry.state === 'failed' || entry.echoEventId || entry.retryText === undefined) continue;
@@ -3477,6 +3484,7 @@ function reconcileOutgoingText(item: MessageItem) {
     const candidates = [entry.retryText, entry.retryText.replace(/\[/g, '\\['), entry.item.message || ''];
     if (!candidates.some(candidate => normalize(candidate) === text)) continue;
     entry.echoEventId = item.eventId; rememberClaimedText(item.eventId);
+    if (entry.state === 'unknown') outgoingMessages.delete(entry.localId);
     return true;
   }
   return false;
@@ -3537,6 +3545,7 @@ function finishOutgoing(entry: OutgoingMessage, status: OutgoingState, response?
       }
     }
   }
+  if (status === 'unknown' && entry.echoEventId) outgoingMessages.delete(entry.localId);
   if (entry.item.id === state.activeId) refreshOutgoing();
 }
 
@@ -3580,6 +3589,10 @@ function renderHistory(items: MessageItem[]) {
   for (const entry of outgoing) {
     const localImage = entry.item.type === 'image' && (/^data:image\//i.test(entry.item.message || '') || (entry.item.message || '').startsWith('/api/image-emotes/file/') || (entry.item.message || '').startsWith('/api/send-operations/'));
     const linkedRow = entry.echoEventId ? desired.find(row => (row as HTMLElement).dataset.eventId === entry.echoEventId) as HTMLElement | undefined : undefined;
+    if (linkedRow && entry.state !== 'failed') {
+      linkedRow.dataset.sendState = 'sent';
+      continue;
+    }
     const row = linkedRow || renderMessage(localImage ? { ...entry.item, message: '[图片]' } : entry.item);
     row.dataset.outgoingId = String(entry.localId);
     row.dataset.sendState = entry.state;

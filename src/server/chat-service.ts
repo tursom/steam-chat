@@ -7,7 +7,7 @@ import { resolveBilibiliLink } from './bilibili-links';
 import { resolveStickerAlias } from './sticker-inventory';
 import { SteamInventoryCache, type SteamInventory } from './steam-inventory-cache';
 import { settleMetadata } from '../steam/metadata';
-import { steamEventKey } from '../storage/history-message';
+import { replayMessage, steamEventKey } from '../storage/history-message';
 import type { HistoryStorage } from '../storage/history-storage';
 import type { IncomingMessage, Server, ServerResponse } from 'node:http';
 import type { Duplex } from 'node:stream';
@@ -72,6 +72,7 @@ type Waiter = Promise<unknown> | (() => Promise<unknown> | unknown);
 
 type SteamChatApi = {
   sendFriendMessage?: CallbackStyleFunction;
+  getFriendMessageHistory?: CallbackStyleFunction;
   getEmoticonList?: CallbackStyleFunction;
   on?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
   off?: (event: 'friendMessage' | 'friendMessageEcho', listener: (...args: unknown[]) => void) => void;
@@ -1468,9 +1469,11 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
   }
 
-  async function persistSent(record: HistoryRecordInput): Promise<HistoryItem> {
+  async function persistSent(record: HistoryRecordInput, authorize?: () => void): Promise<HistoryItem> {
+    authorize?.();
     if (!historyStorage) {
       const item = await appendLog(record, { logPath });
+      authorize?.();
       broadcast({ type: 'message', ...item });
       return item;
     }
@@ -1489,6 +1492,74 @@ function createChatService(options: ChatServiceOptions = {}) {
     }
   }
 
+  async function reconcileTextSend(id: string, message: string, steamAccountId: string | undefined,
+    submittedAt: number, selfName: Promise<string>, authorize: () => void) {
+    const chat = steamUser?.chat;
+    if (!steamAccountId || !chat?.getFriendMessageHistory) return;
+    const guard = () => {
+      authorize();
+      checkSend(steamAccountId);
+      const identities = [steamIdToString(steamUser?.steamID), ensureActiveSteamAccount()?.steamId,
+        currentSteamStatus().steamId].filter(Boolean);
+      if (identities.some(identity => identity !== steamAccountId)) {
+        throw Object.assign(new Error('Steam account changed during text reconciliation'), { statusCode: 409 });
+      }
+    };
+    guard();
+    const deadline = Date.now() + 3000;
+    let timer: NodeJS.Timeout | undefined;
+    let response: unknown;
+    try {
+      // The read has no side effects. Racing it here also consumes late SDK
+      // fulfillment/rejection without allowing late results to reach persistence.
+      response = await Promise.race([
+        callMaybeCallback(chat.getFriendMessageHistory, chat, [id, { maxCount: 20, wantBbcode: true }]),
+        new Promise<undefined>(resolve => { timer = setTimeout(() => resolve(undefined), 3000); })
+      ]).catch((): undefined => undefined);
+    } finally { if (timer) clearTimeout(timer); }
+    guard();
+    if (Date.now() >= deadline || !isRecord(response) || !Array.isArray(response.messages)) return;
+    const readAt = Date.now();
+    // sendFriendMessage's default BBCode mode escapes literal brackets before
+    // submission. Only Steam's returned wrappers may be projected as markup.
+    const expected = replayMessage(message.replace(/\[/g, '\\['));
+    const records: HistoryRecordInput[] = [];
+    for (const item of response.messages.slice(0, 20)) {
+      if (!isRecord(item) || steamIdToString(item.sender) !== steamAccountId
+        || typeof item.message !== 'string' || replayMessage(item.message) !== expected
+        || !(item.server_timestamp instanceof Date)
+        || !(typeof item.ordinal === 'number' || typeof item.ordinal === 'string' && /^\d+$/.test(item.ordinal))) continue;
+      const at = item.server_timestamp.getTime();
+      // Steam timestamps have second precision; allow only a small clock margin.
+      if (!Number.isFinite(at) || at < submittedAt - 1000 || at > readAt + 1000) continue;
+      const key = steamEventKey(steamAccountId, id, true, item.message, item.server_timestamp, item.ordinal);
+      if (!key) continue;
+      records.push({ type: 'message', echo: true, steamAccountId, id, message: item.message,
+        ordinal: item.ordinal, sentAt: item.server_timestamp.toISOString(), steamEventKey: key });
+    }
+    if (!records.length) return;
+    const name = await selfName;
+    guard();
+    records.sort((a, b) => a.sentAt!.localeCompare(b.sentAt!) || Number(a.ordinal) - Number(b.ordinal));
+    for (const record of records) {
+      guard();
+      if (Date.now() >= deadline) return;
+      // Durable storage deduplicates by Steam identity. The legacy JSONL path
+      // needs the same protection when overlapping failed sends read one event.
+      const legacyKey = `reconciled:${record.steamEventKey}`;
+      if (!historyStorage && isRecent(recentSentText, legacyKey)) continue;
+      if (!historyStorage) remember(recentSentText, legacyKey);
+      try { await persistSent({ ...record, name }, guard); }
+      catch (error) {
+        if (!historyStorage) recentSentText.delete(legacyKey);
+        if (isRecord(error) && [401, 403, 409].includes(Number(error.statusCode))) throw error;
+        guard();
+        logger.warn?.('Text reconciliation persistence failed', { error: errorMessage(error) });
+      }
+    }
+    guard();
+  }
+
   async function sendTextMessage(id: unknown, msg: unknown, steamAccountId?: string, authorize?: (level?: SteamLevel) => void): Promise<HistoryItem> {
     rejectGroupRecipient(id);
     steamAccountId = steamAccountId || ensureActiveSteamAccount()?.steamId || currentSteamStatus().steamId || undefined;
@@ -1504,20 +1575,21 @@ function createChatService(options: ChatServiceOptions = {}) {
     // Resolve the text classification before any waiter or retry can yield to a grant change.
     const level: SteamLevel = requiresFullLevel(message) ? 'full' : 'chat';
     authorize?.(level);
-    let submitted = false;
+    let submittedAt: number | undefined;
     const result = await withSteamRetry(() => {
       authorize?.(level);
       checkSend(steamAccountId);
       const sender = steamUser.chat?.sendFriendMessage || steamUser.sendFriendMessage;
       const context = steamUser.chat?.sendFriendMessage ? steamUser.chat : steamUser;
       if (!sender) throw new Error('Steam chat sender is unavailable');
-      submitted = true;
+      submittedAt = Date.now();
       return callMaybeCallback(sender, context, [id, message]);
-    }, false, false).catch(error => {
+    }, false, false).catch(async error => {
       // Steam may deliver the message before its acknowledgement is lost. Text
       // submissions have no idempotency token, so retrying can send another copy.
-      if (submitted && (isTransientSteamError(error) || /timed\s*out/i.test(errorMessage(error))
+      if (submittedAt !== undefined && (isTransientSteamError(error) || /timed\s*out/i.test(errorMessage(error))
         || isRecord(error) && Number(error.eresult) === 16)) {
+        await reconcileTextSend(String(id), message, steamAccountId, submittedAt, selfName, () => authorize?.(level));
         throw Object.assign(new Error('文字发送结果未确认，请先检查聊天记录。', { cause: error }), { statusCode: 502, uncertain: true });
       }
       throw error;

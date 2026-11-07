@@ -253,15 +253,42 @@ test('an HTTP confirmation does not consume another identical send awaiting its 
   assert.equal(api.items().length, 2);
 });
 
-test('a lost HTTP reply keeps uncertainty on one echo row without creating a second message', async () => {
+test('a lost HTTP reply leaves a recorded echo without a false uncertainty warning or second message', async () => {
   const { api, pending, nodes, messages } = harness();
   nodes['#messageInput'].value = 'delivered'; const sending = api.sendText();
   api.receiveHistoryMessage({ ...item('delivered'), echo: true, sentAt: new Date().toISOString() });
   pending[0].reject(new Error('proxy connection reset'));
   assert.equal(await sending, false);
-  assert.equal(messages.children.length, 1); assert.equal(api.outgoing().length, 1);
-  assert.equal(api.outgoing()[0].state, 'unknown');
+  assert.equal(messages.children.length, 1); assert.equal(api.outgoing().length, 0);
+  assert.equal(messages.children[0].dataset.sendState, 'sent');
   assert.equal(pending.length, 1, 'no implicit retry follows a lost HTTP reply');
+});
+
+test('a delayed recorded echo clears an uncertain attempt after its HTTP request has failed', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'delivered later'; const sending = api.sendText();
+  pending[0].respond(502, { error: 'Acknowledgement lost', uncertain: true });
+  assert.equal(await sending, false); assert.equal(api.outgoing()[0].state, 'unknown');
+  const confirmed = { ...item('late-echo'), message: 'delivered later', echo: true, sentAt: new Date().toISOString() };
+  api.receiveHistoryMessage(confirmed); api.receiveHistoryMessage(confirmed);
+  assert.equal(api.outgoing().length, 0); assert.equal(messages.children.length, 1);
+  assert.equal(api.items()[0].eventId, 'late-echo');
+  assert.equal(pending.length, 1, 'confirmation never resends a message');
+});
+
+test('one recorded echo clears only one of two identical uncertain sends', async () => {
+  const { api, pending, nodes, messages } = harness();
+  nodes['#messageInput'].value = 'same'; const first = api.sendText();
+  nodes['#messageInput'].value = 'same'; const second = api.sendText();
+  for (const request of pending) request.respond(502, { error: 'Acknowledgement lost', uncertain: true });
+  await Promise.all([first, second]);
+  const confirmed = { ...item('one-echo'), message: 'same', echo: true, sentAt: new Date().toISOString() };
+  api.receiveHistoryMessage(confirmed); api.receiveHistoryMessage(confirmed);
+  assert.equal(api.outgoing().length, 1); assert.equal(api.outgoing()[0].state, 'unknown');
+  assert.equal(messages.children.length, 2);
+  api.receiveHistoryMessage({ ...confirmed, eventId: 'second-echo' });
+  assert.equal(api.outgoing().length, 0); assert.equal(messages.children.length, 2);
+  assert.equal(pending.length, 2);
 });
 
 test('incoming, other-peer, other-account and old echoes cannot confirm a new text send', async () => {
@@ -293,6 +320,28 @@ test('latest history reconciles a confirmed text when its WebSocket echo was mis
   assert.equal(messages.children.length, 1); assert.equal(api.outgoing().length, 1);
   pending[0].reject(new Error('HTTP reply lost'));
   assert.equal(await sending, false); assert.equal(messages.children.length, 1);
+  assert.equal(api.outgoing().length, 0);
+});
+
+for (const wrapper of ['[url]https://example.com/video[/url]', '[url="https://example.com/video"]https://example.com/video[/url]']) {
+  test(`canonical URL echo clears an uncertain plain URL send: ${wrapper}`, async () => {
+    const { api, pending, nodes, messages } = harness();
+    nodes['#messageInput'].value = 'https://example.com/video'; const sending = api.sendText();
+    pending[0].respond(502, { error: 'Acknowledgement lost', uncertain: true }); await sending;
+    api.receiveHistoryMessage({ ...item('url-echo'), echo: true, message: wrapper, sentAt: new Date().toISOString() });
+    assert.equal(api.outgoing().length, 0); assert.equal(messages.children.length, 1);
+    assert.equal(pending.length, 1);
+  });
+}
+
+test('a named or different-target URL cannot clear an uncertain plain URL send', async () => {
+  const { api, pending, nodes } = harness();
+  nodes['#messageInput'].value = 'https://example.com/video'; const sending = api.sendText();
+  pending[0].respond(502, { error: 'Acknowledgement lost', uncertain: true }); await sending;
+  for (const message of ['[url=https://other.example/]https://example.com/video[/url]', '[url=https://example.com/video]a video[/url]']) {
+    api.receiveHistoryMessage({ ...item(message), echo: true, message, sentAt: new Date().toISOString() });
+  }
+  assert.equal(api.outgoing().length, 1); assert.equal(api.outgoing()[0].state, 'unknown');
 });
 
 test('an unconfirmed text request has a finite deadline without being sent again', async () => {

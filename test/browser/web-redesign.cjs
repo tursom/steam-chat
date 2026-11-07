@@ -25,7 +25,10 @@ async function fixture(t, identity = 'super', width = 1440, initialView = 'chat'
   const page = await context.newPage(); page.setDefaultTimeout(6000);
   const errors = [], requests = [], writes = [];
   page.on('pageerror', error => errors.push(error.message));
-  await page.routeWebSocket(/.*/, () => {});
+  const sockets = [];
+  let socketReady;
+  const connected = new Promise(resolve => { socketReady = resolve; });
+  await page.routeWebSocket(/.*/, socket => { sockets.push(socket); socketReady(); });
   const profile = identities[identity];
   const user = { id: 1, username: identity, displayName: '测试用户', roleId: profile.roleId, roleName: identity === 'super' ? '超级管理员' : '成员' };
   const steam = { status: 'online', steamId: account, activeAccount: { id: 1, steamId: account, label: '主号' }, accessAllowed: true,
@@ -78,7 +81,8 @@ async function fixture(t, identity = 'super', width = 1440, initialView = 'chat'
   await page.goto('http://redesign.test/');
   await page.locator('.shell#chatLayout').waitFor();
   await page.waitForFunction(() => document.querySelectorAll('#chatListSections .conv').length > 0);
-  return { page, context, profile, me, steam, requests, writes, errors,
+  return { page, context, profile, me, steam, requests, writes, errors, connected,
+    pushMessage: payload => { for (const socket of sockets) socket.send(JSON.stringify(payload)); },
     holdInventory: () => { inventoryHold = new Promise(resolve => { releaseInventory = resolve; }); },
     setInventory: payload => { inventoryPayload = payload; },
     releaseInventory: () => releaseInventory?.(), deny: code => {
@@ -96,6 +100,41 @@ async function noOverflow(page, label) {
   assert.ok(result.app <= result.appWidth + 1, `${label}: app ${JSON.stringify(result)}`);
   if (result.sheet) assert.ok(result.sheet.scroll <= result.sheet.width + 1, `${label}: sheet ${JSON.stringify(result)}`);
 }
+
+for (const echoFirst of [true, false]) test(`recorded text clears an uncertainty warning, echo before HTTP failure: ${echoFirst}`, async t => {
+  const f = await fixture(t, 'super', 390, 'chat', 'light', true);
+  const { page } = f;
+  await f.connected;
+  await page.locator('#chatListSections .conv').first().tap();
+  const message = { id: alice, steamAccountId: account, eventId: 'delivered-with-lost-ack', type: 'message',
+    echo: true, message: '可爱', sentAt: new Date().toISOString(), timestamp: Math.floor(Date.now() / 1000), ordinal: 0 };
+  let release;
+  let sends = 0;
+  const held = new Promise(resolve => { release = resolve; });
+  await page.route('http://redesign.test/message', async route => {
+    sends++;
+    if (echoFirst) { f.pushMessage(message); await held; }
+    await route.fulfill({ status: 502, json: { error: '文字发送结果未确认，请先检查聊天记录。', uncertain: true } });
+  });
+  await page.locator('#messageInput').fill('可爱');
+  const failed = page.waitForResponse(response => new URL(response.url()).pathname === '/message');
+  await page.locator('#sendButton').tap();
+  if (echoFirst) {
+    await page.locator('[data-event-id="delivered-with-lost-ack"]').waitFor();
+    release();
+  }
+  await failed;
+  if (!echoFirst) {
+    await page.locator('.local-outgoing-state').getByRole('status').waitFor();
+    f.pushMessage(message);
+  }
+  await page.locator('[data-event-id="delivered-with-lost-ack"]').waitFor();
+  await page.waitForFunction(() => !document.querySelector('#messages .local-outgoing-state'));
+  assert.equal(await page.locator('#messages .msg-body').filter({ hasText: '可爱' }).count(), 1);
+  assert.doesNotMatch(await page.locator('#messages').innerText(), /结果未确认|移除此提示|重试/);
+  assert.equal(sends, 1);
+  assert.deepEqual(f.errors, []);
+});
 
 test('saved picker inventory survives reload and can send stickers during a delayed, failed refresh', async t => {
   const f = await fixture(t, 'super', 390, 'chat', 'light', true);
