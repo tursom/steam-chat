@@ -293,6 +293,9 @@ type ImageOperationEntry = OutgoingMessage & { operation?: ImageOperation; image
   uploadRejection?: string };
 const outgoingMessages = new Map<number, OutgoingMessage>();
 const claimedTextEvents = new Set<string>();
+const textAccountCooldowns = new Map<string, number>();
+let textCooldownTimer: ReturnType<typeof setTimeout> | null = null;
+const maxSteamCooldownMs = 24 * 60 * 60 * 1000;
 let outgoingId = 0;
 let chatEpoch = 0;
 let historyRequest = 0;
@@ -486,6 +489,9 @@ function resetHistory() {
 }
 
 function invalidateChat(purgePersistent = true) {
+  textAccountCooldowns.clear();
+  if (textCooldownTimer !== null) clearTimeout(textCooldownTimer);
+  textCooldownTimer = null;
   clearChatCache(purgePersistent);
   inventoryTask = null;
   inventoryContext = '';
@@ -759,6 +765,7 @@ function updateSteamStatus(status: SteamStatus) {
 
 async function api(path: string, options: RequestInit = {}, onUploadProgress?: (percent: number | null) => void): Promise<unknown> {
   const context = chatContext();
+  const account = state.steam.activeAccount?.steamId || state.steam.steamId;
   const controller = !options.signal && (!options.method || options.method === 'GET') ? new AbortController() : null;
   const deadline = controller ? setTimeout(() => controller.abort(), networkDeadlineMs) : null;
   if (controller) options = { ...options, signal: controller.signal };
@@ -788,15 +795,21 @@ async function api(path: string, options: RequestInit = {}, onUploadProgress?: (
         state.steam.accessAllowed = false;
         stopWebSocket(); updateChatLists(); updateChatAvailability();
       }
+      const cooldown = steamRateLimitMetadata(payload, response.headers?.get('Retry-After'));
+      if (cooldown && account && context === chatContext()) {
+        textAccountCooldowns.set(account, Math.max(textAccountCooldowns.get(account) || 0, cooldown.retryAt));
+        updateTextCooldownControls();
+      }
       throw Object.assign(new Error(isRecord(payload) && typeof payload.error === 'string' ? payload.error : `HTTP ${response.status}`), {
-        status: response.status, ...(isRecord(payload) && typeof payload.uncertain === 'boolean' ? { uncertain: payload.uncertain } : {})
+        status: response.status, ...(isRecord(payload) && typeof payload.uncertain === 'boolean' ? { uncertain: payload.uncertain } : {}),
+        ...cooldown
       });
     }
     return payload;
   } finally { if (deadline !== null) clearTimeout(deadline); }
 }
 
-function uploadRequest(path: string, options: RequestInit, onProgress: (percent: number | null) => void): Promise<{ ok: boolean; status: number; json: () => Promise<unknown> }> {
+function uploadRequest(path: string, options: RequestInit, onProgress: (percent: number | null) => void): Promise<{ ok: boolean; status: number; headers: Headers; json: () => Promise<unknown> }> {
   return new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open(options.method || 'POST', path, true);
@@ -806,6 +819,7 @@ function uploadRequest(path: string, options: RequestInit, onProgress: (percent:
     xhr.upload.onprogress = (event) => onProgress(event.lengthComputable && event.total > 0 ? Math.min(99, Math.floor(event.loaded / event.total * 100)) : null);
     xhr.upload.onload = () => onProgress(100);
     xhr.onload = () => resolve({ ok: xhr.status >= 200 && xhr.status < 300, status: xhr.status,
+      headers: new Headers({ 'Retry-After': xhr.getResponseHeader('Retry-After') || '' }),
       json: async () => JSON.parse(xhr.responseText) });
     const uncertain = () => reject(Object.assign(new Error('发送结果未确认，请先检查聊天记录。'), { uncertain: true }));
     xhr.onerror = uncertain;
@@ -2669,8 +2683,7 @@ function updateChatAvailability() {
   document.querySelectorAll<HTMLInputElement | HTMLButtonElement | HTMLTextAreaElement>('[data-chat-control]').forEach((node) => {
     node.disabled = disabled;
   });
-  const send = document.querySelector<HTMLButtonElement>('#sendButton');
-  if (send) send.disabled = disabled || composerSending.has(`${chatContext()}|${state.activeId}`);
+  updateTextSendButton();
   const box = document.querySelector<HTMLElement>('.composer-box');
   if (box) box.hidden = steamAccessAllowed() && !grantAtLeast('chat');
   const attachment = document.querySelector<HTMLButtonElement>('#attachmentToggle');
@@ -4728,6 +4741,65 @@ function requiresFullText(text: string) {
   return /^\s*\/(sticker|roomeffect)(\s|$)/i.test(text) || /\[(sticker|roomeffect)\b/i.test(text);
 }
 
+function steamRateLimitMetadata(payload: unknown, retryAfter?: string | null) {
+  if (!isRecord(payload) || payload.code !== 'steam_rate_limited') return undefined;
+  const now = Date.now();
+  const durations: number[] = [];
+  if (typeof payload.retryAt === 'number' && Number.isFinite(payload.retryAt) && payload.retryAt > now) durations.push(payload.retryAt - now);
+  if (typeof payload.retryAfterMs === 'number' && Number.isFinite(payload.retryAfterMs) && payload.retryAfterMs > 0) durations.push(payload.retryAfterMs);
+  // Retry-After is seconds. Ignore arbitrary strings, dates and non-finite values.
+  if (retryAfter && /^\d+(?:\.\d+)?$/.test(retryAfter.trim())) {
+    const seconds = Number(retryAfter);
+    if (Number.isFinite(seconds) && seconds > 0) durations.push(Math.min(seconds, maxSteamCooldownMs / 1000) * 1000);
+  }
+  // Bound untrusted server metadata so a bad timestamp cannot disable sending forever.
+  const retryAfterMs = Math.min(maxSteamCooldownMs, durations.length ? Math.max(...durations) : 30_000);
+  return { code: 'steam_rate_limited' as const, retryAt: now + retryAfterMs, retryAfterMs };
+}
+
+function textCooldownSeconds(account = state.steam.activeAccount?.steamId || state.steam.steamId || '') {
+  return Math.max(0, Math.ceil(((textAccountCooldowns.get(account) || 0) - Date.now()) / 1000));
+}
+
+function textCooldownBlocked(account?: string) {
+  const seconds = textCooldownSeconds(account);
+  if (seconds) setFeedback(`Steam 发送频率受限，${seconds} 秒后可重试`, 'warn');
+  return seconds > 0;
+}
+
+function updateTextSendButton() {
+  const send = document.querySelector<HTMLButtonElement>('#sendButton');
+  if (!send) return;
+  const seconds = textCooldownSeconds();
+  send.disabled = !steamOnline() || !steamAccessAllowed() || isCommunityGroup() || !state.activeId || !grantAtLeast('chat')
+    || composerSending.has(`${chatContext()}|${state.activeId}`) || seconds > 0;
+  send.title = seconds ? `Steam 发送频率受限，${seconds} 秒后可重试` : '发送消息（Enter）';
+}
+
+function updateTextOutgoingButton(button: HTMLButtonElement, entry: OutgoingMessage) {
+  const resend = button.dataset.textSendAction === 'resend';
+  const seconds = textCooldownSeconds(entry.textSteamAccountId);
+  button.textContent = seconds ? `${seconds} 秒后可重试` : resend ? '仍要发送一份' : '重试发送';
+  button.title = seconds ? `Steam 账号发送频率受限，${seconds} 秒后可重试` : '';
+  button.disabled = seconds > 0 || !canActOnOutgoingText(entry) || !steamOnline() || !!entry.textCheckBusy
+    || entry.state !== (resend ? 'unknown' : 'failed') || (resend && entry.replacementLocalId !== undefined);
+}
+
+function updateTextCooldownControls() {
+  if (textCooldownTimer !== null) clearTimeout(textCooldownTimer);
+  textCooldownTimer = null;
+  for (const [account, until] of textAccountCooldowns) if (until <= Date.now()) textAccountCooldowns.delete(account);
+  updateTextSendButton();
+  document.querySelectorAll<HTMLButtonElement>('[data-text-send-action]').forEach(button => {
+    const entry = outgoingMessages.get(Number(button.dataset.textOutgoingId));
+    if (entry) updateTextOutgoingButton(button, entry);
+  });
+  if (textAccountCooldowns.size) textCooldownTimer = setTimeout(() => {
+    textCooldownTimer = null;
+    updateTextCooldownControls();
+  }, 1000);
+}
+
 async function sendText(explicitMessage?: string, previewMessage?: string): Promise<boolean> {
   if (!grantAtLeast('chat')) { setFeedback('当前授权不能发送消息', 'warn'); return false; }
   const id = activeIdOrWarn();
@@ -4736,6 +4808,7 @@ async function sendText(explicitMessage?: string, previewMessage?: string): Prom
   const msg = draft.trim();
   if (!id || !msg || isCommunityGroup(id)) return false;
   if (requiresFullText(msg) && !grantAtLeast('full')) { setFeedback('贴纸和聊天效果需要「完整」授权', 'warn'); return false; }
+  if (textCooldownBlocked()) return false;
   const outgoing = beginOutgoing(id, previewMessage ?? msg.replace(/\[/g, '\\['), 'message', msg);
   if (explicitMessage === undefined && input) { input.value = ''; resizeComposerInput(input); }
   return sendOutgoingText(outgoing);
@@ -4751,6 +4824,7 @@ function canActOnOutgoingText(entry: OutgoingMessage) {
 
 async function retryOutgoingText(entry: OutgoingMessage): Promise<boolean> {
   if (!canActOnOutgoingText(entry) || !steamOnline() || entry.state !== 'failed' || entry.textCheckBusy) return false;
+  if (textCooldownBlocked(entry.textSteamAccountId)) return false;
   entry.state = 'sending';
   entry.error = entry.textCheckReason = entry.echoEventId = undefined;
   entry.item = { ...entry.item, sentAt: new Date().toISOString() };
@@ -4760,6 +4834,7 @@ async function retryOutgoingText(entry: OutgoingMessage): Promise<boolean> {
 
 async function resendOutgoingText(entry: OutgoingMessage): Promise<boolean> {
   if (!canActOnOutgoingText(entry) || !steamOnline() || entry.state !== 'unknown' || entry.textCheckBusy || entry.replacementLocalId !== undefined) return false;
+  if (textCooldownBlocked(entry.textSteamAccountId)) return false;
   const replacement = beginOutgoing(entry.item.id, entry.item.message || '', 'message', entry.retryText);
   replacement.previousLocalId = entry.localId;
   entry.replacementLocalId = replacement.localId;
@@ -4801,6 +4876,11 @@ function appendTextOutgoingActions(container: HTMLElement, entry: OutgoingMessag
     const button = create('button', `ghost-btn ${className}`, label);
     button.type = 'button';
     button.disabled = !enabled;
+    if (className === 'outgoing-retry' || className === 'outgoing-resend') {
+      button.dataset.textSendAction = className === 'outgoing-resend' ? 'resend' : 'retry';
+      button.dataset.textOutgoingId = String(entry.localId);
+      updateTextOutgoingButton(button, entry);
+    }
     button.addEventListener('click', () => { if (!button.disabled) { button.disabled = true; void run(); } });
     container.append(button);
   };

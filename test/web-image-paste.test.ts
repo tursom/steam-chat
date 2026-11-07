@@ -63,6 +63,7 @@ function harness() {
     headers: Record<string, string> = {};
     open(method: string, path: string) { this.method = method; this.path = path; }
     setRequestHeader(name: string, value: string) { this.headers[name] = value; }
+    getResponseHeader(_name: string): string | null { return null; }
     send(body: string) {
       void sandbox.fetch(this.path, { body }).then(async response => {
         this.upload.onload?.();

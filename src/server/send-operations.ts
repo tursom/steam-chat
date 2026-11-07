@@ -50,6 +50,18 @@ export class SendOperations {
     op.version++;
     try { this.options.onChange?.(op.owner, this.view(op)); } catch { /* A dropped UI hint cannot affect sending. */ }
   }
+  cooldownUntil(account: string): number {
+    const until = this.cooldowns.get(account) || 0;
+    if (until <= Date.now()) { this.cooldowns.delete(account); return 0; }
+    return until;
+  }
+  rateLimited(account: string, retryAfterMs = 30000): number {
+    const delay = Number.isFinite(retryAfterMs) ? Math.max(30000, Math.ceil(retryAfterMs)) : 30000;
+    const candidate = Date.now() + delay;
+    const until = Math.max(this.cooldownUntil(account), Number.isSafeInteger(candidate) ? candidate : Date.now() + 30000);
+    this.cooldowns.set(account, until);
+    return until;
+  }
   private view(op: Operation): SendOperationView {
     return { id: op.id, peerId: op.peerId, name: op.name, steamAccountId: op.owner.account, state: op.state,
       version: op.version, phase: op.phase, attempts: op.attempts, totalAttempts: op.totalAttempts,
@@ -245,7 +257,7 @@ export class SendOperations {
       if (op.state === 'cancelled') return;
       const retryAfter = isRecord(error) && typeof error.retryAfterMs === 'number' ? error.retryAfterMs : 30000;
       if (isRecord(error) && Number(error.eresult) === 84) {
-        this.cooldowns.set(op.owner.account, Math.max(this.cooldowns.get(op.owner.account) || 0, Date.now() + retryAfter));
+        this.rateLimited(op.owner.account, retryAfter);
       }
       const uncertain = isRecord(error) && typeof error.uncertain === 'boolean' ? error.uncertain : op.phase === 'commit' || op.phase === 'unknown';
       if (uncertain) {

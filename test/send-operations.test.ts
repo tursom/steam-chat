@@ -122,6 +122,27 @@ test('account rate-limit cooldown is shared and cannot be bypassed by expedite',
   await until(() => manager.get(two.id, owner).state === 'retry_wait'); assert.equal(calls, 1);
 });
 
+test('rate limits reported by text sends also hold image tasks for the same account', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const calls: string[] = [];
+  const manager = new SendOperations({ ...config, windowMs: 120000, refreshWebSession: async () => {}, send: async input => {
+    calls.push(input.account); return { ...sent, steamAccountId: input.account };
+  } });
+  t.after(() => manager.close());
+  const retryAt = manager.rateLimited(owner.account, 1);
+  assert.equal(retryAt, Date.now() + 30000);
+  const limited = manager.prepare(owner, peer, 'Limited', () => true); manager.start(limited.id, owner, image);
+  await until(() => manager.get(limited.id, owner).state === 'retry_wait');
+  const another = { ...owner, account: '76561198000000003' };
+  const free = manager.prepare(another, peer, 'Other account', () => true); manager.start(free.id, another, image);
+  await until(() => manager.get(free.id, another).state === 'sent');
+  assert.deepEqual(calls, [another.account]);
+  t.mock.timers.tick(30000);
+  await until(() => manager.get(limited.id, owner).state === 'sent');
+  assert.deepEqual(calls, [another.account, owner.account]);
+  assert.equal(manager.cooldownUntil(owner.account), 0);
+});
+
 test('payload budgets, expiration and restart never turn a missing ID into a new send', async () => {
   let calls = 0;
   const options: SendOperationOptions = { ...config, maxBytes: 20, userBytes: 20, imageMs: 15, resultMs: 15, preparedMs: 15,

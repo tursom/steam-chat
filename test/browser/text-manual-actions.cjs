@@ -172,9 +172,101 @@ async function run() {
       await page.locator('.msg-row[data-send-state="failed"]').filter({ hasText: 'Rejected extra copy' }).waitFor();
       assert.equal(await rejectedOriginal.row.getAttribute('data-send-state'), 'unknown');
       assert.equal(await rejectedOriginal.row.getByRole('button', { name: '仍要发送一份' }).isDisabled(), true);
+
+      const cooldownUnknown = await attempt('Unknown before cooldown', 'unknown');
+      await page.clock.install({ time: new Date() });
+      await page.clock.pauseAt(new Date(Date.now() + 100));
+      const limitedIndex = writes.length;
+      await page.locator('#messageInput').fill('Rate limited original [body]');
+      await page.locator('#sendButton').click();
+      const limitedRequest = await waitRequest(writes, limitedIndex + 1);
+      const limitedRow = page.locator('.msg-row').filter({ hasText: 'Rate limited original [body]' }).last();
+      const limitedId = await limitedRow.getAttribute('data-outgoing-id');
+      const clockNow = await page.evaluate(() => Date.now());
+      await respond(limitedRequest, 429, { code: 'steam_rate_limited', error: 'RateLimitExceeded', uncertain: false,
+        retryAt: clockNow + 30000, retryAfterMs: 30000 });
+      await limitedRow.getByRole('button', { name: '30 秒后可重试' }).waitFor();
+      assert.equal(await limitedRow.getAttribute('data-send-state'), 'failed');
+      assert.match(await limitedRow.innerText(), /Steam 发送频率受限/);
+      for (const row of [failed.row, limitedRow, cooldownUnknown.row]) {
+        const action = row.locator('.outgoing-retry, .outgoing-resend');
+        assert.equal(await action.innerText(), '30 秒后可重试');
+        assert.equal(await action.isDisabled(), true);
+      }
+      assert.equal(await page.locator('#sendButton').isDisabled(), true);
+      assert.match(await page.locator('#sendButton').getAttribute('title'), /30 秒后可重试/);
+      assert.equal(await page.locator('#messageInput').isEditable(), true);
+      await page.locator('#messageInput').fill('Edited draft during cooldown');
+      const cooldownWriteCount = writes.length;
+      const outgoingCount = await page.locator('[data-outgoing-id]').count();
+      await page.locator('#messageInput').press('Enter');
+      const helperResults = await page.evaluate(async ({ failedId, unknownId, limitedId }) => [
+        await sendText(), await sendText('/sticker must-wait'),
+        await retryOutgoingText(outgoingMessages.get(Number(failedId))),
+        await retryOutgoingText(outgoingMessages.get(Number(limitedId))),
+        await resendOutgoingText(outgoingMessages.get(Number(unknownId)))
+      ], { failedId: failed.id, unknownId: cooldownUnknown.id, limitedId });
+      assert.deepEqual(helperResults, [false, false, false, false, false]);
+      assert.equal(writes.length, cooldownWriteCount);
+      assert.equal(await page.locator('[data-outgoing-id]').count(), outgoingCount);
+      assert.equal(await page.locator('#messageInput').inputValue(), 'Edited draft during cooldown');
+
+      const cooldownCheckIndex = checks.length;
+      await cooldownUnknown.row.getByRole('button', { name: '检查发送结果' }).click();
+      await respond(await waitRequest(checks, cooldownCheckIndex + 1), 200, { items: [] });
+      await cooldownUnknown.row.locator('.outgoing-check-reason').waitFor();
+      assert.equal(await cooldownUnknown.row.getAttribute('data-send-state'), 'unknown');
+      // Navigate to a different peer: failed rows and new sends share the account deadline.
+      await page.evaluate(() => openConversation('76561198000000002', 'Other peer'));
+      assert.equal(await page.locator('#sendButton').isDisabled(), true);
+      await page.locator('#messageInput').fill('Other peer draft');
+      assert.equal(await page.evaluate(() => sendText()), false);
+      assert.equal(await page.locator('#messageInput').inputValue(), 'Other peer draft');
+      await page.evaluate(peer => openConversation(peer, 'Manual text actions'), peer);
+      await failed.row.locator('.outgoing-retry').waitFor();
+      assert.equal(await failed.row.locator('.outgoing-retry').innerText(), '30 秒后可重试');
+      await page.locator('#messageInput').fill('Draft stays through expiry');
+      // The account cache is keyed independently; another account can still send.
+      const differentAccountIndex = writes.length;
+      await page.evaluate(() => {
+        globalThis.savedCooldownSteam = structuredClone(state.steam);
+        state.steam = { ...state.steam, steamId: '76561198000000008', activeAccount: { id: 2, steamId: '76561198000000008' } };
+        void sendText('Different account is available');
+      });
+      const differentAccountRequest = await waitRequest(writes, differentAccountIndex + 1);
+      assert.equal(differentAccountRequest.body.steamAccountId, '76561198000000008');
+      await respond(differentAccountRequest, 400, { error: 'Test rejection', uncertain: false });
+      await page.waitForFunction(() => [...outgoingMessages.values()].some(entry => entry.retryText === 'Different account is available' && entry.state === 'failed'));
+      await page.evaluate(() => { state.steam = globalThis.savedCooldownSteam; refreshOutgoing(); updateChatAvailability(); });
+      assert.equal(await page.locator('#sendButton').isDisabled(), true);
+      await page.evaluate(() => { globalThis.cooldownRows = [...document.querySelectorAll('.msg-row')]; });
+      const expiryWriteCount = writes.length;
+      await page.clock.fastForward(1000);
+      assert.equal(await limitedRow.locator('.outgoing-retry').innerText(), '29 秒后可重试');
+      await page.clock.fastForward(28000);
+      assert.equal(await limitedRow.locator('.outgoing-retry').innerText(), '1 秒后可重试');
+      await page.clock.fastForward(1000);
+      assert.equal(await limitedRow.locator('.outgoing-retry').innerText(), '重试发送');
+      assert.equal(await limitedRow.locator('.outgoing-retry').isEnabled(), true);
+      assert.equal(await cooldownUnknown.row.locator('.outgoing-resend').innerText(), '仍要发送一份');
+      assert.equal(await cooldownUnknown.row.locator('.outgoing-resend').isEnabled(), true);
+      assert.equal(await page.locator('#sendButton').isEnabled(), true);
+      assert.equal(await page.locator('#messageInput').inputValue(), 'Draft stays through expiry');
+      assert.equal(writes.length, expiryWriteCount, 'expiry does not automatically send');
+      assert.equal(await page.evaluate(() => globalThis.cooldownRows.every((row, index) => row === document.querySelectorAll('.msg-row')[index])), true, 'ticks preserve history/media nodes');
+      await limitedRow.locator('.outgoing-retry').click();
+      const afterCooldown = await waitRequest(writes, expiryWriteCount + 1);
+      assert.deepEqual(afterCooldown.body, limitedRequest.body, 'manual retry after expiry keeps the original body');
+      await respond(afterCooldown, 429, { code: 'steam_rate_limited', error: 'Friendly rate limit', uncertain: false });
+      await limitedRow.getByRole('button', { name: '30 秒后可重试' }).waitFor();
+      assert.equal(await page.locator('#messageInput').inputValue(), 'Draft stays through expiry');
+      assert.deepEqual(await page.evaluate(() => {
+        invalidateChat();
+        return { timerStopped: textCooldownTimer === null, cacheCleared: textAccountCooldowns.size === 0 };
+      }), { timerStopped: true, cacheCleared: true });
       assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
       assert.deepEqual(errors, []);
-      console.log(`PASS ${width}px: original-body retry, real-history check, explicit extra copy, duplicate guards and stale-context buttons`);
+      console.log(`PASS ${width}px: manual text actions, account cooldown controls, draft preservation, expiry and timer cleanup`);
       await page.close();
     }
   } finally { await browser.close(); }

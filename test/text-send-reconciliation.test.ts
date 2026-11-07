@@ -215,6 +215,28 @@ test('real SDK 10-second acknowledgement timeout triggers one read and never res
   t.mock.timers.reset();
 });
 
+test('account text cooldown blocks fresh requests until expiry without extending the wait', async t => {
+  const { service, user, records, counts } = probe(t);
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  let sends = 0;
+  user.chat.sendFriendMessage = (_id: string, _message: string, callback: (error: unknown, result?: unknown) => void) => {
+    if (++sends === 1) callback(Object.assign(new Error('RateLimitExceeded'), { eresult: 84 }));
+    else callback(null, { modified_message: 'new text', server_timestamp: new Date(), ordinal: 7 });
+  };
+  let retryAt = 0;
+  await assert.rejects(service.sendTextMessage(peer, 'limited', account), (error: { retryAt: number; statusCode: number; uncertain: boolean }) => {
+    retryAt = error.retryAt;
+    return error.statusCode === 429 && error.uncertain === false && retryAt === Date.now() + 30_000;
+  });
+  t.mock.timers.tick(29_999);
+  await assert.rejects(service.sendTextMessage(other, 'new text', account), (error: { retryAt: number; retryAfterMs: number }) =>
+    error.retryAt === retryAt && error.retryAfterMs === 1);
+  assert.equal(sends, 1); assert.equal(records.length, 0); assert.equal(counts().reads, 0);
+  t.mock.timers.tick(1);
+  await service.sendTextMessage(other, 'new text', account);
+  assert.equal(sends, 2); assert.equal(records.length, 1);
+});
+
 test('explicit Steam rejections are failed rather than uncertain and never retried automatically', async t => {
   for (const eresult of [8, 15, 17, 25, 84]) {
     const { service, user, records, counts } = probe(t, async () => ({ messages: [entry()] }));

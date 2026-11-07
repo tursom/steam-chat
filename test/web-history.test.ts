@@ -15,6 +15,7 @@ class Element {
   hidden = false;
   disabled = false;
   value = '';
+  title = '';
   isConnected = true;
   extraHeight = 0;
   listeners = new Map<string, Set<() => void>>();
@@ -41,7 +42,7 @@ class Element {
 
 type Item = { id: string; eventId: string; message: string; echo?: boolean; name?: string; sentAt?: string; steamAccountId?: string; type?: string };
 type OutgoingEntry = { localId: number; state: string; item: Item; context: string; readonly retryText?: string; textCheckBusy?: boolean; textCheckReason?: string; replacementLocalId?: number };
-type Pending = { url: URL; method?: string; body?: string; signal?: AbortSignal; resolve: (value: unknown) => void; respond: (status: number, value: unknown) => void; reject: (error: Error) => void };
+type Pending = { url: URL; method?: string; body?: string; signal?: AbortSignal; resolve: (value: unknown) => void; respond: (status: number, value: unknown, headers?: Record<string, string>) => void; reject: (error: Error) => void };
 function harness(withLayout = false, withRealtime = false, disk?: Map<string, unknown>, browserStorage = new Map<string, string>()) {
   let now = Date.now();
   const timers = new Map<number, { delay: number; callback: () => unknown }>();
@@ -73,10 +74,13 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     disconnect() { this.active = false; }
   }
   const source = readFileSync(resolve(__dirname, '../web/app.js'), 'utf8');
-  const nodes: Record<string, Element> = { '#app': new Element(), '#chatLayout': new Element(), '#chatListSections': new Element(), '#messageInput': new Element(), '#messages': new Element(), '#historyOlder': new Element(), '#storageHealth': new Element() };
+  const nodes: Record<string, Element> = { '#app': new Element(), '#chatLayout': new Element(), '#chatListSections': new Element(), '#messageInput': new Element(), '#sendButton': new Element(), '#messages': new Element(), '#historyOlder': new Element(), '#storageHealth': new Element() };
   const pending: Pending[] = [];
   const sandbox = {
-    document: { querySelector: (id: string) => nodes[id] || null, querySelectorAll: (): Element[] => [],
+    document: { querySelector: (id: string) => nodes[id] || null, querySelectorAll: (selector: string): Element[] => {
+      const visit = (node: Element): Element[] => [...(node.dataset.textSendAction ? [node] : []), ...node.children.flatMap(visit)];
+      return selector === '[data-text-send-action]' ? visit(nodes['#messages']) : [];
+    },
       visibilityState: 'visible', addEventListener: events.addEventListener.bind(events), removeEventListener: events.removeEventListener.bind(events), createElement: () => new Element() },
     window: { addEventListener: events.addEventListener.bind(events) },
     location: { protocol: 'http:', host: 'test' }, WebSocket: FakeSocket, AbortController, crypto: webcrypto,
@@ -101,7 +105,7 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     fetch: (url: string, options: RequestInit = {}) => new Promise((resolve, reject) => pending.push({ url: new URL(url, 'http://test'),
       method: options.method,
       body: typeof options.body === 'string' ? options.body : undefined,
-      respond: (status, payload) => resolve({ ok: status < 400, status, json: async () => payload }),
+      respond: (status, payload, headers) => resolve({ ok: status < 400, status, headers: new Headers(headers), json: async () => payload }),
       signal: options.signal || undefined, resolve: (payload) => resolve({ ok: true, json: async () => payload }), reject })),
     __test: undefined as unknown
   };
@@ -111,7 +115,7 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     state.me = {id: 1}; state.permissions = ['chat.use', 'self.password.change']; state.activeId = 'peer'; state.steam.accessAllowed = true;
     state.steam.steamGrant = {level:'full', scope:'all', peerCount:0, expiresAt:null};
     resizeComposerInput = () => {};
-    globalThis.__test = {refreshChatData, loadChatInventory, updateSteamStatus, sendText, retryOutgoingText, resendOutgoingText, checkOutgoingText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
+    globalThis.__test = {api, steamRateLimitMetadata, textCooldownSeconds, refreshChatData, loadChatInventory, updateSteamStatus, sendText, retryOutgoingText, resendOutgoingText, checkOutgoingText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
       openConversation, rememberThread, restoreThread, scheduleChatCache, restoreChatCache, clearChatCache,
       bootstrap: () => { setupAppInstallation = () => {}; renderShell = () => {}; restoreImageOperations = () => {}; return bootstrap(); },
       requestDurableSync, ensureWebSocket, stopWebSocket, startStatusPolling, stopStatusPolling, setupRealtimeResume,
@@ -120,6 +124,9 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
       switchPeer: (id) => { state.activeId = id; resetHistory(); },
       detached: () => historyDetached, busy: () => historyBusy};`, sandbox);
   const api = sandbox.__test as {
+    api: (path: string) => Promise<unknown>;
+    steamRateLimitMetadata: (payload: unknown, header?: string) => { code: string; retryAt: number; retryAfterMs: number } | undefined;
+    textCooldownSeconds: (account?: string) => number;
     refreshChatData: (includeConversations?: boolean) => Promise<void>;
     loadChatInventory: () => Promise<void>;
     updateSteamStatus: (status: Record<string, unknown>) => void;
@@ -464,6 +471,148 @@ async function manualTextAttempt(status: 'failed' | 'unknown') {
   assert.equal(entry.state, status);
   return { ...h, entry };
 }
+
+test('Steam rate-limit metadata accepts only the known code and bounds finite timers', () => {
+  const { api, now } = harness(false, true);
+  const metadata = api.steamRateLimitMetadata;
+  const code = 'steam_rate_limited';
+  for (const payload of [null, {}, { error: 'RateLimitExceeded' }, { code: 'other', retryAfterMs: 60000 }]) {
+    assert.equal(metadata(payload, '60'), undefined);
+  }
+  for (const value of [undefined, null, '60000', NaN, Infinity, -Infinity, -1, 0]) {
+    const result = metadata({ code, retryAt: value, retryAfterMs: value }, 'invalid')!;
+    assert.equal(result.retryAt, now() + 30000);
+    assert.equal(result.retryAfterMs, 30000);
+  }
+  assert.equal(metadata({ code, retryAt: now() - 1 })!.retryAfterMs, 30000);
+  assert.equal(metadata({ code, retryAt: now() + 45000, retryAfterMs: 20000 }, '60')!.retryAfterMs, 60000);
+  assert.equal(metadata({ code, retryAfterMs: 1200 })!.retryAfterMs, 1200, 'remaining time is not restarted at 30s');
+  assert.equal(metadata({ code }, '1.5')!.retryAfterMs, 1500);
+  for (const header of ['Infinity', '-1', 'NaN', 'Fri, 01 Jan 2027 00:00:00 GMT', '0']) {
+    assert.equal(metadata({ code }, header)!.retryAfterMs, 30000);
+  }
+  for (const payload of [{ code, retryAt: Number.MAX_VALUE }, { code, retryAfterMs: Number.MAX_VALUE }]) {
+    assert.equal(metadata(payload)!.retryAfterMs, 24 * 60 * 60 * 1000);
+  }
+  assert.equal(metadata({ code }, '1'.repeat(100))!.retryAfterMs, 24 * 60 * 60 * 1000);
+});
+
+test('API errors retain safe cooldown metadata, honor Retry-After, and leave unrelated 5xx unknown', async () => {
+  const { api, pending, now } = harness(false, true);
+  api.state.steam.steamId = 'account';
+  const requesting = assert.rejects(api.api('/message'), {
+    status: 429, uncertain: false, code: 'steam_rate_limited', retryAt: now() + 60000, retryAfterMs: 60000
+  });
+  pending[0].respond(429, { code: 'steam_rate_limited', uncertain: false, error: 'Friendly limit', retryAfterMs: 45000 }, { 'Retry-After': '60' });
+  await requesting;
+  assert.equal(api.textCooldownSeconds('account'), 60);
+  assert.equal(api.textCooldownSeconds('other'), 0);
+
+  api.invalidateChat();
+  api.state.steam.status = 'online';
+  const sending = api.sendText('unrelated 5xx');
+  pending[1].respond(503, { error: 'RateLimitExceeded', code: 'unrecognized', retryAfterMs: 60000 });
+  await sending;
+  assert.equal(api.outgoing()[0].state, 'unknown');
+  assert.equal(api.textCooldownSeconds(), 0);
+});
+
+test('account cooldown gates all text helpers across peers, preserves drafts, and ticks controls without rebuilding rows', async () => {
+  const { api, pending, nodes, messages, advance, timers } = harness(false, true);
+  api.state.steam.steamId = 'account';
+  api.state.steam.status = 'online';
+  const attempt = async (text: string, status: number, payload: unknown) => {
+    const sending = api.sendText(text);
+    pending.at(-1)!.respond(status, payload);
+    await sending;
+    return api.outgoing().at(-1)!;
+  };
+  const failed = await attempt('original [body]', 400, { error: 'Rejected', uncertain: false });
+  const unknown = await attempt('unknown original', 502, { error: 'Unconfirmed' });
+  api.switchPeer('other-peer');
+  const limited = await attempt('Rate limited body', 429, { code: 'steam_rate_limited', error: 'RateLimitExceeded', uncertain: false });
+  assert.equal(limited.state, 'failed');
+  assert.equal(api.textCooldownSeconds(), 30, 'known code without timing falls back to 30s');
+  nodes['#messageInput'].value = 'edited draft';
+  assert.equal(await api.sendText(), false);
+  assert.equal(await api.sendText('/sticker original'), false);
+  assert.equal(await api.retryOutgoingText(limited), false);
+  api.switchPeer('peer');
+  assert.equal(await api.retryOutgoingText(failed), false, 'failed row on another peer shares the same account cooldown');
+  assert.equal(await api.resendOutgoingText(unknown), false);
+  assert.equal(unknown.replacementLocalId, undefined);
+  assert.equal(nodes['#messageInput'].value, 'edited draft');
+  assert.equal(pending.length, 3);
+  assert.equal(api.outgoing().length, 3);
+  assert.equal(failed.retryText, 'original [body]');
+
+  const checking = api.checkOutgoingText(unknown);
+  assert.equal(pending[3].url.pathname, '/api/messages/check');
+  pending[3].respond(200, { items: [] });
+  await checking;
+  assert.equal(unknown.state, 'unknown');
+  const rows = [...messages.children];
+  const buttons = rows.flatMap(row => row.children.flatMap(node => node.children)).filter(button => button.dataset.textSendAction);
+  assert.equal(buttons.length, 2);
+  for (const button of buttons) { assert.equal(button.disabled, true); assert.equal(button.textContent, '30 秒后可重试'); }
+  assert.equal(nodes['#sendButton'].disabled, true);
+  assert.match(nodes['#sendButton'].title, /30 秒后可重试/);
+  assert.equal(nodes['#messageInput'].disabled, false);
+  const tick = (ms: number) => {
+    advance(ms);
+    const timer = [...timers].find(([, value]) => value.delay === 1000);
+    assert.ok(timer, 'a short-lived cooldown tick is scheduled');
+    timers.delete(timer[0]); timer[1].callback();
+  };
+  tick(1000);
+  assert.equal(buttons[0].textContent, '29 秒后可重试');
+  assert.deepEqual(messages.children, rows, 'tick leaves row and media nodes untouched');
+  tick(28000);
+  assert.equal(buttons[0].textContent, '1 秒后可重试');
+  tick(1000);
+  assert.equal(buttons[0].textContent, '重试发送');
+  assert.equal(buttons[1].textContent, '仍要发送一份');
+  for (const button of buttons) assert.equal(button.disabled, false);
+  assert.equal(nodes['#sendButton'].disabled, false);
+  assert.equal([...timers.values()].filter(timer => timer.delay === 1000).length, 0);
+  assert.equal(pending.length, 4, 'expiry never sends automatically');
+  assert.equal(nodes['#messageInput'].value, 'edited draft');
+  const retrying = api.retryOutgoingText(failed);
+  assert.equal(JSON.parse(pending[4].body!).msg, 'original [body]');
+  pending[4].respond(400, { error: 'Rejected', uncertain: false });
+  await retrying;
+  const resending = api.resendOutgoingText(unknown);
+  assert.equal(JSON.parse(pending[5].body!).msg, 'unknown original');
+  pending[5].respond(400, { error: 'Rejected', uncertain: false });
+  await resending;
+  assert.equal(nodes['#messageInput'].value, 'edited draft');
+});
+
+test('cooldown does not affect a different account; invalidation clears timers and ignores stale errors', async () => {
+  const { api, pending, nodes, timers } = harness(false, true);
+  api.state.steam.steamId = 'account'; api.state.steam.status = 'online';
+  const sending = api.sendText('limited');
+  pending[0].respond(429, { code: 'steam_rate_limited', uncertain: false });
+  await sending;
+  assert.equal(api.textCooldownSeconds(), 30);
+  api.state.steam.steamId = 'other-account';
+  nodes['#messageInput'].value = 'different account draft';
+  const other = api.sendText();
+  assert.equal(pending.length, 2);
+  pending[1].respond(400, { error: 'Rejected', uncertain: false });
+  await other;
+  api.state.steam.steamId = 'account';
+  assert.equal(api.textCooldownSeconds(), 30);
+  api.invalidateChat();
+  assert.equal(api.textCooldownSeconds(), 0);
+  assert.equal([...timers.values()].filter(timer => timer.delay === 1000).length, 0);
+  const stale = api.sendText('in flight before logout');
+  api.invalidateChat();
+  pending[2].respond(429, { code: 'steam_rate_limited', uncertain: false });
+  await stale;
+  assert.equal(api.textCooldownSeconds(), 0);
+  assert.equal([...timers.values()].filter(timer => timer.delay === 1000).length, 0);
+});
 
 test('manual failed retry keeps its bubble and immutable original body without touching the later draft', async () => {
   const { api, pending, nodes, messages, entry } = await manualTextAttempt('failed');

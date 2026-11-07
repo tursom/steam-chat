@@ -101,14 +101,33 @@ test('text HTTP errors identify explicit rejection and pre-submission offline st
   const f = await fixture(t);
   f.grantChat(); f.rejectText();
   const rejected = await f.send();
-  assert.equal(rejected.status, 500);
-  assert.equal((await rejected.json()).uncertain, false);
+  assert.equal(rejected.status, 429);
+  assert.equal(rejected.headers.get('retry-after'), '30');
+  const rejection = await rejected.json();
+  assert.equal(rejection.uncertain, false);
+  assert.equal(rejection.code, 'steam_rate_limited');
+  assert.ok(rejection.retryAt > Date.now() + 29_000);
+  assert.ok(rejection.retryAfterMs <= 30_000 && rejection.retryAfterMs > 29_000);
+  assert.deepEqual(f.counts(), { reads: 0, sends: 1 });
+  const repeated = await f.send();
+  assert.equal(repeated.status, 429);
+  assert.equal((await repeated.json()).retryAt, rejection.retryAt, 'blocked retries do not reset the cooldown');
   assert.deepEqual(f.counts(), { reads: 0, sends: 1 });
   f.offline();
   const offline = await f.send();
   assert.equal(offline.status, 503);
   assert.equal((await offline.json()).uncertain, false);
   assert.deepEqual(f.counts(), { reads: 0, sends: 1 });
+});
+
+test('a text rate-limit cooldown does not block read-only delivery checks', async t => {
+  const f = await fixture(t);
+  f.grantChat(); f.rejectText();
+  assert.equal((await f.send()).status, 429);
+  const checked = await f.request();
+  assert.equal(checked.status, 200);
+  assert.equal((await checked.json()).items.length, 1);
+  assert.deepEqual(f.counts(), { reads: 1, sends: 1 });
 });
 
 test('manual check validates request, original account, method, session and friend scope before reading', async t => {

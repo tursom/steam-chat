@@ -81,6 +81,7 @@ function harness() {
     constructor() { requests.push(this); }
     open(method: string, path: string, async: boolean) { this.method = method; this.path = path; this.async = async; }
     setRequestHeader(name: string, value: string) { this.headers.set(name, value); }
+    getResponseHeader(_name: string): string | null { return null; }
     send(body: unknown) { this.body = body; this.sends++; }
     abort() { this.aborted = true; this.onabort?.(); }
     progress(loaded: number, total: number, lengthComputable = true) { this.upload.onprogress?.({ loaded, total, lengthComputable }); }

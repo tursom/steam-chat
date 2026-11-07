@@ -413,6 +413,11 @@ function errorPayload(error: unknown): UnknownRecord {
   }
   if (isRecord(error) && error.resetRequired === true) payload.resetRequired = true;
   if (isRecord(error) && typeof error.uncertain === 'boolean') payload.uncertain = error.uncertain;
+  if (isRecord(error) && error.code === 'steam_rate_limited') {
+    for (const key of ['retryAt', 'retryAfterMs']) {
+      if (typeof error[key] === 'number' && Number.isFinite(error[key]) && error[key] > 0) payload[key] = error[key];
+    }
+  }
   if (isRecord(error) && ['prepare', 'begin', 'upload', 'commit', 'unknown'].includes(String(error.imageUploadPhase))) {
     payload.imageUploadPhase = error.imageUploadPhase;
   }
@@ -962,7 +967,9 @@ function createChatService(options: ChatServiceOptions = {}) {
       legacyAuth.challenge(res);
       return;
     }
-    jsonResponse(res, statusCodeForError(error), errorPayload(error));
+    const retryAfterMs = isRecord(error) && error.code === 'steam_rate_limited' && typeof error.retryAfterMs === 'number' ? error.retryAfterMs : 0;
+    jsonResponse(res, statusCodeForError(error), errorPayload(error),
+      retryAfterMs > 0 && Number.isFinite(retryAfterMs) ? { 'Retry-After': String(Math.ceil(retryAfterMs / 1000)) } : {});
   }
 
   function clientConfig() {
@@ -1594,12 +1601,23 @@ function createChatService(options: ChatServiceOptions = {}) {
     const result = await withSteamRetry(() => {
       authorize?.(level);
       checkSend(steamAccountId);
+      if (steamAccountId) {
+        const retryAt = sendOperations.cooldownUntil(steamAccountId);
+        if (retryAt) throw Object.assign(new Error('RateLimitExceeded'), { statusCode: 429, code: 'steam_rate_limited',
+          uncertain: false, retryAt, retryAfterMs: retryAt - Date.now() });
+      }
       const sender = steamUser.chat?.sendFriendMessage || steamUser.sendFriendMessage;
       const context = steamUser.chat?.sendFriendMessage ? steamUser.chat : steamUser;
       if (!sender) throw new Error('Steam chat sender is unavailable');
       submittedAt = Date.now();
       return callMaybeCallback(sender, context, [id, message]);
     }, false, false).catch(async error => {
+      if (submittedAt !== undefined && steamAccountId && isRecord(error) && Number(error.eresult) === 84) {
+        const retryAt = sendOperations.rateLimited(steamAccountId);
+        throw Object.assign(error instanceof Error ? error : new Error(errorMessage(error)), {
+          statusCode: 429, code: 'steam_rate_limited', uncertain: false, retryAt, retryAfterMs: retryAt - Date.now()
+        });
+      }
       // These protocol responses explicitly reject the request. Transport loss
       // and generic SDK failures remain uncertain once submission has started.
       if (submittedAt === undefined || isRecord(error) && [8, 15, 17, 25, 84].includes(Number(error.eresult))) {
