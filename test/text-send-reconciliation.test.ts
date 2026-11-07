@@ -58,13 +58,21 @@ for (const { input, canonical, existing } of [
     const storage = createHistoryStorage({ logPath: join(directory, 'chat.jsonl'), dbPath: join(directory, 'db'), logger });
     const user = new SteamUser({ autoRelogin: false });
     user.steamID = new SteamID(account);
-    const timestamp = Math.floor(Date.now() / 1000);
+    let timestamp = 0;
+    const originals: Array<{ eventId?: string }> = [];
     const packets: Array<{ method: string; payload: any }> = [];
     user._sendUnified = (method: string, payload: unknown, callback: (body: unknown, header: unknown) => void) => {
       packets.push({ method, payload });
       if (method === 'FriendMessages.SendMessage#1') {
+        timestamp = Math.floor(Date.now() / 1000);
         // Steam accepted the text, but its send acknowledgement was lost.
-        callback({}, { proto: { eresult: 16 } });
+        // Seed the concurrent import at submission time, not before storage and
+        // WebSocket setup, which may span a second boundary on a busy runner.
+        if (existing) {
+          void storage.append({ steamAccountId: account, id: peer, echo: true, message: canonical,
+            sentAt: new Date(timestamp * 1000).toISOString(), ordinal: 7, name: 'Earlier import' }, { notify: false })
+            .then(original => { originals.push(original); callback({}, { proto: { eresult: 16 } }); });
+        } else callback({}, { proto: { eresult: 16 } });
       } else if (method === 'FriendMessages.GetActiveMessageSessions#1') {
         callback({ message_sessions: [], timestamp }, { proto: { eresult: 1 } });
       } else {
@@ -83,10 +91,6 @@ for (const { input, canonical, existing } of [
       await storage.close();
       await rm(directory, { recursive: true, force: true });
     });
-    // append waits for storage initialization; optionally seed a prior import to
-    // prove reconciliation reuses the durable canonical event rather than an ack.
-    const original = existing ? await storage.append({ steamAccountId: account, id: peer, echo: true,
-      message: canonical, sentAt: new Date(timestamp * 1000).toISOString(), ordinal: 7, name: 'Earlier import' }, { notify: false }) : null;
     for (let i = 0; !storage.canSend() && i < 200; i++) await new Promise(resolve => setTimeout(resolve, 10));
     assert.equal(storage.canSend(), true);
     service.server.listen(0, '127.0.0.1');
@@ -114,7 +118,7 @@ for (const { input, canonical, existing } of [
     assert.equal(actual.ordinal, 7);
     assert.equal(actual.sentAt, new Date(timestamp * 1000).toISOString());
     assert.equal(actual.name, existing ? 'Earlier import' : 'Actual self');
-    if (original) assert.equal(actual.eventId, original.eventId);
+    if (existing) assert.equal(actual.eventId, originals[0].eventId);
     assert.deepEqual((await storage.sync({ steamAccountId: account })).items.map(item => item.eventId), [actual.eventId]);
     assert.equal(packets.filter(item => item.method === 'FriendMessages.SendMessage#1').length, 1);
     const reads = packets.filter(item => item.method === 'FriendMessages.GetRecentMessages#1');
