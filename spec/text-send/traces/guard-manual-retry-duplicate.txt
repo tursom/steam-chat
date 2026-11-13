@@ -1,0 +1,103 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 0 and seed 1 with 1 worker on 12 cores with 491MB heap and 64MB offheap memory [pid: 531885] (Linux 7.0.14-4-pve amd64, Arch Linux 21.0.13.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /root/dev/.cache/steam-chat-tla/text-send-lc1ymolf/guard-manual-retry-duplicate/TextSendGuard.tla
+Parsing file /tmp/Naturals.tla
+Semantic processing of module Naturals
+Semantic processing of module TextSendGuard
+Starting... (2026-11-13 23:59:50)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-13 23:59:50.
+Error: Invariant NoUnintendedDuplicate is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ sdkIdentity = "original"
+/\ ui = "sending"
+/\ manualRetries = 0
+/\ acceptedCopies = 0
+/\ calls = 0
+/\ stage = "ready"
+
+State 2: <Submit line 14, col 11 to line 16, col 73 of module TextSendGuard>
+/\ sdkIdentity = "original"
+/\ ui = "sending"
+/\ manualRetries = 0
+/\ acceptedCopies = 0
+/\ calls = 1
+/\ stage = "awaitingSteam"
+
+State 3: <SteamAccept line 18, col 16 to line 20, col 69 of module TextSendGuard>
+/\ sdkIdentity = "original"
+/\ ui = "sending"
+/\ manualRetries = 0
+/\ acceptedCopies = 1
+/\ calls = 1
+/\ stage = "awaitingAck"
+
+State 4: <SdkTimeout line 22, col 15 to line 24, col 84 of module TextSendGuard>
+/\ sdkIdentity = "original"
+/\ ui = "sending"
+/\ manualRetries = 0
+/\ acceptedCopies = 1
+/\ calls = 1
+/\ stage = "reconciling"
+
+State 5: <IdentityMismatch line 26, col 21 to line 29, col 84 of module TextSendGuard>
+/\ sdkIdentity = "different"
+/\ ui = "sending"
+/\ manualRetries = 0
+/\ acceptedCopies = 1
+/\ calls = 1
+/\ stage = "reconciling"
+
+State 6: <Http409 line 34, col 12 to line 36, col 81 of module TextSendGuard>
+/\ sdkIdentity = "different"
+/\ ui = "sending"
+/\ manualRetries = 0
+/\ acceptedCopies = 1
+/\ calls = 1
+/\ stage = "response409"
+
+State 7: <ObserveResponse line 43, col 5 to line 47, col 70 of module TextSendGuard>
+/\ sdkIdentity = "different"
+/\ ui = "failed"
+/\ manualRetries = 0
+/\ acceptedCopies = 1
+/\ calls = 1
+/\ stage = "finished"
+
+State 8: <RestoreIdentity line 49, col 20 to line 51, col 83 of module TextSendGuard>
+/\ sdkIdentity = "original"
+/\ ui = "failed"
+/\ manualRetries = 0
+/\ acceptedCopies = 1
+/\ calls = 1
+/\ stage = "finished"
+
+State 9: <ManualRetry line 54, col 16 to line 57, col 66 of module TextSendGuard>
+/\ sdkIdentity = "original"
+/\ ui = "sending"
+/\ manualRetries = 1
+/\ acceptedCopies = 1
+/\ calls = 1
+/\ stage = "ready"
+
+State 10: <Submit line 14, col 11 to line 16, col 73 of module TextSendGuard>
+/\ sdkIdentity = "original"
+/\ ui = "sending"
+/\ manualRetries = 1
+/\ acceptedCopies = 1
+/\ calls = 2
+/\ stage = "awaitingSteam"
+
+State 11: <SteamAccept line 18, col 16 to line 20, col 69 of module TextSendGuard>
+/\ sdkIdentity = "original"
+/\ ui = "sending"
+/\ manualRetries = 1
+/\ acceptedCopies = 2
+/\ calls = 2
+/\ stage = "awaitingAck"
+
+16 states generated, 14 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 11.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 2 and the 95th percentile is 2).
+Finished in 00s at (2026-11-13 23:59:50)

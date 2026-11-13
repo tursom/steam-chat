@@ -22,7 +22,7 @@ async function run() {
   try {
     for (const width of [1440, 390]) {
       const page = await browser.newPage({ viewport: { width, height: 900 } });
-      const writes = [], checks = [], errors = [];
+      const writes = [], checks = [], errors = [], history = [];
       let socket;
       page.on('pageerror', error => errors.push(error.message));
       await page.routeWebSocket(/.*/, connection => { socket = connection; });
@@ -34,6 +34,7 @@ async function run() {
             method: route.request().method(), body: route.request().postDataJSON() }));
           return;
         }
+        if (pathname === '/api/history') return route.fulfill({ json: { items: history } });
         if (Object.hasOwn(fixtures, pathname)) return route.fulfill({ json: fixtures[pathname] });
         const file = path.resolve(root, `.${pathname === '/' ? '/index.html' : pathname}`);
         if (!file.startsWith(root + path.sep)) return route.fulfill({ status: 403 });
@@ -129,12 +130,27 @@ async function run() {
         assert.deepEqual([writes.length, checks.length], before, `stale ${change} buttons must not issue requests`);
       }
 
-      // The check's actual recorded event replaces the unknown row normally.
-      await unknown.row.getByRole('button', { name: '检查发送结果' }).click();
+      // F3: a date page has already loaded this event before the pending check returns.
       const checkedItem = { ...event('Original unknown body', 'checked-original'), sentAt };
-      await respond(await waitRequest(checks, 3), 200, { items: [checkedItem] });
+      history.push(checkedItem);
+      await unknown.row.getByRole('button', { name: '检查发送结果' }).click();
+      await waitRequest(checks, 3);
+      await page.evaluate(sentAt => loadHistory('date', sentAt), sentAt);
+      assert.equal(await page.evaluate(() => historyDetached), true);
       await page.locator('[data-event-id="checked-original"]').waitFor();
-      assert.equal(await unknown.row.count(), 0);
+      assert.equal(await page.evaluate(id => outgoingMessages.get(Number(id)).textCandidateFound === true, unknown.id), true, 'date loading already supplies candidate evidence');
+      await respond(await waitRequest(checks, 3), 200, { items: [] });
+      await page.waitForFunction(id => outgoingMessages.get(Number(id))?.textCheckBusy === false, unknown.id);
+      await page.waitForFunction(id => outgoingMessages.get(Number(id))?.textCandidateFound === true, unknown.id);
+      assert.equal(await page.evaluate(() => historyDetached), true, 'checking keeps the selected date page');
+      assert.equal(await page.locator('[data-event-id="checked-original"]').count(), 1);
+      await page.evaluate(() => loadHistory());
+      await page.locator('[data-event-id="checked-original"]').waitFor();
+      assert.equal(await unknown.row.getAttribute('data-send-state'), 'unknown');
+      assert.match(await unknown.row.innerText(), /找到相同内容.*无法确认.*核对记录.*移除此提示/);
+      await unknown.row.getByRole('button', { name: '移除此提示' }).click();
+      assert.equal(await unknown.row.count(), 0, 'only manual dismissal removes the reviewed prompt');
+      assert.equal(await page.locator('[data-event-id="checked-original"]').count(), 1);
       assert.equal(writes.length, writeCount);
       assert.equal(await page.locator('#messageInput').inputValue(), 'Draft while checking');
 
@@ -144,6 +160,7 @@ async function run() {
       const replacementIndex = writes.length;
       await original.row.getByRole('button', { name: '仍要发送一份' }).evaluate(button => { button.click(); button.click(); });
       const replacementRequest = await waitRequest(writes, replacementIndex + 1);
+      const replacementId = await page.locator('.msg-row[data-send-state="sending"]').filter({ hasText: 'Explicit extra copy' }).getAttribute('data-outgoing-id');
       assert.deepEqual(replacementRequest.body, original.request.body);
       assert.equal(await page.locator('.msg-row').filter({ hasText: 'Explicit extra copy' }).count(), 2);
       assert.equal(await original.row.getAttribute('data-send-state'), 'unknown');
@@ -152,9 +169,16 @@ async function run() {
       const replacementItem = event('Explicit extra copy', 'replacement-confirmed');
       socket.send(JSON.stringify(replacementItem));
       await page.locator('[data-event-id="replacement-confirmed"]').waitFor();
-      assert.equal(await original.row.getAttribute('data-send-state'), 'unknown', 'replacement realtime confirmation leaves original unknown');
+      assert.equal(await original.row.getAttribute('data-send-state'), 'unknown');
+      assert.equal(await localRow(replacementId).getAttribute('data-send-state'), 'sending');
+      assert.equal(await page.locator('.msg-row').filter({ hasText: 'Explicit extra copy' }).count(), 3);
+      assert.deepEqual(await page.evaluate(ids => ids.map(id => {
+        const entry = outgoingMessages.get(Number(id));
+        return { candidate: entry.textCandidateFound, echoEventId: entry.echoEventId ?? null };
+      }), [original.id, replacementId]), [{ candidate: true, echoEventId: null }, { candidate: true, echoEventId: null }], 'F2: neither attempt exclusively claims the candidate');
+      assert.match(await original.row.innerText(), /找到相同内容.*无法确认/);
       await respond(replacementRequest, 200, { ok: true, item: replacementItem });
-      await page.waitForTimeout(80);
+      await localRow(replacementId).waitFor({ state: 'detached' });
       assert.equal(await original.row.getAttribute('data-send-state'), 'unknown');
       assert.equal(await page.locator('[data-event-id="replacement-confirmed"]').count(), 1);
       await original.row.getByRole('button', { name: '仍要发送一份' }).evaluate(button => button.click());
@@ -162,8 +186,37 @@ async function run() {
       await original.row.getByRole('button', { name: '检查发送结果' }).click();
       await respond(await waitRequest(checks, 4), 200, { items: [{ ...event('Explicit extra copy', 'original-confirmed'), sentAt: originalSentAt }] });
       await page.locator('[data-event-id="original-confirmed"]').waitFor();
+      assert.equal(await original.row.getAttribute('data-send-state'), 'unknown');
+      assert.match(await original.row.innerText(), /找到相同内容.*无法确认/);
+      assert.equal(await page.locator('.msg-row').filter({ hasText: 'Explicit extra copy' }).count(), 3);
+      await original.row.getByRole('button', { name: '移除此提示' }).click();
       assert.equal(await original.row.count(), 0);
       assert.equal(await page.locator('.msg-row').filter({ hasText: 'Explicit extra copy' }).count(), 2);
+      assert.equal(writes.length, replacementIndex + 1, 'checking and dismissal do not send another copy');
+
+      const conflictIndex = writes.length;
+      await page.locator('#messageInput').fill('Unmarked conflict with late candidate');
+      await page.locator('#sendButton').click();
+      const conflictRequest = await waitRequest(writes, conflictIndex + 1);
+      const conflict = page.locator('.msg-row[data-outgoing-id]').filter({ hasText: 'Unmarked conflict with late candidate' });
+      const conflictId = await conflict.getAttribute('data-outgoing-id');
+      await respond(conflictRequest, 409, { error: 'Unmarked conflict' });
+      await conflict.getByRole('button', { name: '检查发送结果' }).waitFor();
+      assert.equal(await conflict.getAttribute('data-send-state'), 'unknown');
+      const conflictSentAt = await page.evaluate(id => outgoingMessages.get(Number(id)).item.sentAt, conflictId);
+      const lateCheckIndex = checks.length;
+      await conflict.getByRole('button', { name: '检查发送结果' }).click();
+      await respond(await waitRequest(checks, lateCheckIndex + 1), 200, { items: [{
+        ...event('Unmarked conflict with late candidate', 'candidate-plus-31s'),
+        sentAt: new Date(Date.parse(conflictSentAt) + 31000).toISOString()
+      }] });
+      await conflict.locator('.outgoing-check-reason').waitFor();
+      assert.match(await conflict.innerText(), /找到相同内容.*无法确认/, 'F4: +31s remains candidate evidence');
+      assert.equal(await conflict.getAttribute('data-send-state'), 'unknown');
+      await conflict.getByRole('button', { name: '移除此提示' }).click();
+      assert.equal(await conflict.count(), 0);
+      assert.equal(await page.locator('[data-event-id="candidate-plus-31s"]').count(), 1);
+      assert.equal(writes.length, conflictIndex + 1);
 
       const rejectedOriginal = await attempt('Rejected extra copy', 'unknown');
       const rejectedIndex = writes.length;

@@ -1,0 +1,26 @@
+✔ TLC external-attribution: official-client echo is only candidate evidence (4.620906ms)
+✔ TLC replacement-attribution: neither attempt owns the original echo (1.735496ms)
+✔ TLC late-known-check: +31s evidence is reported without inventing confirmation (2.552639ms)
+✔ TLC existing-known-check: date-page history is revisited by a manual read (1.304154ms)
+✔ local history evidence survives an empty recent Steam query (0.876268ms)
+✔ control: a delayed observation with an on-time timestamp is also candidate evidence (0.778592ms)
+✔ control: echo before uncertain response does not erase uncertainty or retransmit (0.793199ms)
+✔ control: empty history neither proves failure nor initiates a resend (0.763764ms)
+✔ control: manual check reports a previously unseen candidate within the window (1.613472ms)
+✔ control: a repeated event can inform two identical attempts without consuming either (1.075528ms)
+✔ control: direct HTTP success resolves its own request even beyond the heuristic window (0.817889ms)
+✔ TLC guard-manual-retry-duplicate: post-submit 409 preserves unknown and blocks ordinary retry (494.162481ms)
+✔ control: unmarked HTTP 400 is not proof of non-delivery (0.839767ms)
+✔ control: unmarked HTTP 403 is not proof of non-delivery (0.526541ms)
+✔ control: unmarked HTTP 409 is not proof of non-delivery (0.471588ms)
+✔ control: unmarked HTTP 429 is not proof of non-delivery (0.591352ms)
+✔ control: unmarked HTTP 503 is not proof of non-delivery (0.48989ms)
+✔ control: explicit non-delivery still allows a single manual retry (0.590301ms)
+ℹ tests 18
+ℹ suites 0
+ℹ pass 18
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 868.376671

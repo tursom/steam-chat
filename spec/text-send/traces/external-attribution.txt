@@ -1,0 +1,103 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 0 and seed 1 with 1 worker on 12 cores with 491MB heap and 64MB offheap memory [pid: 530217] (Linux 7.0.14-4-pve amd64, Arch Linux 21.0.13.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /root/dev/.cache/steam-chat-tla/text-send-lc1ymolf/external-attribution/TextSend.tla
+Parsing file /tmp/Integers.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module TextSend
+Starting... (2026-11-13 23:59:40)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-13 23:59:40.
+Error: Invariant NoFalseAttribution is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {}
+/\ now = 0
+/\ present = {}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"absent", "absent">>
+/\ calls = <<0, 0>>
+/\ claimed = {}
+
+State 2: <Begin line 43, col 5 to line 50, col 40 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {}
+/\ now = 0
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"sending", "absent">>
+/\ calls = <<0, 0>>
+/\ claimed = {}
+
+State 3: <ExternalAccept line 130, col 5 to line 135, col 51 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {3}
+/\ now = 0
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"sending", "absent">>
+/\ calls = <<0, 0>>
+/\ claimed = {}
+
+State 4: <Receive line 153, col 5 to line 163, col 67 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<3, 0>>
+/\ accepted = {3}
+/\ now = 0
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = TRUE
+/\ consumers = <<{}, {}, {1}>>
+/\ replied = {}
+/\ history = {3}
+/\ ui = <<"sending", "absent">>
+/\ calls = <<0, 0>>
+/\ claimed = {3}
+
+26 states generated, 22 distinct states found, 14 states left on queue.
+The depth of the complete state graph search is 4.
+The average outdegree of the complete state graph is 3 (minimum is 2, the maximum 5 and the 95th percentile is 5).
+Finished in 00s at (2026-11-13 23:59:40)

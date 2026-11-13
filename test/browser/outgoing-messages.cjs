@@ -88,8 +88,9 @@ async function run() {
       history.push(item);
       socket.send(JSON.stringify({ ...item, type: 'message' }));
       await page.locator('[data-event-id="confirmed-1"]').waitFor({ timeout: 3000 });
-      assert.equal(await row.count(), 1, 'a realtime confirmation must replace the placeholder while HTTP is still pending');
-      assert.doesNotMatch(await row.innerText(), /发送中|未确认/, 'the recorded message is visible normally while its HTTP request remains pending');
+      assert.equal(await row.count(), 2, 'a realtime candidate stays separate from the pending HTTP attempt');
+      assert.equal(await row.locator('.local-outgoing-state').count(), 1);
+      assert.match(await row.locator('.local-outgoing-state').innerText(), /发送中/);
       assert.match(await queued.innerText(), /发送中/, 'the other pending send must retain its own state');
       await writes[0].route.fulfill({ json: { ok: true, item } });
       writes[0].done();
@@ -111,7 +112,7 @@ async function run() {
       const failed = page.locator('.msg-row').filter({ hasText: 'Rejected text' });
       await failed.waitFor({ timeout: 3000 });
       await page.waitForTimeout(50);
-      await writes[2].route.fulfill({ status: 400, json: { error: 'Rejected for regression test' } });
+      await writes[2].route.fulfill({ status: 400, json: { error: 'Rejected for regression test', uncertain: false } });
       writes[2].done();
       await page.waitForTimeout(100);
       assert.match(await failed.innerText(), /失败/);
@@ -200,28 +201,35 @@ async function run() {
       const two = { ...one, eventId: 'identical-two', ordinal: 1 };
       socket.send(JSON.stringify(one)); socket.send(JSON.stringify(one));
       await page.locator('[data-event-id="identical-one"]').waitFor();
-      assert.equal(await identicalRows.count(), 2, 'one repeated echo must not consume both intentional sends');
-      assert.equal(await identicalRows.locator('.local-outgoing-state').count(), 1);
+      assert.equal(await identicalRows.count(), 3, 'one repeated candidate must not consume either intentional send');
+      assert.equal(await identicalRows.locator('.local-outgoing-state').count(), 2);
       socket.send(JSON.stringify(two)); await page.locator('[data-event-id="identical-two"]').waitFor();
-      assert.equal(await identicalRows.count(), 2); assert.equal(await identicalRows.locator('.local-outgoing-state').count(), 0);
+      assert.equal(await identicalRows.count(), 4); assert.equal(await identicalRows.locator('.local-outgoing-state').count(), 2);
       for (const [offset, confirmed] of [[1, two], [0, one]]) {
         await writes[identicalIndex + offset].route.fulfill({ json: { ok: true, item: confirmed } }); writes[identicalIndex + offset].done();
       }
-      await page.waitForFunction(() => ['identical-one', 'identical-two'].every(id => !document.querySelector(`[data-event-id="${id}"] .local-outgoing-state`)));
+      await page.waitForFunction(() => ![...document.querySelectorAll('[data-outgoing-id]')].some(row => row.textContent.includes('Intentional identical text')));
+      assert.equal(await identicalRows.count(), 2);
       const lostIndex = writes.length;
-      await page.locator('#messageInput').fill('Confirmed despite lost HTTP'); await page.locator('#sendButton').click();
+      await page.locator('#messageInput').fill('External candidate with lost HTTP'); await page.locator('#sendButton').click();
       await page.waitForFunction(() => document.querySelector('.msg-row[data-send-state="sending"]'));
-      socket.send(JSON.stringify({ ...item, eventId: 'echo-lost-http', message: 'Confirmed despite lost HTTP', sentAt: new Date().toISOString() }));
+      socket.send(JSON.stringify({ ...item, eventId: 'echo-lost-http', message: 'External candidate with lost HTTP', sentAt: new Date().toISOString() }));
       await page.locator('[data-event-id="echo-lost-http"]').waitFor();
       await writes[lostIndex].route.abort('failed'); writes[lostIndex].done();
       await page.waitForTimeout(100);
-      const delivered = page.locator('.msg-row').filter({ hasText: 'Confirmed despite lost HTTP' });
-      assert.equal(await delivered.count(), 1); assert.doesNotMatch(await delivered.innerText(), /发送中|发送失败/);
-      assert.doesNotMatch(await delivered.innerText(), /未确认/, 'a recorded event must not retain the lost HTTP request warning');
-      assert.equal(writes.length, lostIndex + 1, 'an echoed message must never be sent again after the HTTP reply is lost');
+      const delivered = page.locator('.msg-row').filter({ hasText: 'External candidate with lost HTTP' });
+      const lostAttempt = delivered.locator('xpath=self::*[@data-outgoing-id]');
+      assert.equal(await delivered.count(), 2);
+      assert.equal(await lostAttempt.getAttribute('data-send-state'), 'unknown');
+      assert.match(await lostAttempt.innerText(), /找到相同内容.*无法确认.*核对记录/);
+      assert.equal(writes.length, lostIndex + 1, 'candidate evidence must never resend after a lost HTTP reply');
+      await lostAttempt.getByRole('button', { name: '移除此提示' }).click();
+      assert.equal(await delivered.count(), 1, 'manual dismissal removes only the prompt after reviewing the event');
+      assert.equal(await page.locator('[data-event-id="echo-lost-http"]').count(), 1);
+      assert.equal(writes.length, lostIndex + 1);
       assert.equal(await playerFrame.evaluate(() => window.playbackMarker), 'playing-42s');
       assert.deepEqual(errors, []);
-      console.log(`PASS ${width}px: immediate sends, echo deduplication, image failure/unknown certainty and no client retries`);
+      console.log(`PASS ${width}px: immediate sends, candidate evidence, HTTP confirmation, manual dismissal, image certainty and no client retries`);
       await page.close();
     }
   } finally { await browser.close(); }

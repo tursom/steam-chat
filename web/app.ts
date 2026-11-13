@@ -284,15 +284,14 @@ const state: AppState = {
 };
 
 type OutgoingState = 'sending' | 'sent' | 'failed' | 'unknown';
-type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string; echoEventId?: string;
-  readonly retryText?: string; readonly textSteamAccountId?: string; textCheckBusy?: boolean; textCheckReason?: string; replacementLocalId?: number; previousLocalId?: number };
+type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string;
+  readonly retryText?: string; readonly textSteamAccountId?: string; textCheckBusy?: boolean; textCheckReason?: string; textCandidateFound?: boolean; replacementLocalId?: number; previousLocalId?: number };
 type ImageOperation = { id: string; peerId: string; steamAccountId: string; state: string; version: number;
   attempts: number; maxAttempts: number; nextRetryAt: number; phase: string; error?: string; retryable: boolean; hasImage: boolean; item?: MessageItem; cooldownUntil?: number; replacementId?: string };
 type ImageOperationEntry = OutgoingMessage & { operation?: ImageOperation; imagePayload?: Record<string, string>; transfer?: ImageTransfer;
   operationBusy?: boolean; operationQueryBusy?: boolean; operationQueryError?: boolean; lastOperationQuery?: number; operationMissing?: boolean; operationCreatingFailed?: boolean;
   uploadRejection?: string };
 const outgoingMessages = new Map<number, OutgoingMessage>();
-const claimedTextEvents = new Set<string>();
 const textAccountCooldowns = new Map<string, number>();
 let textCooldownTimer: ReturnType<typeof setTimeout> | null = null;
 const maxSteamCooldownMs = 24 * 60 * 60 * 1000;
@@ -527,7 +526,6 @@ function invalidateChat(purgePersistent = true) {
   imageEmoteError = '';
   imageTransfers.clear();
   outgoingMessages.clear();
-  claimedTextEvents.clear();
   clearImageDrafts();
   storageHealth = undefined;
   resetHistory();
@@ -3146,7 +3144,7 @@ async function loadHistory(mode: 'latest' | 'older' | 'newer' | 'date' = 'latest
     const payload = await api(`/api/history?${params}`, { signal: options.signal });
     if (options.signal?.aborted || !current()) return;
     const items = uniqueMessages(asMessages(isRecord(payload) ? payload.items : payload));
-    if (mode === 'latest') for (const item of items) reconcileOutgoingText(item);
+    for (const item of items) reconcileOutgoingText(item);
     historyLoaded = true;
     networkThreads.add(target);
     const confirmed = new Set(items.map((item) => item.eventId).filter(Boolean));
@@ -3357,7 +3355,7 @@ function receiveHistoryMessage(item: MessageItem) {
   if (!item.id || !steamAccessAllowed()) return;
   const account = state.steam.activeAccount?.steamId || state.steam.steamId;
   if (item.steamAccountId && item.steamAccountId !== account) return;
-  const confirmedOutgoing = reconcileOutgoingText(item);
+  const outgoingEvidenceChanged = reconcileOutgoingText(item);
   const unreadKey = item.eventId || `${item.id}|${item.sentAt || item.date}|${item.message}`;
   if (!item.echo && (item.id !== state.activeId || historyDetached || document.hidden) && !unreadEvents.has(unreadKey)) {
     unreadEvents.add(unreadKey); if (unreadEvents.size > 2000) unreadEvents.delete(unreadEvents.values().next().value!);
@@ -3381,11 +3379,11 @@ function receiveHistoryMessage(item: MessageItem) {
   historyLive = uniqueMessages([...historyLive, item]).slice(-500);
   if (historyDetached) { updateHistoryControls(); return; }
   if (item.eventId && historyItems.some((entry) => entry.eventId === item.eventId)) {
-    if (confirmedOutgoing) refreshOutgoing();
+    if (outgoingEvidenceChanged) refreshOutgoing();
     return;
   }
   historyItems.push(item);
-  if (confirmedOutgoing) { refreshOutgoing(); return; }
+  if (outgoingEvidenceChanged) { refreshOutgoing(); return; }
   const messages = document.querySelector<HTMLElement>('#messages');
   if (!messages) return;
   const atBottom = historyScroll ? historyScroll.following()
@@ -3467,14 +3465,14 @@ function watchHistoryLayout(messages: HTMLElement, follow: boolean) {
   settle();
 }
 
-function rememberClaimedText(eventId: string) {
-  claimedTextEvents.add(eventId);
-  if (claimedTextEvents.size > 1000) claimedTextEvents.delete(claimedTextEvents.values().next().value!);
+function textSendCheckReason(found: boolean) {
+  return found
+    ? '聊天记录中找到相同内容的消息，但无法确认是否对应本次发送。请核对记录，确认后可移除此提示。'
+    : '未找到可确认的发送记录，消息仍可能已发送；请稍后再检查。';
 }
 
 function reconcileOutgoingText(item: MessageItem) {
-  if (!item.echo || !item.eventId || item.type && item.type !== 'message' || claimedTextEvents.has(item.eventId)) return false;
-  if (historyItems.some(previous => previous.eventId === item.eventId)) return false;
+  if (!item.echo || !item.eventId || item.type && item.type !== 'message') return false;
   const account = state.steam.activeAccount?.steamId || state.steam.steamId;
   if (item.steamAccountId && item.steamAccountId !== account) return false;
   const sentAt = Date.parse(String(item.sentAt || item.date || '').replace(' ', 'T'));
@@ -3487,24 +3485,24 @@ function reconcileOutgoingText(item: MessageItem) {
         return target === undefined || target === body ? body : original;
       });
   const text = normalize(item.message || '');
-  // Associate display only, one attempt per new Steam event. A recorded message
-  // is displayed normally even if its HTTP acknowledgement was lost. Keep an
-  // in-flight request until its own response so an explicit rejection stays distinct.
-  // An explicit extra copy owns its confirmation before the older unknown row.
-  // Ordinary identical sends retain their original insertion order.
-  const attempts = [...outgoingMessages.values()].sort((a, b) => Number(b.previousLocalId !== undefined) - Number(a.previousLocalId !== undefined));
-  for (const entry of attempts) {
+  // Body/time matches are evidence candidates, never request confirmations.
+  // The same event can be a candidate for several intentional identical sends.
+  // Revisit existing history too: a prior date-page load must not hide evidence.
+  let changed = false;
+  for (const entry of outgoingMessages.values()) {
     if (entry.context !== chatContext() || entry.item.id !== item.id || entry.item.type !== 'message'
-      || entry.state === 'failed' || entry.echoEventId || entry.retryText === undefined) continue;
+      || entry.state !== 'sending' && entry.state !== 'unknown' || entry.retryText === undefined) continue;
     const startedAt = Date.parse(entry.item.sentAt || '');
-    if (!Number.isFinite(startedAt) || sentAt < startedAt - 2000 || sentAt > startedAt + 30000) continue;
+    if (!Number.isFinite(startedAt) || sentAt < startedAt - 2000) continue;
     const candidates = [entry.retryText, entry.retryText.replace(/\[/g, '\\['), entry.item.message || ''];
     if (!candidates.some(candidate => normalize(candidate) === text)) continue;
-    entry.echoEventId = item.eventId; rememberClaimedText(item.eventId);
-    if (entry.state === 'unknown') outgoingMessages.delete(entry.localId);
-    return true;
+    if (!entry.textCandidateFound || entry.textCheckReason !== textSendCheckReason(true)) {
+      entry.textCandidateFound = true;
+      entry.textCheckReason = textSendCheckReason(true);
+      changed = true;
+    }
   }
-  return false;
+  return changed;
 }
 
 function visibleOutgoing() {
@@ -3548,7 +3546,7 @@ function finishOutgoing(entry: OutgoingMessage, status: OutgoingState, response?
   if (entry.context !== chatContext() || !outgoingMessages.has(entry.localId)) return;
   entry.state = status;
   entry.error = error;
-  if (status === 'failed') entry.echoEventId = undefined;
+  if (status === 'failed') { entry.textCandidateFound = undefined; entry.textCheckReason = undefined; }
   if (isRecord(response)) {
     const account = state.steam.activeAccount?.steamId || state.steam.steamId;
     const item = asMessages([response.item]).find(item => item.id === entry.item.id && item.echo
@@ -3557,19 +3555,19 @@ function finishOutgoing(entry: OutgoingMessage, status: OutgoingState, response?
       entry.item = item;
       if (item.eventId) {
         entry.eventId = item.eventId;
-        if (entry.retryText !== undefined) rememberClaimedText(item.eventId);
         outgoingMessages.delete(entry.localId);
         receiveHistoryMessage(item);
       }
     }
   }
-  if (status === 'unknown' && entry.echoEventId) outgoingMessages.delete(entry.localId);
   if (entry.item.id === state.activeId) refreshOutgoing();
 }
 
-function outgoingFailure(error: unknown): 'failed' | 'unknown' {
+function outgoingFailure(error: unknown, requireDeliveryEvidence = false): 'failed' | 'unknown' {
   if (isRecord(error) && typeof error.uncertain === 'boolean') return error.uncertain ? 'unknown' : 'failed';
-  // Transport and server failures do not prove Steam rejected the send.
+  // Text submissions require delivery evidence; keep legacy image handling
+  // separate until that path uses the same explicit delivery contract.
+  if (requireDeliveryEvidence) return 'unknown';
   return isRecord(error) && typeof error.status === 'number' && error.status >= 400 && error.status < 500 ? 'failed' : 'unknown';
 }
 
@@ -3606,12 +3604,7 @@ function renderHistory(items: MessageItem[]) {
   }
   for (const entry of outgoing) {
     const localImage = entry.item.type === 'image' && (/^data:image\//i.test(entry.item.message || '') || (entry.item.message || '').startsWith('/api/image-emotes/file/') || (entry.item.message || '').startsWith('/api/send-operations/'));
-    const linkedRow = entry.echoEventId ? desired.find(row => (row as HTMLElement).dataset.eventId === entry.echoEventId) as HTMLElement | undefined : undefined;
-    if (linkedRow && entry.state !== 'failed') {
-      linkedRow.dataset.sendState = 'sent';
-      continue;
-    }
-    const row = linkedRow || renderMessage(localImage ? { ...entry.item, message: '[图片]' } : entry.item);
+    const row = renderMessage(localImage ? { ...entry.item, message: '[图片]' } : entry.item);
     row.dataset.outgoingId = String(entry.localId);
     row.dataset.sendState = entry.state;
     row.dataset.state = (entry as ImageOperationEntry).operation?.state || entry.state;
@@ -3653,7 +3646,6 @@ function renderHistory(items: MessageItem[]) {
       });
       bubble.append(dismiss);
     }
-    if (linkedRow) continue;
     // Insert local attempts at their send time instead of pinning them after all history.
     const sentAt = Date.parse(entry.item.sentAt || entry.item.date || '');
     const next = Number.isFinite(sentAt) ? items.find(item => {
@@ -4826,7 +4818,8 @@ async function retryOutgoingText(entry: OutgoingMessage): Promise<boolean> {
   if (!canActOnOutgoingText(entry) || !steamOnline() || entry.state !== 'failed' || entry.textCheckBusy) return false;
   if (textCooldownBlocked(entry.textSteamAccountId)) return false;
   entry.state = 'sending';
-  entry.error = entry.textCheckReason = entry.echoEventId = undefined;
+  entry.error = entry.textCheckReason = undefined;
+  entry.textCandidateFound = undefined;
   entry.item = { ...entry.item, sentAt: new Date().toISOString() };
   refreshOutgoing();
   return sendOutgoingText(entry);
@@ -4846,6 +4839,9 @@ async function checkOutgoingText(entry: OutgoingMessage): Promise<void> {
   if (!canActOnOutgoingText(entry) || entry.state !== 'unknown' || entry.textCheckBusy) return;
   entry.textCheckBusy = true;
   entry.textCheckReason = undefined;
+  // Steam only returns its recent tail. Already-loaded pages remain useful
+  // evidence even when their messages have fallen outside that remote window.
+  for (const item of [...historyItems, ...historyLive]) reconcileOutgoingText(item);
   refreshOutgoing();
   const controller = new AbortController();
   const deadline = setTimeout(() => controller.abort(), networkDeadlineMs);
@@ -4859,9 +4855,11 @@ async function checkOutgoingText(entry: OutgoingMessage): Promise<void> {
       && typeof item.message === 'string' && Number.isFinite(Date.parse(item.sentAt || item.date || ''))
       && (!item.steamAccountId || item.steamAccountId === steamAccountId));
     for (const item of items) receiveHistoryMessage(item);
-    if (outgoingMessages.get(entry.localId) === entry) entry.textCheckReason = '未找到可确认的发送记录，消息仍可能已发送；请稍后再检查。';
+    if (outgoingMessages.get(entry.localId) === entry) entry.textCheckReason = textSendCheckReason(entry.textCandidateFound === true);
   } catch (error) {
-    if (canActOnOutgoingText(entry) && entry.state === 'unknown') entry.textCheckReason = `检查失败：${errorMessage(error)}。发送结果仍未确认。`;
+    if (canActOnOutgoingText(entry) && entry.state === 'unknown') {
+      entry.textCheckReason = `检查失败：${errorMessage(error)}。${entry.textCandidateFound ? textSendCheckReason(true) : '发送结果仍未确认。'}`;
+    }
   } finally {
     clearTimeout(deadline);
     entry.textCheckBusy = false;
@@ -4904,7 +4902,7 @@ async function sendOutgoingText(outgoing: OutgoingMessage): Promise<boolean> {
     finishOutgoing(outgoing, 'sent', response);
     return true;
   } catch (error) {
-    finishOutgoing(outgoing, outgoingFailure(error), undefined, errorMessage(error));
+    finishOutgoing(outgoing, outgoingFailure(error, true), undefined, errorMessage(error));
     return false;
   } finally { clearTimeout(deadline); }
 }
@@ -5721,7 +5719,10 @@ function sortHistoryItems(items: MessageItem[]) {
 function applyDurableMessages(items: MessageItem[]) {
   const account = state.steam.activeAccount?.steamId || state.steam.steamId;
   const accepted = items.filter(item => item.id && item.eventId && item.steamAccountId === account);
-  for (const item of accepted) reconcileOutgoingText(item);
+  let outgoingEvidenceChanged = false;
+  for (const item of accepted) {
+    if (reconcileOutgoingText(item) && item.id === state.activeId) outgoingEvidenceChanged = true;
+  }
   for (const item of accepted) { updateRecentConversation(item, false); updateCachedMessage(item); }
   if (accepted.length) { updateChatLists(); scheduleChatCache(); }
   const current = accepted.filter(item => item.id === state.activeId);
@@ -5729,7 +5730,10 @@ function applyDurableMessages(items: MessageItem[]) {
   historyLive = sortHistoryItems([...historyLive, ...current]).slice(-500);
   if (historyDetached) { updateHistoryControls(); return; }
   const before = new Set(historyItems.map(item => item.eventId));
-  if (!current.some(item => !before.has(item.eventId))) return;
+  if (!current.some(item => !before.has(item.eventId))) {
+    if (outgoingEvidenceChanged) refreshOutgoing();
+    return;
+  }
   const messages = document.querySelector<HTMLElement>('#messages');
   const top = messages?.scrollTop || 0;
   const following = historyScroll?.following() ?? Boolean(messages && messages.scrollHeight - top - messages.clientHeight < 48);

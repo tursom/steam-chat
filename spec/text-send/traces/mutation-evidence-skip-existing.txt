@@ -1,0 +1,172 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 0 and seed 1 with 1 worker on 12 cores with 491MB heap and 64MB offheap memory [pid: 533909] (Linux 7.0.14-4-pve amd64, Arch Linux 21.0.13.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /root/dev/.cache/steam-chat-tla/text-send-lc1ymolf/mutation-evidence-skip-existing/TextSendEvidence.tla
+Parsing file /root/dev/.cache/steam-chat-tla/text-send-lc1ymolf/mutation-evidence-skip-existing/TextSend.tla
+Parsing file /tmp/Integers.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module TextSend
+Semantic processing of module TextSendEvidence
+Starting... (2026-11-13 23:59:59)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-13 23:59:59.
+Error: Invariant NoStuckKnownCheck is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {}
+/\ now = 0
+/\ present = {}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"absent", "absent">>
+/\ evidence = {}
+/\ calls = <<0, 0>>
+/\ claimed = {}
+
+State 2: <EvidenceNext line 42, col 9 to line 46, col 72 of module TextSendEvidence>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {}
+/\ now = 0
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"sending", "absent">>
+/\ evidence = {}
+/\ calls = <<0, 0>>
+/\ claimed = {}
+
+State 3: <EvidenceNext line 42, col 9 to line 46, col 72 of module TextSendEvidence>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {}
+/\ now = 0
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {1}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"sending", "absent">>
+/\ evidence = {}
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+State 4: <EvidenceNext line 42, col 9 to line 46, col 72 of module TextSendEvidence>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {1}
+/\ now = 0
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"sending", "absent">>
+/\ evidence = {}
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+State 5: <EvidenceNext line 42, col 9 to line 46, col 72 of module TextSendEvidence>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {1}
+/\ now = 0
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {1}
+/\ history = {}
+/\ ui = <<"unknown", "absent">>
+/\ evidence = {}
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+State 6: <EvidenceNext line 42, col 9 to line 46, col 72 of module TextSendEvidence>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {1}
+/\ now = 0
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {1}
+/\ history = {1}
+/\ ui = <<"unknown", "absent">>
+/\ evidence = {}
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+State 7: <CheckEvidence line 30, col 5 to line 39, col 55 of module TextSendEvidence>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {1}
+/\ now = 0
+/\ present = {1}
+/\ stuckCheck = TRUE
+/\ checked = TRUE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {1}
+/\ history = {1}
+/\ ui = <<"unknown", "absent">>
+/\ evidence = {}
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+140 states generated, 84 distinct states found, 40 states left on queue.
+The depth of the complete state graph search is 7.
+The average outdegree of the complete state graph is 2 (minimum is 0, the maximum 5 and the 95th percentile is 4).
+Finished in 00s at (2026-11-13 23:59:59)

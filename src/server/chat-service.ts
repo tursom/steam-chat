@@ -1627,34 +1627,44 @@ function createChatService(options: ChatServiceOptions = {}) {
       // submissions have no idempotency token, so retrying can send another copy.
       if (submittedAt !== undefined && (isTransientSteamError(error) || /timed\s*out/i.test(errorMessage(error))
         || isRecord(error) && Number(error.eresult) === 16)) {
-        await reconcileTextSend(String(id), message, steamAccountId, submittedAt, selfName, () => authorize?.(level));
+        try {
+          await reconcileTextSend(String(id), message, steamAccountId, submittedAt, selfName, () => authorize?.(level));
+        } catch (reconciliationError) {
+          // Preserve authorization/account errors, but a failed check cannot prove the send failed.
+          throw Object.assign(isRecord(reconciliationError) ? reconciliationError : new Error(errorMessage(reconciliationError)), { uncertain: true });
+        }
         throw Object.assign(new Error('文字发送结果未确认，请先检查聊天记录。', { cause: error }), { statusCode: 502, uncertain: true });
       }
-      throw error;
+      throw Object.assign(isRecord(error) ? error : new Error(errorMessage(error)), { uncertain: true });
     });
-    const canonicalMessage = isRecord(result) && typeof result.modified_message === 'string'
-      ? result.modified_message : message;
-    if (/^\/sticker(?:\s|$)/i.test(message.trim()) && !/^\[sticker\b[^\]]*\]\s*\[\/sticker\]$/i.test(canonicalMessage.trim())) {
-      throw Object.assign(new Error('Steam 未确认贴纸解析，请先检查官方客户端。'), { statusCode: 502, uncertain: true });
+    try {
+      const canonicalMessage = isRecord(result) && typeof result.modified_message === 'string'
+        ? result.modified_message : message;
+      if (/^\/sticker(?:\s|$)/i.test(message.trim()) && !/^\[sticker\b[^\]]*\]\s*\[\/sticker\]$/i.test(canonicalMessage.trim())) {
+        throw Object.assign(new Error('Steam 未确认贴纸解析，请先检查官方客户端。'), { statusCode: 502, uncertain: true });
+      }
+      if (/^\/roomeffect(?:\s|$)/i.test(message.trim()) && !/^\[roomeffect\b[^\]]*\]\s*\[\/roomeffect\]$/i.test(canonicalMessage.trim())) {
+        throw Object.assign(new Error('Steam 未确认聊天效果解析，请先检查官方客户端。'), { statusCode: 502, uncertain: true });
+      }
+      remember(recentSentText, `${id}:${canonicalMessage}`);
+      const record: HistoryRecordInput = {
+        type: 'message',
+        echo: true,
+        steamAccountId,
+        id,
+        name: await selfName,
+        message: canonicalMessage
+      };
+      if (isRecord(result)) {
+        if (typeof result.ordinal === 'string' || typeof result.ordinal === 'number') record.ordinal = result.ordinal;
+        if (result.server_timestamp instanceof Date) record.sentAt = result.server_timestamp.toISOString();
+        record.steamEventKey = steamEventKey(steamAccountId, String(id), true, canonicalMessage, result.server_timestamp, result.ordinal);
+      }
+      return await persistSent(record);
+    } catch (error) {
+      // Steam accepted the send even if processing its acknowledgement or saving it fails.
+      throw Object.assign(isRecord(error) ? error : new Error(errorMessage(error)), { uncertain: true });
     }
-    if (/^\/roomeffect(?:\s|$)/i.test(message.trim()) && !/^\[roomeffect\b[^\]]*\]\s*\[\/roomeffect\]$/i.test(canonicalMessage.trim())) {
-      throw Object.assign(new Error('Steam 未确认聊天效果解析，请先检查官方客户端。'), { statusCode: 502, uncertain: true });
-    }
-    remember(recentSentText, `${id}:${canonicalMessage}`);
-    const record: HistoryRecordInput = {
-      type: 'message',
-      echo: true,
-      steamAccountId,
-      id,
-      name: await selfName,
-      message: canonicalMessage
-    };
-    if (isRecord(result)) {
-      if (typeof result.ordinal === 'string' || typeof result.ordinal === 'number') record.ordinal = result.ordinal;
-      if (result.server_timestamp instanceof Date) record.sentAt = result.server_timestamp.toISOString();
-      record.steamEventKey = steamEventKey(steamAccountId, String(id), true, canonicalMessage, result.server_timestamp, result.ordinal);
-    }
-    return persistSent(record);
   }
 
   async function sendImageMessage(id: unknown, body: ImageBody, steamAccountId?: string, authorize?: () => void): Promise<HistoryItem> {

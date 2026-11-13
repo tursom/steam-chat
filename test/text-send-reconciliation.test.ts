@@ -256,7 +256,7 @@ test('successful sends, permanent failures and pre-submission failures never rea
       ...(kind === 'before submission' ? { waitForLogin: () => { throw new Error('Timeout'); } } : {})
     });
     user.chat.sendFriendMessage = (_id: string, _message: string, callback: (error: unknown, result?: unknown) => void) => {
-      callback(kind === 'permanent' ? new Error('Access denied') : null,
+      callback(kind === 'permanent' ? Object.assign(new Error('Access denied'), { eresult: 15 }) : null,
         { modified_message: 'lost ack', server_timestamp: new Date(), ordinal: 7 });
     };
     if (kind === 'success') await service.sendTextMessage(peer, 'lost ack', account);
@@ -266,6 +266,46 @@ test('successful sends, permanent failures and pre-submission failures never rea
     assert.equal(records.length, kind === 'success' ? 1 : 0);
   }
 });
+
+for (const plain of [false, true]) {
+  test(`generic SDK failure preserves the original ${plain ? 'object' : 'Error'} and marks it uncertain`, async t => {
+    const cause = new Error('upstream failure');
+    const original = Object.assign(plain ? { message: 'Unexpected SDK failure' } : new Error('Unexpected SDK failure'),
+      { statusCode: 502, code: 'sdk_failure', cause, uncertain: false });
+    const { service, user, records, counts } = probe(t, async () => ({ messages: [entry()] }));
+    let sends = 0;
+    user.chat.sendFriendMessage = (_id, _message, callback) => { sends++; callback(original); };
+    await assert.rejects(service.sendTextMessage(peer, 'lost ack', account), error => error === original);
+    assert.equal(original.uncertain, true);
+    assert.equal(original.statusCode, 502);
+    assert.equal(original.code, 'sdk_failure');
+    assert.equal(original.cause, cause);
+    assert.equal(sends, 1);
+    assert.equal(counts().reads, 0);
+    assert.deepEqual(records, []);
+  });
+}
+
+for (const stage of ['acknowledgement', 'legacy persistence'] as const) {
+  test(`failure after Steam accepted the text remains uncertain: ${stage}`, async t => {
+    const directory = await mkdtemp(join(tmpdir(), 'text-send-accepted-'));
+    t.after(() => rm(directory, { recursive: true, force: true }));
+    const { service, user, records, counts } = probe(t, async () => ({ messages: [entry()] }),
+      stage === 'legacy persistence' ? { historyStorage: undefined, logPath: directory } : {});
+    let sends = 0;
+    user.chat.sendFriendMessage = (_id: string, _message: string, callback: (error: unknown, result?: unknown) => void) => {
+      sends++;
+      callback(null, { modified_message: 'lost ack', ordinal: 7,
+        server_timestamp: stage === 'acknowledgement' ? new Date(NaN) : new Date() });
+    };
+    await assert.rejects(service.sendTextMessage(peer, 'lost ack', account),
+      (error: Error & { uncertain?: boolean; code?: string }) => error.uncertain === true
+        && (stage === 'acknowledgement' ? error instanceof RangeError : error.code === 'EISDIR'));
+    assert.equal(sends, 1);
+    assert.equal(counts().reads, 0);
+    assert.deepEqual(records, []);
+  });
+}
 
 for (const body of [undefined, {}, { messages: null }, { messages: [null, {}, 'bad'] }, { messages: [] }]) {
   test(`missing or malformed history keeps uncertain 502: ${JSON.stringify(body)}`, async t => {
@@ -304,7 +344,8 @@ for (const stage of ['history', 'metadata', 'between records'] as const) {
         onMessage: () => () => {}, onStatus: () => () => {}, onDurable: () => () => {}
       } } : {})
     });
-    const sending = assert.rejects(service.sendTextMessage(peer, 'lost ack', account, authorize), error => error === forbidden);
+    const sending = assert.rejects(service.sendTextMessage(peer, 'lost ack', account, authorize), error =>
+      error === forbidden && (error as typeof forbidden & { uncertain?: boolean }).uncertain === true);
     await turn();
     if (stage === 'history') allowed = false;
     completeRead(null, { messages: [entry(), entry({ ordinal: 8 })] });
@@ -328,7 +369,7 @@ for (const source of ['SDK', 'active account'] as const) {
     const broadcasts: unknown[] = [];
     service.clients.add({ readyState: WebSocket.OPEN, send: (message: unknown) => broadcasts.push(message), terminate() {} });
     const sending = assert.rejects(service.sendTextMessage(peer, 'lost ack', account),
-      (error: { statusCode?: number }) => error.statusCode === 409);
+      (error: { statusCode?: number; uncertain?: boolean }) => error.statusCode === 409 && error.uncertain === true);
     await turn();
     if (source === 'SDK') user.steamID = new SteamID(other);
     else active = other;
@@ -347,7 +388,7 @@ test('revocation during a failed history read still surfaces the authorization e
   const { service, records } = probe(t, (_id, _opts, callback) => { complete = callback; });
   const sending = assert.rejects(service.sendTextMessage(peer, 'lost ack', account, () => {
     if (!allowed) throw forbidden;
-  }), error => error === forbidden);
+  }), error => error === forbidden && (error as typeof forbidden & { uncertain?: boolean }).uncertain === true);
   await turn();
   allowed = false;
   complete(new Error('history unavailable'));

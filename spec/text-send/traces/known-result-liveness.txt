@@ -1,0 +1,249 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 0 and seed 1 with 1 worker on 12 cores with 491MB heap and 64MB offheap memory [pid: 530597] (Linux 7.0.14-4-pve amd64, Arch Linux 21.0.13.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /root/dev/.cache/steam-chat-tla/text-send-lc1ymolf/known-result-liveness/TextSend.tla
+Parsing file /tmp/Integers.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module TextSend
+Starting... (2026-11-13 23:59:43)
+Implied-temporal checking--satisfiability problem has 2 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-13 23:59:43.
+Progress(10) at 2026-11-13 23:59:43: 172 states generated, 88 distinct states found, 0 states left on queue.
+Checking 2 branches of temporal properties for the complete state space with 176 total distinct states at (2026-11-13 23:59:43)
+Error: Temporal properties were violated.
+
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {}
+/\ now = 0
+/\ present = {}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"absent", "absent">>
+/\ calls = <<0, 0>>
+/\ claimed = {}
+
+State 2: <Begin line 43, col 5 to line 50, col 40 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {}
+/\ now = 0
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"sending", "absent">>
+/\ calls = <<0, 0>>
+/\ claimed = {}
+
+State 3: <Advance line 194, col 5 to line 198, col 67 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {}
+/\ now = 1
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"sending", "absent">>
+/\ calls = <<0, 0>>
+/\ claimed = {}
+
+State 4: <Advance line 194, col 5 to line 198, col 67 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {}
+/\ now = 31
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"sending", "absent">>
+/\ calls = <<0, 0>>
+/\ claimed = {}
+
+State 5: <Submit line 58, col 5 to line 65, col 51 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<0, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {}
+/\ now = 31
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {1}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"sending", "absent">>
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+State 6: <SteamAccept line 69, col 5 to line 76, col 40 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<31, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {1}
+/\ now = 31
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {}
+/\ history = {}
+/\ ui = <<"sending", "absent">>
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+State 7: <ObserveUnknown line 89, col 5 to line 95, col 40 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<31, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {1}
+/\ now = 31
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {1}
+/\ history = {}
+/\ ui = <<"unknown", "absent">>
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+State 8: <Receive line 153, col 5 to line 163, col 67 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<31, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {1}
+/\ now = 31
+/\ present = {1}
+/\ stuckCheck = FALSE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {1}
+/\ history = {1}
+/\ ui = <<"unknown", "absent">>
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+State 9: <ManualCheck line 180, col 5 to line 190, col 46 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<31, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {1}
+/\ now = 31
+/\ present = {1}
+/\ stuckCheck = TRUE
+/\ checked = TRUE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {1}
+/\ history = {1}
+/\ ui = <<"unknown", "absent">>
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+State 10: <ManualCheck line 180, col 5 to line 190, col 46 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<31, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {1}
+/\ now = 31
+/\ present = {1}
+/\ stuckCheck = TRUE
+/\ checked = FALSE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {1}
+/\ history = {1}
+/\ ui = <<"unknown", "absent">>
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+State 11: <ManualCheck line 180, col 5 to line 190, col 46 of module TextSend>
+/\ startAt = <<0, 0>>
+/\ eventAt = <<31, 0, 0>>
+/\ rejected = {}
+/\ echo = <<0, 0>>
+/\ accepted = {1}
+/\ now = 31
+/\ present = {1}
+/\ stuckCheck = TRUE
+/\ checked = TRUE
+/\ parent = <<0, 0>>
+/\ pending = {}
+/\ badAssociation = FALSE
+/\ consumers = <<{}, {}, {}>>
+/\ replied = {1}
+/\ history = {1}
+/\ ui = <<"unknown", "absent">>
+/\ calls = <<1, 0>>
+/\ claimed = {}
+
+Back to state 10: <ManualCheck line 180, col 5 to line 190, col 46 of module TextSend>
+
+Finished checking temporal properties in 00s at 2026-11-13 23:59:43
+172 states generated, 88 distinct states found, 0 states left on queue.
+Finished in 00s at (2026-11-13 23:59:43)

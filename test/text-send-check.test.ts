@@ -30,19 +30,20 @@ async function fixture(t: TestContext) {
   let failure = false;
   let reads = 0;
   let sends = 0;
-  let rejectText = false;
+  let sendError: Error | undefined;
+  let historyCount = 100;
   const records: HistoryRecordInput[] = [];
   const status = { status: 'online', steamId: account };
   const steamUser = Object.assign(new EventEmitter(), { steamID: account, chat: {
     sendFriendMessage(_id: string, _text: string, callback: (error: unknown) => void) {
       sends++;
-      if (rejectText) callback(Object.assign(new Error('RateLimitExceeded'), { eresult: 84 }));
+      if (sendError) callback(sendError);
       else throw new Error('checking must never send');
     },
     getFriendMessageHistory(id: string, options: unknown, callback: (error: unknown, response?: unknown) => void) {
       reads++;
       assert.equal(id, peer);
-      assert.deepEqual(options, { maxCount: 100, wantBbcode: true });
+      assert.deepEqual(options, { maxCount: historyCount, wantBbcode: true });
       queueMicrotask(() => { beforeReply(); callback(failure ? new Error('private upstream response') : null, response); });
     }
   } });
@@ -65,11 +66,18 @@ async function fixture(t: TestContext) {
   });
   return { request, records, body, actual, counts: () => ({ reads, sends }), setResponse(value: unknown) { response = value; },
     send: () => fetch(`${base}/message`, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
-    rejectText() { rejectText = true; }, offline() { status.status = 'offline'; },
+    rejectText() { sendError = Object.assign(new Error('RateLimitExceeded'), { eresult: 84 }); },
+    failSend(error = new Error('Request timed out')) { sendError = error; historyCount = 20; },
+    offline() { status.status = 'offline'; },
     grantChat() { store.replaceUserSteamGrants(user.id, [{ steamAccountId: active.id, level: 'chat', scope: 'some', peers: [peer], expiresAt: null }], admin.id); },
     fail() { failure = true; }, beforeReply(callback: () => void) { beforeReply = callback; },
     revoke() { store.replaceUserSteamGrants(user.id, [], admin.id); },
-    switchAccount() { store.upsertSteamAccount({ steamId: other, setActive: true }); steamUser.steamID = status.steamId = other; } };
+    revokeSession() { store.revokeUserSessions(user.id, admin.id); },
+    switchAccount() {
+      const next = store.upsertSteamAccount({ steamId: other, setActive: true });
+      store.replaceUserSteamGrants(user.id, [{ steamAccountId: next.id, level: 'chat', scope: 'some', peers: [peer], expiresAt: null }], admin.id);
+      steamUser.steamID = status.steamId = other;
+    } };
 }
 
 test('manual text check reads Steam history for a read-only scoped user without sending', async t => {
@@ -118,6 +126,53 @@ test('text HTTP errors identify explicit rejection and pre-submission offline st
   assert.equal(offline.status, 503);
   assert.equal((await offline.json()).uncertain, false);
   assert.deepEqual(f.counts(), { reads: 0, sends: 1 });
+});
+
+for (const { change, status, error, extra } of [
+  { change: 'switchAccount', status: 409, error: 'Steam account changed before sending', extra: {} },
+  { change: 'revoke', status: 403, error: '当前 Steam 授权不足，需要「只读」授权',
+    extra: { code: 'steam_grant_insufficient', required: 'read', statusCode: 403 } },
+  { change: 'revokeSession', status: 401, error: 'Unauthorized', extra: {} },
+  { change: 'offline', status: 503, error: 'Steam offline', extra: {} }
+] as const) {
+  for (const historyFails of [false, true]) {
+    test(`text HTTP send remains uncertain after ${change} during ${historyFails ? 'failed' : 'successful'} reconciliation read`, async t => {
+      const f = await fixture(t);
+      f.grantChat(); f.failSend();
+      f.setResponse({ messages: [{ ...f.actual, server_timestamp: new Date() }] });
+      if (historyFails) f.fail();
+      f.beforeReply(() => f[change]());
+      const response = await f.send();
+      assert.equal(response.status, status);
+      assert.deepEqual(await response.json(), { error, ...extra, uncertain: true });
+      assert.deepEqual(f.counts(), { reads: 1, sends: 1 });
+      assert.equal(f.records.length, 0);
+    });
+  }
+}
+
+test('text HTTP send marks a generic SDK failure uncertain while preserving its status and payload', async t => {
+  const f = await fixture(t);
+  f.grantChat();
+  f.failSend(Object.assign(new Error('Unexpected SDK failure'), { statusCode: 502, code: 'sdk_failure' }));
+  const response = await f.send();
+  assert.equal(response.status, 502);
+  assert.deepEqual(await response.json(), { error: 'Unexpected SDK failure', code: 'sdk_failure', uncertain: true });
+  assert.deepEqual(f.counts(), { reads: 0, sends: 1 });
+  assert.equal(f.records.length, 0);
+});
+
+test('text HTTP send keeps an explicit Steam access rejection certain', async t => {
+  const f = await fixture(t);
+  f.grantChat();
+  f.failSend(Object.assign(new Error('Access denied'), { eresult: 15, statusCode: 403, code: 'steam_access_denied' }));
+  const response = await f.send();
+  assert.equal(response.status, 403);
+  assert.deepEqual(await response.json(), {
+    error: 'Access denied', code: 'steam_access_denied', statusCode: 403, uncertain: false
+  });
+  assert.deepEqual(f.counts(), { reads: 0, sends: 1 });
+  assert.equal(f.records.length, 0);
 });
 
 test('a text rate-limit cooldown does not block read-only delivery checks', async t => {

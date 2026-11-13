@@ -41,7 +41,7 @@ class Element {
 }
 
 type Item = { id: string; eventId: string; message: string; echo?: boolean; name?: string; sentAt?: string; steamAccountId?: string; type?: string };
-type OutgoingEntry = { localId: number; state: string; item: Item; context: string; readonly retryText?: string; textCheckBusy?: boolean; textCheckReason?: string; replacementLocalId?: number };
+type OutgoingEntry = { localId: number; state: string; item: Item; context: string; readonly retryText?: string; textCheckBusy?: boolean; textCheckReason?: string; textCandidateFound?: boolean; echoEventId?: string; replacementLocalId?: number };
 type Pending = { url: URL; method?: string; body?: string; signal?: AbortSignal; resolve: (value: unknown) => void; respond: (status: number, value: unknown, headers?: Record<string, string>) => void; reject: (error: Error) => void };
 function harness(withLayout = false, withRealtime = false, disk?: Map<string, unknown>, browserStorage = new Map<string, string>()) {
   let now = Date.now();
@@ -174,6 +174,13 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
 }
 const item = (eventId: string, id = 'peer'): Item => ({ id, eventId, message: eventId });
 
+function assertTextCandidate(entry: OutgoingEntry, state: 'sending' | 'unknown') {
+  assert.equal(entry.state, state);
+  assert.equal(entry.textCandidateFound, true);
+  assert.match(entry.textCheckReason!, /找到相同内容.*无法确认.*核对记录.*移除此提示/);
+  assert.equal(entry.echoEventId, undefined, 'body matches never associate an event with an attempt');
+}
+
 for (const stale of [false, true]) {
   test(`friend and group requests start without waiting for conversations or inventory, stale context ${stale}`, async () => {
     const { api, pending } = harness();
@@ -218,33 +225,35 @@ test('optimistic text appears before the response and reconciles response, WebSo
   assert.equal(messages.children.length, 1);
 });
 
-test('a confirmed realtime echo replaces its text placeholder before a delayed HTTP reply', async () => {
+test('a realtime candidate keeps its text placeholder until the original HTTP reply succeeds', async () => {
   const { api, pending, nodes, messages } = harness();
   nodes['#messageInput'].value = 'hello';
   const sending = api.sendText();
   const confirmed = { ...item('echo-before-response'), message: 'hello', echo: true, sentAt: new Date().toISOString() };
   api.receiveHistoryMessage(confirmed);
-  assert.equal(messages.children.length, 1, 'the confirmed echo and the pending placeholder represent one send');
-  assert.equal(messages.children[0].dataset.eventId, confirmed.eventId);
-  assert.equal(api.outgoing().length, 1, 'echo association must not invent an HTTP acknowledgement');
-  assert.equal(api.outgoing()[0].state, 'sending');
+  assert.equal(messages.children.length, 2, 'the recorded event and the pending attempt remain distinct');
+  assert.equal(api.items()[0].eventId, confirmed.eventId);
+  assert.equal(api.outgoing().length, 1);
+  assertTextCandidate(api.outgoing()[0], 'sending');
   pending[0].resolve({ ok: true, item: confirmed });
   await sending;
   assert.equal(messages.children.length, 1);
 });
 
-test('one realtime event consumes at most one of two identical pending sends', async () => {
+test('one realtime event is a nonexclusive candidate for two identical pending sends', async () => {
   const { api, pending, nodes, messages } = harness();
   nodes['#messageInput'].value = 'same'; const first = api.sendText();
   nodes['#messageInput'].value = 'same'; const second = api.sendText();
   const confirmed = { ...item('first-identical'), message: 'same', echo: true, sentAt: new Date().toISOString() };
   api.receiveHistoryMessage(confirmed); api.receiveHistoryMessage(confirmed);
-  assert.equal(messages.children.length, 2);
+  assert.equal(messages.children.length, 3);
   assert.equal(api.outgoing().length, 2);
+  for (const entry of api.outgoing()) assertTextCandidate(entry, 'sending');
   const next = { ...confirmed, eventId: 'second-identical' };
   api.receiveHistoryMessage(next);
-  assert.equal(messages.children.length, 2); assert.equal(api.outgoing().length, 2);
+  assert.equal(messages.children.length, 4); assert.equal(api.outgoing().length, 2);
   pending[1].resolve({ ok: true, item: next }); await second;
+  assert.equal(api.outgoing().length, 1); assertTextCandidate(api.outgoing()[0], 'sending');
   pending[0].resolve({ ok: true, item: confirmed }); await first;
   assert.equal(messages.children.length, 2); assert.equal(api.items().length, 2);
 });
@@ -265,30 +274,32 @@ test('an HTTP confirmation does not consume another identical send awaiting its 
   assert.equal(api.items().length, 2);
 });
 
-test('a lost HTTP reply leaves a recorded echo without a false uncertainty warning or second message', async () => {
+test('F1: an external same-body event cannot confirm an attempt whose HTTP reply is lost', async () => {
   const { api, pending, nodes, messages } = harness();
   nodes['#messageInput'].value = 'delivered'; const sending = api.sendText();
   api.receiveHistoryMessage({ ...item('delivered'), echo: true, sentAt: new Date().toISOString() });
   pending[0].reject(new Error('proxy connection reset'));
   assert.equal(await sending, false);
-  assert.equal(messages.children.length, 1); assert.equal(api.outgoing().length, 0);
-  assert.equal(messages.children[0].dataset.sendState, 'sent');
+  assert.equal(messages.children.length, 2); assert.equal(api.outgoing().length, 1);
+  assertTextCandidate(api.outgoing()[0], 'unknown');
+  assert.equal(api.items()[0].eventId, 'delivered');
   assert.equal(pending.length, 1, 'no implicit retry follows a lost HTTP reply');
 });
 
-test('a delayed recorded echo clears an uncertain attempt after its HTTP request has failed', async () => {
+test('a delayed recorded echo leaves an uncertain attempt with candidate evidence', async () => {
   const { api, pending, nodes, messages } = harness();
   nodes['#messageInput'].value = 'delivered later'; const sending = api.sendText();
   pending[0].respond(502, { error: 'Acknowledgement lost', uncertain: true });
   assert.equal(await sending, false); assert.equal(api.outgoing()[0].state, 'unknown');
   const confirmed = { ...item('late-echo'), message: 'delivered later', echo: true, sentAt: new Date().toISOString() };
   api.receiveHistoryMessage(confirmed); api.receiveHistoryMessage(confirmed);
-  assert.equal(api.outgoing().length, 0); assert.equal(messages.children.length, 1);
+  assert.equal(api.outgoing().length, 1); assert.equal(messages.children.length, 2);
+  assertTextCandidate(api.outgoing()[0], 'unknown');
   assert.equal(api.items()[0].eventId, 'late-echo');
   assert.equal(pending.length, 1, 'confirmation never resends a message');
 });
 
-test('one recorded echo clears only one of two identical uncertain sends', async () => {
+test('one recorded echo supplies evidence to both identical uncertain sends without clearing either', async () => {
   const { api, pending, nodes, messages } = harness();
   nodes['#messageInput'].value = 'same'; const first = api.sendText();
   nodes['#messageInput'].value = 'same'; const second = api.sendText();
@@ -296,57 +307,64 @@ test('one recorded echo clears only one of two identical uncertain sends', async
   await Promise.all([first, second]);
   const confirmed = { ...item('one-echo'), message: 'same', echo: true, sentAt: new Date().toISOString() };
   api.receiveHistoryMessage(confirmed); api.receiveHistoryMessage(confirmed);
-  assert.equal(api.outgoing().length, 1); assert.equal(api.outgoing()[0].state, 'unknown');
-  assert.equal(messages.children.length, 2);
+  assert.equal(api.outgoing().length, 2);
+  for (const entry of api.outgoing()) assertTextCandidate(entry, 'unknown');
+  assert.equal(messages.children.length, 3);
   api.receiveHistoryMessage({ ...confirmed, eventId: 'second-echo' });
-  assert.equal(api.outgoing().length, 0); assert.equal(messages.children.length, 2);
+  assert.equal(api.outgoing().length, 2); assert.equal(messages.children.length, 4);
   assert.equal(pending.length, 2);
 });
 
-test('incoming, other-peer, other-account and old echoes cannot confirm a new text send', async () => {
+test('incoming, other-peer, other-account and old echoes are not candidates for a new text send', async () => {
   const { api, pending, nodes } = harness(); api.state.steam.steamId = 'account';
   nodes['#messageInput'].value = 'same'; const sending = api.sendText();
   const confirmed = { ...item('candidate'), message: 'same', echo: true, steamAccountId: 'account', sentAt: new Date().toISOString() };
   for (const candidate of [{ ...confirmed, eventId: 'incoming', echo: false }, { ...confirmed, eventId: 'other-peer', id: 'other' },
     { ...confirmed, eventId: 'other-account', steamAccountId: 'other-account' }, { ...confirmed, eventId: 'old', sentAt: new Date(Date.now() - 60000).toISOString() }]) {
     api.receiveHistoryMessage(candidate); assert.equal(api.outgoing().length, 1);
+    assert.equal(api.outgoing()[0].textCandidateFound, undefined);
   }
   api.receiveHistoryMessage(confirmed); assert.equal(api.outgoing().length, 1);
+  assertTextCandidate(api.outgoing()[0], 'sending');
   pending[0].resolve({ ok: true, item: confirmed }); await sending;
 });
 
-test('a realtime canonical emoticon echo confirms the same locally typed Steam emoticon', async () => {
+test('a realtime canonical emoticon echo is a candidate for the locally typed Steam emoticon', async () => {
   const { api, pending, nodes, messages } = harness();
   nodes['#messageInput'].value = ':smile:'; const sending = api.sendText();
   const confirmed = { ...item('emoticon'), message: '[emoticon]smile[/emoticon]', echo: true, sentAt: new Date().toISOString() };
   api.receiveHistoryMessage(confirmed);
-  assert.equal(messages.children.length, 1); assert.equal(api.outgoing().length, 1);
+  assert.equal(messages.children.length, 2); assert.equal(api.outgoing().length, 1);
+  assertTextCandidate(api.outgoing()[0], 'sending');
   pending[0].resolve({ ok: true, item: confirmed }); await sending;
 });
 
-test('latest history reconciles a confirmed text when its WebSocket echo was missed', async () => {
+test('latest history supplies candidate evidence when the WebSocket echo was missed', async () => {
   const { api, pending, nodes, messages } = harness();
   nodes['#messageInput'].value = 'history confirmation'; const sending = api.sendText();
   const confirmed = { ...item('history-confirmed'), message: 'history confirmation', echo: true, sentAt: new Date().toISOString() };
   const loading = api.loadHistory(); pending[1].resolve({ items: [confirmed] }); await loading;
-  assert.equal(messages.children.length, 1); assert.equal(api.outgoing().length, 1);
+  assert.equal(messages.children.length, 2); assert.equal(api.outgoing().length, 1);
+  assertTextCandidate(api.outgoing()[0], 'sending');
   pending[0].reject(new Error('HTTP reply lost'));
-  assert.equal(await sending, false); assert.equal(messages.children.length, 1);
-  assert.equal(api.outgoing().length, 0);
+  assert.equal(await sending, false); assert.equal(messages.children.length, 2);
+  assert.equal(api.outgoing().length, 1);
+  assertTextCandidate(api.outgoing()[0], 'unknown');
 });
 
 for (const wrapper of ['[url]https://example.com/video[/url]', '[url="https://example.com/video"]https://example.com/video[/url]']) {
-  test(`canonical URL echo clears an uncertain plain URL send: ${wrapper}`, async () => {
+  test(`canonical URL echo is a candidate for an uncertain plain URL send: ${wrapper}`, async () => {
     const { api, pending, nodes, messages } = harness();
     nodes['#messageInput'].value = 'https://example.com/video'; const sending = api.sendText();
     pending[0].respond(502, { error: 'Acknowledgement lost', uncertain: true }); await sending;
     api.receiveHistoryMessage({ ...item('url-echo'), echo: true, message: wrapper, sentAt: new Date().toISOString() });
-    assert.equal(api.outgoing().length, 0); assert.equal(messages.children.length, 1);
+    assert.equal(api.outgoing().length, 1); assert.equal(messages.children.length, 2);
+    assertTextCandidate(api.outgoing()[0], 'unknown');
     assert.equal(pending.length, 1);
   });
 }
 
-test('a named or different-target URL cannot clear an uncertain plain URL send', async () => {
+test('a named or different-target URL is not a candidate for an uncertain plain URL send', async () => {
   const { api, pending, nodes } = harness();
   nodes['#messageInput'].value = 'https://example.com/video'; const sending = api.sendText();
   pending[0].respond(502, { error: 'Acknowledgement lost', uncertain: true }); await sending;
@@ -354,6 +372,7 @@ test('a named or different-target URL cannot clear an uncertain plain URL send',
     api.receiveHistoryMessage({ ...item(message), echo: true, message, sentAt: new Date().toISOString() });
   }
   assert.equal(api.outgoing().length, 1); assert.equal(api.outgoing()[0].state, 'unknown');
+  assert.equal(api.outgoing()[0].textCandidateFound, undefined);
 });
 
 test('an unconfirmed text request has a finite deadline without being sent again', async () => {
@@ -367,13 +386,13 @@ test('an unconfirmed text request has a finite deadline without being sent again
   assert.equal(pending.length, 1);
 });
 
-test('durable catch-up associates an echo while the text HTTP response is delayed', async () => {
+test('durable catch-up supplies a candidate while the text HTTP response is delayed', async () => {
   const { api, pending, nodes, messages } = harness(); api.state.steam.steamId = 'account'; api.setSyncCursor('before');
   nodes['#messageInput'].value = 'durable echo'; const sending = api.sendText();
   const confirmed = { ...item('durable-echo'), message: 'durable echo', echo: true, steamAccountId: 'account', sentAt: new Date().toISOString() };
   api.requestDurableSync(); const sync = api.syncTask();
   pending[1].resolve({ steamAccountId: 'account', items: [confirmed], hasMore: false, nextCursor: 'after' }); await sync;
-  assert.equal(messages.children.length, 1); assert.equal(api.outgoing()[0].state, 'sending');
+  assert.equal(messages.children.length, 2); assertTextCandidate(api.outgoing()[0], 'sending');
   pending[0].resolve({ ok: true, item: confirmed }); await sending;
   assert.equal(messages.children.length, 1); assert.equal(api.outgoing().length, 0);
 });
@@ -382,9 +401,12 @@ test('a similar observed echo cannot turn an explicitly rejected request into a 
   const { api, pending, nodes, messages } = harness();
   nodes['#messageInput'].value = 'same text'; const sending = api.sendText();
   api.receiveHistoryMessage({ ...item('observed-echo'), message: 'same text', echo: true, sentAt: new Date().toISOString() });
-  assert.equal(messages.children.length, 1);
-  pending[0].respond(400, { error: 'Rejected request' }); assert.equal(await sending, false);
+  assert.equal(messages.children.length, 2);
+  assertTextCandidate(api.outgoing()[0], 'sending');
+  pending[0].respond(400, { error: 'Rejected request', uncertain: false }); assert.equal(await sending, false);
   assert.equal(api.outgoing()[0].state, 'failed'); assert.equal(api.items().length, 1);
+  assert.equal(api.outgoing()[0].textCandidateFound, undefined);
+  assert.equal(api.outgoing()[0].textCheckReason, undefined);
   assert.equal(messages.children.length, 2, 'the failed attempt stays distinct from the actual observed message');
 });
 
@@ -446,14 +468,14 @@ test('identical intentional sends stay distinct and preserve a newer composer dr
   assert.equal(nodes['#messageInput'].value, 'new draft');
 });
 
-for (const status of [400, 500, undefined]) {
+for (const status of [400, 409, 500, undefined]) {
   test(`outgoing failure ${status} is classified without retry`, async () => {
     const { api, pending, nodes, messages } = harness();
     nodes['#messageInput'].value = 'hello';
     const sending = api.sendText();
     pending[0].reject(Object.assign(new Error('rejected'), { status }));
     assert.equal(await sending, false);
-    assert.equal(api.outgoing()[0].state, status === 400 ? 'failed' : 'unknown');
+    assert.equal(api.outgoing()[0].state, 'unknown');
     assert.equal(messages.children.length, 1);
     assert.equal(pending.length, 1);
   });
@@ -470,6 +492,60 @@ async function manualTextAttempt(status: 'failed' | 'unknown') {
   const entry = h.api.outgoing()[0];
   assert.equal(entry.state, status);
   return { ...h, entry };
+}
+
+for (const uncertain of [undefined, true, false]) {
+  test(`HTTP 409 with uncertain=${uncertain} uses explicit certainty, not status`, async () => {
+    const { api, pending } = harness();
+    const sending = api.sendText('conflict response');
+    pending[0].respond(409, { error: 'Conflict', ...(uncertain === undefined ? {} : { uncertain }) });
+    assert.equal(await sending, false);
+    assert.equal(api.outgoing()[0].state, uncertain === false ? 'failed' : 'unknown');
+    assert.equal(pending.length, 1, 'HTTP errors never trigger an automatic resend');
+  });
+}
+
+for (const offset of [-2001, -2000, 31000]) {
+  test(`F4: manual check candidate time offset ${offset}ms preserves the -2s lower bound without a +30s upper bound`, async () => {
+    const { api, pending, entry } = await manualTextAttempt('unknown');
+    const checking = api.checkOutgoingText(entry);
+    pending[1].resolve({ items: [{ ...entry.item, eventId: `offset-${offset}`,
+      sentAt: new Date(Date.parse(entry.item.sentAt!) + offset).toISOString() }] });
+    await checking;
+    assert.equal(api.outgoing().length, 1);
+    if (offset >= -2000) assertTextCandidate(entry, 'unknown');
+    else {
+      assert.equal(entry.state, 'unknown');
+      assert.equal(entry.textCandidateFound, undefined);
+      assert.match(entry.textCheckReason!, /未找到.*仍可能已发送/);
+    }
+    assert.equal(pending.length, 2);
+  });
+}
+
+for (const remote of ['same record', 'empty recent tail', 'unavailable'] as const) {
+test(`F3: local date-page evidence survives a ${remote} check without leaving that page`, async () => {
+  const { api, pending, messages, entry } = await manualTextAttempt('unknown');
+  const candidate = { ...entry.item, eventId: 'date-loaded-candidate' };
+  const loading = api.loadHistory('date', entry.item.sentAt);
+  pending[1].resolve({ items: [candidate] });
+  await loading;
+  assert.equal(api.detached(), true);
+  assert.equal(api.items()[0].eventId, candidate.eventId);
+  assertTextCandidate(entry, 'unknown');
+  const checking = api.checkOutgoingText(entry);
+  assert.equal(pending.at(-1)!.url.pathname, '/api/messages/check');
+  if (remote === 'unavailable') pending.at(-1)!.respond(503, { error: 'History unavailable' });
+  else pending.at(-1)!.resolve({ items: remote === 'same record' ? [candidate] : [] });
+  await checking;
+  assertTextCandidate(entry, 'unknown');
+  if (remote === 'unavailable') assert.match(entry.textCheckReason!, /检查失败.*找到相同内容/);
+  assert.equal(api.outgoing().length, 1);
+  assert.equal(api.detached(), true);
+  assert.equal(api.items().length, 1);
+  assert.equal(messages.children.length, 1, 'the date event is neither duplicated nor replaced by the hidden prompt');
+  assert.equal(pending.filter(request => request.url.pathname === '/message').length, 1);
+});
 }
 
 test('Steam rate-limit metadata accepts only the known code and bounds finite timers', () => {
@@ -660,7 +736,7 @@ for (const stale of ['peer', 'account', 'active account', 'access', 'permission'
   });
 }
 
-test('manual unknown check posts original attempt metadata and only actual history clears it', async () => {
+test('manual unknown check posts original attempt metadata and reports candidates without clearing it', async () => {
   const { api, pending, nodes, entry } = await manualTextAttempt('unknown');
   nodes['#messageInput'].value = 'later draft';
   const checking = api.checkOutgoingText(entry);
@@ -679,7 +755,8 @@ test('manual unknown check posts original attempt metadata and only actual histo
   const confirmed = { ...entry.item, eventId: 'checked', steamAccountId: 'account', message: 'original \\[body]' };
   pending[2].resolve({ items: [confirmed] });
   await again;
-  assert.equal(api.outgoing().length, 0);
+  assert.equal(api.outgoing().length, 1);
+  assertTextCandidate(entry, 'unknown');
   assert.equal(api.items()[0].eventId, 'checked');
   assert.equal(nodes['#messageInput'].value, 'later draft');
   assert.equal(pending.filter(request => request.url.pathname === '/message').length, 1, 'check never calls /message');
@@ -727,7 +804,7 @@ for (const stale of ['peer', 'account', 'access', 'invalidate'] as const) {
   });
 }
 
-test('explicit unknown resend creates only one new attempt and preserves the original until its own confirmation', async () => {
+test('F2: an explicit replacement cannot claim a candidate or clear the original unknown attempt', async () => {
   const { api, pending, nodes, entry } = await manualTextAttempt('unknown');
   nodes['#messageInput'].value = 'new draft';
   const resending = api.resendOutgoingText(entry);
@@ -742,8 +819,10 @@ test('explicit unknown resend creates only one new attempt and preserves the ori
   assert.deepEqual(JSON.parse(pending[1].body!), { id: 'peer', msg: 'original [body]', steamAccountId: 'account' });
   const confirmed = { ...replacement.item, eventId: 'replacement-confirmed' };
   api.receiveHistoryMessage(confirmed);
+  assert.equal(api.outgoing().length, 2);
   assert.equal(api.outgoing()[0], entry);
-  assert.equal(entry.state, 'unknown', 'replacement echo must not consume the original');
+  assertTextCandidate(entry, 'unknown');
+  assertTextCandidate(replacement, 'sending');
   pending[1].resolve({ ok: true, item: confirmed });
   assert.equal(await resending, true);
   assert.equal(api.outgoing().length, 1);
@@ -752,7 +831,9 @@ test('explicit unknown resend creates only one new attempt and preserves the ori
   const checking = api.checkOutgoingText(entry);
   pending[2].resolve({ items: [{ ...entry.item, eventId: 'original-confirmed' }] });
   await checking;
-  assert.equal(api.outgoing().length, 0);
+  assert.equal(api.outgoing().length, 1);
+  assert.equal(api.outgoing()[0], entry);
+  assertTextCandidate(entry, 'unknown');
   assert.equal(api.items().length, 2);
 });
 
