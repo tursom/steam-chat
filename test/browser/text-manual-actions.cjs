@@ -4,6 +4,7 @@ const { chromium } = require('playwright');
 const assert = require('node:assert/strict');
 const fs = require('node:fs/promises');
 const path = require('node:path');
+const { splitTextMessage } = require('../../dist/src/server/text-message-limit');
 const root = path.resolve(process.env.STEAM_CHAT_WEB_ROOT || path.join(__dirname, '../../dist/web'));
 const peer = '76561198000000001';
 const account = '76561198000000009';
@@ -29,6 +30,10 @@ async function run() {
       await page.addInitScript(() => localStorage.setItem('steam-chat.view', 'chat'));
       await page.route('http://steam-chat.test/**', async route => {
         const pathname = new URL(route.request().url()).pathname;
+        if (pathname === '/api/messages/split') {
+          const body = route.request().postDataJSON();
+          return route.fulfill({ json: { parts: splitTextMessage(body.msg), maxBytes: 6340, steamAccountId: account } });
+        }
         if (pathname === '/message' || pathname === '/api/messages/check') {
           await new Promise(done => (pathname === '/message' ? writes : checks).push({ route, done,
             method: route.request().method(), body: route.request().postDataJSON() }));
@@ -67,6 +72,46 @@ async function run() {
       await page.goto('http://steam-chat.test');
       await page.locator('.list-item').first().click();
       await page.locator('#messageInput').waitFor();
+
+      const longText = '第一行：' + '甲'.repeat(1300) + '\n第二行：' + '乙'.repeat(1300) + '\r\n第三行：' + '😀'.repeat(1000);
+      // A real textarea normalizes pasted CRLF to LF before the app reads it.
+      const parts = splitTextMessage(longText.replace(/\r\n?/g, '\n'));
+      assert.equal(parts.length, 3);
+      await page.locator('#messageInput').fill(longText);
+      await page.locator('#sendButton').evaluate(button => { button.click(); button.click(); });
+      const firstPart = await waitRequest(writes, 1);
+      assert.equal(firstPart.body.msg, parts[0]);
+      assert.equal(await page.locator('.msg-row[data-outgoing-id]').count(), 3);
+      assert.match(await page.locator('.msg-row[data-outgoing-id]').last().innerText(), /第 3\/3 段.*等待前段发送/);
+      await page.locator('#messageInput').fill('Draft written during a long send');
+      await page.getByRole('button', { name: '暂停后续发送' }).click();
+      const firstItem = event(parts[0], 'long-part-0');
+      history.push(firstItem);
+      await respond(firstPart, 200, { ok: true, item: firstItem });
+      await page.getByRole('button', { name: '继续发送后续段落' }).waitFor();
+      assert.equal(writes.length, 1);
+      await page.getByRole('button', { name: '继续发送后续段落' }).click();
+      const secondPart = await waitRequest(writes, 2);
+      assert.equal(secondPart.body.msg, parts[1]);
+      await respond(secondPart, 400, { error: 'Middle part rejected', uncertain: false });
+      const middleRow = page.locator('.msg-row[data-send-state="failed"]');
+      await middleRow.getByRole('button', { name: '重试发送' }).waitFor();
+      assert.equal(writes.length, 2);
+      assert.match(await page.locator('.msg-row[data-outgoing-id]').last().innerText(), /第 3\/3 段.*尚未发送/);
+      await middleRow.getByRole('button', { name: '重试发送' }).evaluate(button => { button.click(); button.click(); });
+      const secondRetry = await waitRequest(writes, 3);
+      assert.deepEqual(secondRetry.body, secondPart.body);
+      const secondItem = event(parts[1], 'long-part-1');
+      history.push(secondItem);
+      await respond(secondRetry, 200, { ok: true, item: secondItem });
+      const thirdPart = await waitRequest(writes, 4);
+      assert.equal(thirdPart.body.msg, parts[2]);
+      const thirdItem = event(parts[2], 'long-part-2');
+      history.push(thirdItem);
+      await respond(thirdPart, 200, { ok: true, item: thirdItem });
+      await page.locator('[data-event-id="long-part-2"]').waitFor();
+      assert.equal(await page.locator('.msg-row[data-outgoing-id]').count(), 0);
+      assert.equal(await page.locator('#messageInput').inputValue(), 'Draft written during a long send');
 
       const failed = await attempt('Original [failed] body', 'failed');
       await page.locator('#messageInput').fill('New edited draft');

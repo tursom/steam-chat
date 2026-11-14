@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { test } from 'node:test';
 import { runInNewContext } from 'node:vm';
 import { webcrypto } from 'node:crypto';
+import { splitTextMessage } from '../src/server/text-message-limit';
 
 class Element {
   children: Element[] = [];
@@ -41,7 +42,8 @@ class Element {
 }
 
 type Item = { id: string; eventId: string; message: string; echo?: boolean; name?: string; sentAt?: string; steamAccountId?: string; type?: string };
-type OutgoingEntry = { localId: number; state: string; item: Item; context: string; readonly retryText?: string; textCheckBusy?: boolean; textCheckReason?: string; textCandidateFound?: boolean; echoEventId?: string; replacementLocalId?: number };
+type OutgoingEntry = { localId: number; state: string; item: Item; context: string; readonly retryText?: string; textCheckBusy?: boolean; textCheckReason?: string; textCandidateFound?: boolean; echoEventId?: string; replacementLocalId?: number;
+  textQueued?: boolean; textBatchIndex?: number; textBatch?: { entries: OutgoingEntry[]; next: number; running: boolean; paused: boolean } };
 type Pending = { url: URL; method?: string; body?: string; signal?: AbortSignal; resolve: (value: unknown) => void; respond: (status: number, value: unknown, headers?: Record<string, string>) => void; reject: (error: Error) => void };
 function harness(withLayout = false, withRealtime = false, disk?: Map<string, unknown>, browserStorage = new Map<string, string>()) {
   let now = Date.now();
@@ -115,7 +117,7 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     state.me = {id: 1}; state.permissions = ['chat.use', 'self.password.change']; state.activeId = 'peer'; state.steam.accessAllowed = true;
     state.steam.steamGrant = {level:'full', scope:'all', peerCount:0, expiresAt:null};
     resizeComposerInput = () => {};
-    globalThis.__test = {api, steamRateLimitMetadata, textCooldownSeconds, refreshChatData, loadChatInventory, updateSteamStatus, sendText, retryOutgoingText, resendOutgoingText, checkOutgoingText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
+    globalThis.__test = {api, steamRateLimitMetadata, textCooldownSeconds, refreshChatData, loadChatInventory, updateSteamStatus, sendText, runTextBatch, retryOutgoingText, resendOutgoingText, checkOutgoingText, sendImage, loadHistory, loadConversations, receiveHistoryMessage, loadStorageHealth, storageHealthText,
       openConversation, rememberThread, restoreThread, scheduleChatCache, restoreChatCache, clearChatCache,
       bootstrap: () => { setupAppInstallation = () => {}; renderShell = () => {}; restoreImageOperations = () => {}; return bootstrap(); },
       requestDurableSync, ensureWebSocket, stopWebSocket, startStatusPolling, stopStatusPolling, setupRealtimeResume,
@@ -138,6 +140,7 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     restoreChatCache: () => Promise<void>;
     clearChatCache: () => void;
     sendText: (explicitMessage?: string, previewMessage?: string) => Promise<boolean>;
+    runTextBatch: (batch: NonNullable<OutgoingEntry['textBatch']>) => Promise<boolean>;
     retryOutgoingText: (entry: OutgoingEntry) => Promise<boolean>;
     resendOutgoingText: (entry: OutgoingEntry) => Promise<boolean>;
     checkOutgoingText: (entry: OutgoingEntry) => Promise<void>;
@@ -150,7 +153,7 @@ function harness(withLayout = false, withRealtime = false, disk?: Map<string, un
     resetHistory: () => void;
     invalidateChat: () => void;
     switchPeer: (id: string) => void;
-    state: { me: { id: number; sessionVersion?: number }; permissions: string[]; sendOperations: boolean; imageOperationUpload: boolean; activeId: string; view: string; steam: { steamId: string | null; activeAccount?: { id: number; steamId: string; label: string }; status: string; accessAllowed: boolean; accessRevision?: string; steamGrant?: { level: string; scope: string; peerCount: number } }; friends: Array<{id: string; name: string}>; activeName: string;
+    state: { me: { id: number; sessionVersion?: number }; permissions: string[]; sendOperations: boolean; imageOperationUpload: boolean; activeId: string; view: string; steam: { steamId: string | null; activeAccount?: { id: number; steamId: string; label: string }; status: string; accessAllowed: boolean; accessRevision?: string; textMessageLimit?: number; steamGrant?: { level: string; scope: string; peerCount: number } }; friends: Array<{id: string; name: string}>; activeName: string;
       conversations: Array<{id: string; name?: string; preview?: string; updatedAt?: string}>; feedback: string;
       emoticons: Array<Record<string, unknown>>; stickers: Array<Record<string, unknown>>; effects: Array<Record<string, unknown>> };
     outgoing: () => OutgoingEntry[];
@@ -224,6 +227,397 @@ test('optimistic text appears before the response and reconciles response, WebSo
   await loading;
   assert.equal(messages.children.length, 1);
 });
+
+test('unavailable or invalid text splitting preserves the complete draft without sending', async () => {
+  const { api, pending, nodes } = harness();
+  api.state.steam.status = 'online';
+  api.state.steam.steamId = 'account';
+  for (const msg of ['a'.repeat(6341), '中'.repeat(2114), '😀'.repeat(1586), '['.repeat(3171),
+    'a' + '\n'.repeat(104) + 'a', 'a' + '\r\n'.repeat(104) + 'a']) {
+    const draft = `  ${msg}\n`;
+    nodes['#messageInput'].value = draft;
+    const sending = api.sendText();
+    assert.equal(pending.at(-1)!.url.pathname, '/api/messages/split');
+    pending.at(-1)!.respond(400, { error: '无法安全分段', uncertain: false });
+    assert.equal(await sending, false);
+    assert.equal(nodes['#messageInput'].value, draft);
+    assert.equal(api.outgoing().length, 0);
+    assert.equal(api.textCooldownSeconds(), 0);
+    assert.match(api.state.feedback, /无法安全分段/);
+  }
+  assert.ok(pending.every(request => request.url.pathname === '/api/messages/split'));
+});
+
+test('web text budget accepts Unicode, bracket and CRLF boundary messages', async () => {
+  const { api, pending, nodes } = harness();
+  const messages = ['a'.repeat(6340), '中'.repeat(2113) + 'a', '😀'.repeat(1585), '['.repeat(3170),
+    'a'.repeat(6278) + '\nb', 'a'.repeat(6278) + '\r\nb', 'a'.repeat(6278) + '\rb'];
+  for (const msg of messages) {
+    nodes['#messageInput'].value = msg;
+    const sending = api.sendText();
+    assert.equal(JSON.parse(pending.at(-1)!.body!).msg, msg);
+    assert.equal(nodes['#messageInput'].value, '');
+    pending.at(-1)!.resolve({ ok: true });
+    assert.equal(await sending, true);
+  }
+  assert.equal(pending.length, messages.length);
+});
+
+test('legacy over-budget retry and replacement do not submit or overwrite the current draft', async () => {
+  const { api, pending, nodes } = harness();
+  api.state.steam.status = 'online';
+  api.state.steam.steamId = 'self';
+  const sending = api.sendText('original');
+  pending[0].respond(400, { error: 'rejected', uncertain: false });
+  await sending;
+  const entry = api.outgoing()[0];
+  // Model an attempt retained from a client that predates length validation.
+  Object.assign(entry, { retryText: '中'.repeat(2114) });
+  nodes['#messageInput'].value = 'new draft';
+  assert.equal(await api.retryOutgoingText(entry), false);
+  assert.equal(entry.state, 'failed');
+  assert.match(api.state.feedback, /消息过长/);
+  entry.state = 'unknown';
+  assert.equal(await api.resendOutgoingText(entry), false);
+  assert.equal(entry.state, 'unknown');
+  assert.equal(entry.replacementLocalId, undefined);
+  assert.equal(pending.length, 1);
+  assert.equal(api.outgoing().length, 1);
+  assert.equal(nodes['#messageInput'].value, 'new draft');
+  assert.equal(api.textCooldownSeconds(), 0);
+});
+
+const longText = 'a'.repeat(4000) + '\n' + '中'.repeat(1300) + '\r\n' + '😀'.repeat(1000);
+
+async function startLongText() {
+  const h = harness(false, true);
+  h.api.state.steam.status = 'online';
+  h.api.state.steam.steamId = 'account';
+  h.nodes['#messageInput'].value = longText;
+  const sending = h.api.sendText();
+  assert.equal(h.pending.length, 1);
+  assert.equal(h.pending[0].url.pathname, '/api/messages/split');
+  assert.equal(h.nodes['#messageInput'].value, longText, 'keep draft until preparation succeeds');
+  const parts = splitTextMessage(longText);
+  assert.equal(parts.length, 3);
+  h.pending[0].resolve({ parts, maxBytes: 6340, steamAccountId: 'account' });
+  await microtasks(() => h.pending.length === 2);
+  return { ...h, sending, parts };
+}
+
+async function nextTextPart(h: Awaited<ReturnType<typeof startLongText>>, count: number) {
+  await microtasks(() => h.api.outgoing().some(entry => entry.textBatch?.running
+    && entry.textBatch.entries[entry.textBatch.next]?.textQueued));
+  await microtasks(() => [...h.timers.values()].some(timer => timer.delay === 1000));
+  const [id, timer] = [...h.timers].filter(([, timer]) => timer.delay === 1000).at(-1)!;
+  h.advance(timer.delay);
+  h.timers.delete(id);
+  timer.callback();
+  await microtasks(() => h.pending.length === count);
+}
+
+function confirmTextPart(h: Awaited<ReturnType<typeof startLongText>>, request: number, index: number) {
+  h.pending[request].resolve({ ok: true, item: { id: 'peer', message: h.parts[index], eventId: `part-${index}`,
+    echo: true, steamAccountId: 'account', sentAt: new Date(h.now()).toISOString() } });
+}
+
+test('long text prepares newline-preserving parts and sends only after the previous response and pacing delay', async () => {
+  const h = await startLongText();
+  assert.equal(h.nodes['#messageInput'].value, '');
+  assert.equal(h.api.outgoing().length, 3);
+  assert.equal(h.api.outgoing()[0].textQueued, false);
+  assert.equal(h.api.outgoing()[1].textQueued, true);
+  assert.equal(h.parts.join(''), longText);
+  assert.ok(h.parts[0].endsWith('\n'));
+  assert.ok(h.parts[1].endsWith('\r\n'));
+  h.nodes['#messageInput'].value = 'later draft';
+  assert.equal(await h.api.sendText(), false, 'no parallel composer send while a batch runs');
+  assert.equal(h.pending.length, 2);
+  confirmTextPart(h, 1, 0);
+  await microtasks(() => h.api.outgoing().length === 2);
+  assert.equal(h.pending.length, 2, 'acknowledgement alone does not bypass pacing');
+  await nextTextPart(h, 3);
+  confirmTextPart(h, 2, 1);
+  await nextTextPart(h, 4);
+  confirmTextPart(h, 3, 2);
+  assert.equal(await h.sending, true);
+  assert.equal(h.api.outgoing().length, 0);
+  assert.deepEqual(h.pending.slice(1).map(request => JSON.parse(request.body!).msg), h.parts);
+  assert.equal(h.nodes['#messageInput'].value, 'later draft');
+});
+
+test('failed middle text part pauses the suffix and manual retry never replays the successful prefix', async () => {
+  const h = await startLongText();
+  confirmTextPart(h, 1, 0);
+  await nextTextPart(h, 3);
+  h.pending[2].respond(400, { error: 'Steam rejected', uncertain: false });
+  assert.equal(await h.sending, false);
+  const failed = h.api.outgoing()[0];
+  assert.equal(failed.state, 'failed');
+  assert.equal(h.api.outgoing()[1].textQueued, true);
+  assert.equal(failed.textBatch!.next, 1);
+  assert.equal(h.messages.children.at(-1)!.dataset.outgoingId, String(h.api.outgoing()[1].localId),
+    'unsubmitted suffix stays after confirmed history and the failed predecessor');
+  const retry = h.api.retryOutgoingText(failed);
+  assert.equal(h.pending.length, 4);
+  assert.equal(await h.api.retryOutgoingText(failed), false, 'double retry cannot submit concurrently');
+  confirmTextPart(h, 3, 1);
+  await nextTextPart(h, 5);
+  confirmTextPart(h, 4, 2);
+  assert.equal(await retry, true);
+  assert.deepEqual(h.pending.slice(1).map(request => JSON.parse(request.body!).msg), [h.parts[0], h.parts[1], h.parts[1], h.parts[2]]);
+});
+
+test('unknown middle part blocks the suffix until an explicitly requested replacement succeeds', async () => {
+  const h = await startLongText();
+  confirmTextPart(h, 1, 0);
+  await nextTextPart(h, 3);
+  h.pending[2].reject(new Error('response lost'));
+  assert.equal(await h.sending, false);
+  const unknown = h.api.outgoing()[0];
+  assert.equal(unknown.state, 'unknown');
+  assert.equal(await h.api.runTextBatch(unknown.textBatch!), false);
+  h.api.receiveHistoryMessage({ id: 'peer', eventId: 'external-candidate', echo: true, message: h.parts[1], sentAt: new Date(h.now()).toISOString() });
+  assert.equal(h.pending.length, 3, 'a same-body historical candidate cannot release the suffix');
+  const resend = h.api.resendOutgoingText(unknown);
+  assert.equal(h.pending.length, 4);
+  assert.equal(await h.api.resendOutgoingText(unknown), false);
+  confirmTextPart(h, 3, 1);
+  await nextTextPart(h, 5);
+  confirmTextPart(h, 4, 2);
+  assert.equal(await resend, true);
+  assert.equal(unknown.state, 'unknown');
+  assert.equal(h.api.outgoing().length, 1, 'original unknown remains independently reviewable');
+});
+
+test('queued text is not considered submitted evidence and pausing retains it for explicit continuation', async () => {
+  const h = await startLongText();
+  const batch = h.api.outgoing()[0].textBatch!;
+  const queued = h.api.outgoing()[1];
+  h.api.receiveHistoryMessage({ id: 'peer', eventId: 'not-this-unsent-part', echo: true, message: h.parts[1], sentAt: new Date(h.now()).toISOString() });
+  assert.equal(queued.textCandidateFound, undefined);
+  batch.paused = true;
+  confirmTextPart(h, 1, 0);
+  assert.equal(await h.sending, false);
+  assert.equal(h.pending.length, 2);
+  const resume = h.api.runTextBatch(batch);
+  await nextTextPart(h, 3);
+  confirmTextPart(h, 2, 1);
+  await nextTextPart(h, 4);
+  confirmTextPart(h, 3, 2);
+  assert.equal(await resume, true);
+});
+
+for (const changed of ['peer', 'account', 'grant', 'offline', 'invalidate'] as const) {
+  test(`text batch stops on ${changed} change before continuing to the next part`, async () => {
+    const h = await startLongText();
+    const batch = h.api.outgoing()[0].textBatch!;
+    if (changed === 'peer') h.api.state.activeId = 'other';
+    if (changed === 'account') h.api.state.steam.steamId = 'other-account';
+    if (changed === 'grant') h.api.state.steam.steamGrant = { level: 'read', scope: 'all', peerCount: 0 };
+    if (changed === 'offline') h.api.state.steam.status = 'offline';
+    if (changed === 'invalidate') h.api.invalidateChat();
+    confirmTextPart(h, 1, 0);
+    assert.equal(await h.sending, false);
+    assert.equal(h.pending.length, 2);
+    assert.equal(batch.next, 1);
+    assert.equal(batch.entries[1].textQueued, true);
+    if (changed === 'peer') {
+      h.api.state.activeId = 'peer';
+      const resume = h.api.runTextBatch(batch);
+      await nextTextPart(h, 3);
+      confirmTextPart(h, 2, 1);
+      await nextTextPart(h, 4);
+      confirmTextPart(h, 3, 2);
+      assert.equal(await resume, true);
+    } else assert.equal(await h.api.runTextBatch(batch), false);
+  });
+}
+
+test('long text splitting uses the restricted-account budget and keeps a newly edited draft during preparation', async () => {
+  const h = harness(false, true);
+  h.api.state.steam.status = 'online';
+  h.api.state.steam.steamId = 'account';
+  h.api.state.steam.textMessageLimit = 1945;
+  const message = '中'.repeat(1000);
+  h.nodes['#messageInput'].value = message;
+  const sending = h.api.sendText();
+  assert.equal(h.pending[0].url.pathname, '/api/messages/split');
+  h.nodes['#messageInput'].value = 'edited while preparing';
+  const parts = splitTextMessage(message, true);
+  h.pending[0].resolve({ parts, maxBytes: 1945, steamAccountId: 'account' });
+  await microtasks(() => h.pending.length === 2);
+  const batch = h.api.outgoing()[0].textBatch!;
+  batch.paused = true;
+  h.pending[1].resolve({ ok: true });
+  assert.equal(await sending, false);
+  assert.equal(h.nodes['#messageInput'].value, 'edited while preparing');
+});
+
+test('a rate-limited middle part preserves the suffix and honors shared cooldown before manual retry', async () => {
+  const h = await startLongText();
+  confirmTextPart(h, 1, 0);
+  await nextTextPart(h, 3);
+  h.pending[2].respond(429, { error: 'RateLimitExceeded', code: 'steam_rate_limited', uncertain: false, retryAfterMs: 30000 });
+  assert.equal(await h.sending, false);
+  const failed = h.api.outgoing()[0];
+  assert.equal(failed.state, 'failed');
+  assert.equal(await h.api.retryOutgoingText(failed), false);
+  assert.equal(h.pending.length, 3);
+  assert.equal(h.api.outgoing()[1].textQueued, true);
+  h.advance(30000);
+  const retry = h.api.retryOutgoingText(failed);
+  assert.equal(h.pending.length, 4);
+  confirmTextPart(h, 3, 1);
+  await nextTextPart(h, 5);
+  confirmTextPart(h, 4, 2);
+  assert.equal(await retry, true);
+});
+
+test('changing context during the pacing delay pauses before submitting the next text part', async () => {
+  const h = await startLongText();
+  confirmTextPart(h, 1, 0);
+  await microtasks(() => [...h.timers.values()].some(timer => timer.delay === 1000));
+  h.api.state.activeId = 'another-peer';
+  const [id, timer] = [...h.timers].filter(([, timer]) => timer.delay === 1000).at(-1)!;
+  h.timers.delete(id);
+  h.advance(1000);
+  timer.callback();
+  assert.equal(await h.sending, false);
+  assert.equal(h.pending.length, 2);
+  assert.equal(h.api.outgoing()[0].textQueued, true);
+});
+
+test('real account invalidation retains the unknown part and unsent suffix for the original account only', async () => {
+  const h = await startLongText();
+  h.nodes['#messageInput'].value = 'newer draft';
+  const status = { status: 'online', steamId: 'other-account', accessAllowed: true,
+    steamGrant: { level: 'full', scope: 'all', peerCount: 0 } };
+  h.api.updateSteamStatus(status);
+  assert.equal(h.api.outgoing().length, 0, 'original text must not appear under another account');
+  h.pending[1].reject(new Error('response lost during account switch'));
+  assert.equal(await h.sending, false);
+  h.api.updateSteamStatus({ ...status, steamId: 'account' });
+  const restored = h.api.outgoing();
+  assert.equal(restored.length, 3);
+  assert.deepEqual(Array.from(restored, entry => entry.retryText), h.parts);
+  assert.equal(restored[0].state, 'unknown');
+  assert.equal(restored[1].textQueued, true);
+  assert.equal(restored[2].textQueued, true);
+  assert.equal(await h.api.runTextBatch(restored[0].textBatch!), false, 'unconfirmed predecessor still blocks continuation');
+  assert.equal(h.pending.filter(request => request.url.pathname === '/message').length, 1);
+  assert.equal(h.nodes['#messageInput'].value, 'newer draft');
+});
+
+test('grant invalidation retains unsent text and restores it paused after write permission returns', async () => {
+  const h = await startLongText();
+  confirmTextPart(h, 1, 0);
+  await microtasks(() => [...h.timers.values()].some(timer => timer.delay === 1000));
+  const status = { status: 'online', steamId: 'account', accessAllowed: true,
+    steamGrant: { level: 'read', scope: 'all', peerCount: 0 } };
+  h.api.updateSteamStatus(status);
+  const [id, timer] = [...h.timers].filter(([, timer]) => timer.delay === 1000).at(-1)!;
+  h.timers.delete(id);
+  h.advance(1000);
+  timer.callback();
+  assert.equal(await h.sending, false);
+  assert.equal(h.api.outgoing().length, 0);
+  h.api.updateSteamStatus({ ...status, steamGrant: { level: 'full', scope: 'all', peerCount: 0 } });
+  const restored = h.api.outgoing();
+  assert.equal(restored.length, 2);
+  assert.deepEqual(Array.from(restored, entry => entry.retryText), h.parts.slice(1));
+  assert.ok(restored.every(entry => entry.textQueued));
+  assert.equal(h.pending.filter(request => request.url.pathname === '/message').length, 1);
+  assert.equal(restored[0].textBatch!.paused, true);
+});
+
+test('a late successful reply settles the suspended prefix without leaking into another account', async () => {
+  const h = await startLongText();
+  const status = { status: 'online', steamId: 'other-account', accessAllowed: true,
+    steamGrant: { level: 'full', scope: 'all', peerCount: 0 } };
+  h.api.updateSteamStatus(status);
+  confirmTextPart(h, 1, 0);
+  assert.equal(await h.sending, false);
+  assert.equal(h.api.outgoing().length, 0);
+  assert.equal(h.api.items().length, 0);
+  h.api.updateSteamStatus({ ...status, steamId: 'account' });
+  assert.deepEqual(Array.from(h.api.outgoing(), entry => entry.retryText), h.parts.slice(1));
+  assert.ok(h.api.outgoing().every(entry => entry.textQueued));
+  assert.equal(h.pending.filter(request => request.url.pathname === '/message').length, 1);
+});
+
+test('text recovery never crosses the authenticated user boundary', async () => {
+  const h = await startLongText();
+  h.api.state.me = { id: 2 };
+  h.api.invalidateChat();
+  h.pending[1].reject(new Error('session changed'));
+  assert.equal(await h.sending, false);
+  h.api.updateSteamStatus({ status: 'online', steamId: 'account', accessAllowed: true });
+  assert.equal(h.api.outgoing().length, 0);
+  h.api.state.me = { id: 1 };
+  h.api.updateSteamStatus({ status: 'online', steamId: 'account', accessAllowed: true });
+  assert.equal(h.api.outgoing().length, 0, 'switching back cannot resurrect another login session\'s drafts');
+});
+
+for (const certainty of ['failed', 'unknown'] as const) {
+  test(`a competing preparation leaves a ${certainty} batch unchanged when its retry/replacement is busy`, async () => {
+    const h = await startLongText();
+    h.pending[1].respond(502, { error: 'Original failure', uncertain: certainty === 'unknown' });
+    assert.equal(await h.sending, false);
+    const entry = h.api.outgoing()[0];
+    const before = h.api.outgoing().length;
+    const preparing = h.api.sendText(longText + 'next');
+    const preparation = h.pending.at(-1)!;
+    assert.equal(preparation.url.pathname, '/api/messages/split');
+    assert.equal(await (certainty === 'failed' ? h.api.retryOutgoingText(entry) : h.api.resendOutgoingText(entry)), false);
+    assert.equal(entry.state, certainty);
+    assert.equal(entry.textQueued, false);
+    assert.equal(entry.replacementLocalId, undefined);
+    assert.equal(h.api.outgoing().length, before);
+    preparation.respond(400, { error: 'Preparation failed', uncertain: false });
+    assert.equal(await preparing, false);
+    assert.equal(entry.state, certainty);
+    assert.equal(h.pending.filter(request => request.url.pathname === '/message').length, 1);
+  });
+}
+
+for (const changed of ['peer', 'account', 'grant', 'invalidate'] as const) {
+  test(`split preparation cannot start sending after ${changed} changes`, async () => {
+    const h = harness();
+    h.api.state.steam.steamId = 'account';
+    h.nodes['#messageInput'].value = longText;
+    const sending = h.api.sendText();
+    if (changed === 'peer') h.api.state.activeId = 'other';
+    if (changed === 'account') h.api.state.steam.steamId = 'other-account';
+    if (changed === 'grant') h.api.state.steam.steamGrant = { level: 'read', scope: 'all', peerCount: 0 };
+    if (changed === 'invalidate') h.api.invalidateChat();
+    h.pending[0].resolve({ parts: splitTextMessage(longText), maxBytes: 6340, steamAccountId: 'account' });
+    assert.equal(await sending, false);
+    assert.equal(h.pending.length, 1);
+    assert.equal(h.api.outgoing().length, 0);
+    assert.equal(h.nodes['#messageInput'].value, longText);
+  });
+}
+
+for (const result of [
+  { parts: ['lost suffix'], maxBytes: 6340, steamAccountId: 'account' },
+  { parts: [longText], maxBytes: 6340, steamAccountId: 'account' },
+  { parts: [longText], maxBytes: 100000, steamAccountId: 'account' },
+  { parts: [''], maxBytes: 6340, steamAccountId: 'account' },
+  { parts: [], maxBytes: 6340, steamAccountId: 'other-account' }
+]) {
+  test(`malformed split reply preserves the original and never sends: ${JSON.stringify(result).slice(0, 60)}`, async () => {
+    const h = harness();
+    h.api.state.steam.steamId = 'account';
+    h.nodes['#messageInput'].value = longText;
+    const sending = h.api.sendText();
+    h.pending[0].resolve(result);
+    assert.equal(await sending, false);
+    assert.equal(h.nodes['#messageInput'].value, longText);
+    assert.equal(h.pending.length, 1);
+    assert.equal(h.api.outgoing().length, 0);
+  });
+}
 
 test('a realtime candidate keeps its text placeholder until the original HTTP reply succeeds', async () => {
   const { api, pending, nodes, messages } = harness();

@@ -29,6 +29,7 @@ import type { SteamFriendMessageEvent, SteamFriendMessageEventUser } from '../st
 import { errorCode, errorMessage, isRecord } from '../types';
 import { sendSteamImage, sendSteamImageAttempt } from './image-upload';
 import { SendOperations, SendOperationOptions, SendOwner } from './send-operations';
+import { splitTextMessage, textMessageLimit, validateTextMessage } from './text-message-limit';
 import { createHash, createCipheriv, createDecipheriv, randomBytes } from 'node:crypto';
 
 const { ALL_PERMISSIONS, FAILED_LOGIN_LOCK_THRESHOLD } = require('../auth/store') as { ALL_PERMISSIONS: UserPermission[]; FAILED_LOGIN_LOCK_THRESHOLD: number };
@@ -81,6 +82,7 @@ type SteamChatApi = {
 
 type SteamUserLike = ReactionClient & {
   steamID?: unknown;
+  limitations?: { limited?: boolean } | null;
   chat?: SteamChatApi;
   sendFriendMessage?: CallbackStyleFunction;
   getEmoticonList?: CallbackStyleFunction;
@@ -209,6 +211,7 @@ type SessionManagerLike = {
 
 type SteamStatusSummary = {
   status: string;
+  textMessageLimit?: number;
   requiresGuard?: boolean;
   guardType?: string | null;
   domain?: string | null;
@@ -698,6 +701,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     const accessAllowed = legacy || Boolean(grant);
     return {
       ...status,
+      textMessageLimit: textMessageLimit(steamUser?.limitations?.limited === true),
       qrLogin: session && authStore?.hasPermission(session.user, 'steam.manage') ? status.qrLogin : null,
       activeAccount: accessAllowed || (session && authStore?.hasPermission(session.user, 'steam.manage')) ? activeAccountSummary(active) : null,
       accessAllowed,
@@ -1598,6 +1602,7 @@ function createChatService(options: ChatServiceOptions = {}) {
     const level: SteamLevel = requiresFullLevel(message) ? 'full' : 'chat';
     try { authorize?.(level); }
     catch (error) { throw Object.assign(error instanceof Error ? error : new Error(errorMessage(error)), { uncertain: false }); }
+    validateTextMessage(message, steamUser.limitations?.limited === true);
     let submittedAt: number | undefined;
     const result = await withSteamRetry(() => {
       authorize?.(level);
@@ -1939,6 +1944,24 @@ function createChatService(options: ChatServiceOptions = {}) {
       }
 
       requireLegacyOrSession(req);
+
+      if (url.pathname === '/api/messages/split') {
+        if (req.method !== 'POST') { jsonResponse(res, 405, { error: 'Method not allowed' }); return; }
+        const access = requireSteamAccountAccess(req, true);
+        const body = await readJsonBody(req);
+        const authorize = httpSendAuthorization(req, access, body.steamAccountId, requiresFullLevel(body.msg) ? 'full' : 'chat', body.id);
+        authorize();
+        rejectGroupRecipient(body.id);
+        if (typeof body.id !== 'string' || !/^\d{17}$/.test(body.id) || typeof body.msg !== 'string' || !body.msg.trim()) {
+          throw Object.assign(new Error('有效的会话和消息不能为空'), { statusCode: 400, uncertain: false });
+        }
+        const limited = steamUser?.limitations?.limited === true;
+        const parts = splitTextMessage(body.msg, limited);
+        authorize();
+        jsonResponse(res, 200, { parts, maxBytes: textMessageLimit(limited), steamAccountId: access.steamAccountId },
+          { 'Cache-Control': 'private, no-store' });
+        return;
+      }
 
       if (url.pathname === '/api/messages/check') {
         if (req.method !== 'POST') { jsonResponse(res, 405, { error: 'Method not allowed' }); return; }

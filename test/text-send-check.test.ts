@@ -66,6 +66,12 @@ async function fixture(t: TestContext) {
   });
   return { request, records, body, actual, counts: () => ({ reads, sends }), setResponse(value: unknown) { response = value; },
     send: () => fetch(`${base}/message`, { method: 'POST', headers: { Cookie: cookie, 'Content-Type': 'application/json' }, body: JSON.stringify(body) }),
+    split: (changes: Record<string, unknown> = {}, authenticated = true, method = 'POST') => fetch(`${base}/api/messages/split`, {
+      method, headers: { ...(authenticated ? { Cookie: cookie } : {}), 'Content-Type': 'application/json' },
+      ...(method === 'POST' ? { body: JSON.stringify({ ...body, ...changes }) } : {})
+    }),
+    status: () => fetch(`${base}/api/steam/status`, { headers: { Cookie: cookie } }),
+    limited() { Object.assign(steamUser, { limitations: { limited: true } }); },
     rejectText() { sendError = Object.assign(new Error('RateLimitExceeded'), { eresult: 84 }); },
     failSend(error = new Error('Request timed out')) { sendError = error; historyCount = 20; },
     offline() { status.status = 'offline'; },
@@ -91,6 +97,32 @@ test('manual text check reads Steam history for a read-only scoped user without 
   assert.equal(result.items[0].sentAt, f.body.sentAt);
   assert.equal(f.records.length, 1);
   assert.deepEqual(f.counts(), { reads: 1, sends: 0 });
+});
+
+test('text splitting checks session, account, peer and write permission without sending or reading Steam', async t => {
+  const f = await fixture(t);
+  assert.equal((await f.split()).status, 403, 'read-only grants cannot prepare a send');
+  f.grantChat();
+  assert.equal((await f.split({}, false)).status, 401);
+  assert.equal((await f.split({}, true, 'GET')).status, 405);
+  assert.equal((await f.split({ steamAccountId: other })).status, 409);
+  assert.equal((await f.split({ id: other })).status, 403);
+  assert.equal((await f.split({ msg: '' })).status, 400);
+  assert.equal((await f.split({ msg: '/sticker ' + 'a'.repeat(7000) })).status, 403, 'full-level commands remain protected');
+  const text = ('a'.repeat(3000) + '\n').repeat(3);
+  const response = await f.split({ msg: text });
+  assert.equal(response.status, 200);
+  const result = await response.json();
+  assert.equal(result.parts.join(''), text);
+  assert.deepEqual(result.parts, [text.slice(0, 6002), text.slice(6002)]);
+  assert.equal((await (await f.status()).json()).textMessageLimit, 6340);
+  f.limited();
+  assert.equal((await (await f.status()).json()).textMessageLimit, 1945);
+  const limited = await (await f.split({ msg: '中'.repeat(1000) })).json();
+  assert.equal(limited.maxBytes, 1945);
+  assert.equal(limited.parts.join(''), '中'.repeat(1000));
+  assert.deepEqual(f.counts(), { reads: 0, sends: 0 });
+  assert.equal(f.records.length, 0);
 });
 
 test('manual check distinguishes no matching record from unavailable Steam history', async t => {

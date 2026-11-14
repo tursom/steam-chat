@@ -93,6 +93,7 @@ type SteamStatus = {
   activeAccount?: Pick<SteamAccount, 'id' | 'steamId' | 'label'> | null;
   accessAllowed?: boolean;
   accessRevision?: string;
+  textMessageLimit?: number;
   steamGrant?: { level: 'read' | 'chat' | 'full'; scope: 'all' | 'some'; peerCount?: number; peers?: string[]; expiresAt?: string | null; via?: string } | null;
   qrLogin?: { imageDataUrl: string | null; scanned: boolean; expiresAt: number } | null;
 };
@@ -287,7 +288,11 @@ const state: AppState = {
 
 type OutgoingState = 'sending' | 'sent' | 'failed' | 'unknown';
 type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string;
-  readonly retryText?: string; readonly textSteamAccountId?: string; textCheckBusy?: boolean; textCheckReason?: string; textCandidateFound?: boolean; replacementLocalId?: number; previousLocalId?: number };
+  readonly retryText?: string; readonly textSteamAccountId?: string; textCheckBusy?: boolean; textCheckReason?: string; textCandidateFound?: boolean; replacementLocalId?: number; previousLocalId?: number;
+  textBatch?: TextBatch; textBatchIndex?: number; textQueued?: boolean };
+type TextBatch = { entries: OutgoingMessage[]; next: number; running: boolean; paused: boolean; nextSendAt: number; owner: string };
+const textBatchBusy = new Set<string>();
+const pausedTextBatches = new Set<TextBatch>();
 type ImageOperation = { id: string; peerId: string; steamAccountId: string; state: string; version: number;
   attempts: number; maxAttempts: number; nextRetryAt: number; phase: string; error?: string; retryable: boolean; hasImage: boolean; item?: MessageItem; cooldownUntil?: number; replacementId?: string;
   batchId?: string; batchIndex?: number; batchSize?: number; waitingForOperationId?: string };
@@ -491,6 +496,7 @@ function resetHistory() {
 }
 
 function invalidateChat(purgePersistent = true) {
+  suspendTextBatches();
   textAccountCooldowns.clear();
   if (textCooldownTimer !== null) clearTimeout(textCooldownTimer);
   textCooldownTimer = null;
@@ -720,6 +726,7 @@ function updateSteamStatus(status: SteamStatus) {
     state.groups = [];
     state.conversations = [];
   }
+  restorePausedTextBatches();
   const badge = document.querySelector<HTMLElement>('#steamBadge');
   if (badge) {
     badge.textContent = steamLabel();
@@ -3494,7 +3501,7 @@ function reconcileOutgoingText(item: MessageItem) {
   let changed = false;
   for (const entry of outgoingMessages.values()) {
     if (entry.context !== chatContext() || entry.item.id !== item.id || entry.item.type !== 'message'
-      || entry.state !== 'sending' && entry.state !== 'unknown' || entry.retryText === undefined) continue;
+      || entry.state !== 'sending' && entry.state !== 'unknown' || entry.retryText === undefined || entry.textQueued) continue;
     const startedAt = Date.parse(entry.item.sentAt || '');
     if (!Number.isFinite(startedAt) || sentAt < startedAt - 2000) continue;
     const candidates = [entry.retryText, entry.retryText.replace(/\[/g, '\\['), entry.item.message || ''];
@@ -3526,7 +3533,7 @@ function refreshOutgoing(forceBottom = false) {
   }
 }
 
-function beginOutgoing(id: string, message: string, type = 'message', retryText?: string) {
+function beginOutgoing(id: string, message: string, type = 'message', retryText?: string, textBatch?: TextBatch) {
   const returnToLatest = historyDetached || historyBrowsingRequest;
   if (returnToLatest) {
     if (historyDetached) historyItems = [];
@@ -3537,6 +3544,7 @@ function beginOutgoing(id: string, message: string, type = 'message', retryText?
     if (date) date.value = '';
   }
   const entry: OutgoingMessage = { localId: ++outgoingId, context: chatContext(), state: 'sending', retryText,
+    ...(textBatch ? { textBatch, textQueued: true, textBatchIndex: textBatch.entries.length } : {}),
     textSteamAccountId: retryText === undefined ? undefined : state.steam.activeAccount?.steamId || state.steam.steamId || '',
     item: { id, message, type, echo: true, name: '我', sentAt: new Date().toISOString() } };
   outgoingMessages.set(entry.localId, entry);
@@ -3546,7 +3554,15 @@ function beginOutgoing(id: string, message: string, type = 'message', retryText?
 }
 
 function finishOutgoing(entry: OutgoingMessage, status: OutgoingState, response?: unknown, error?: string) {
-  if (entry.context !== chatContext() || !outgoingMessages.has(entry.localId)) return;
+  if (entry.context !== chatContext() || !outgoingMessages.has(entry.localId)) {
+    // A late original reply can settle a suspended batch without publishing
+    // its contents into the currently selected account's history.
+    if (entry.textBatch && pausedTextBatches.has(entry.textBatch) && entry.textBatch.owner === textBatchOwner()) {
+      entry.state = status;
+      entry.error = error;
+    }
+    return;
+  }
   entry.state = status;
   entry.error = error;
   if (status === 'failed') { entry.textCandidateFound = undefined; entry.textCheckReason = undefined; }
@@ -3605,7 +3621,12 @@ function renderHistory(items: MessageItem[]) {
       desired.push(row);
     }
   }
-  for (const entry of outgoing) {
+  // Unsubmitted suffixes follow their attempted predecessors and recorded
+  // messages, even when a retry/replacement was created after the suffix.
+  const queuedText = outgoing.filter(entry => entry.textQueued).sort((a, b) =>
+    (a.textBatch?.entries[0].localId || a.localId) - (b.textBatch?.entries[0].localId || b.localId)
+    || (a.textBatchIndex || 0) - (b.textBatchIndex || 0));
+  for (const entry of [...outgoing.filter(entry => !entry.textQueued), ...queuedText]) {
     const localImage = entry.item.type === 'image' && (/^data:image\//i.test(entry.item.message || '') || (entry.item.message || '').startsWith('/api/image-emotes/file/') || (entry.item.message || '').startsWith('/api/send-operations/'));
     const row = renderMessage(localImage ? { ...entry.item, message: '[图片]' } : entry.item);
     row.dataset.outgoingId = String(entry.localId);
@@ -3624,6 +3645,10 @@ function renderHistory(items: MessageItem[]) {
     const status = create('span', 'message-send-state');
     if (operationEntry.operation) status.append(create('span', 'outgoing-status-label', imageOperationLabel(operationEntry.operation, operationEntry.uploadRejection)));
     else status.textContent = entry.state === 'unknown' && entry.retryText !== undefined ? '结果未确认' : labels[entry.state];
+    if (entry.textBatch) {
+      status.textContent = `第 ${entry.textBatchIndex! + 1}/${entry.textBatch.entries.length} 段 · ${entry.textQueued
+        ? entry.textBatch.paused ? '已暂停，尚未发送' : '等待前段发送' : status.textContent}`;
+    }
     if (entry.state !== 'sent') status.prepend(chatIcon(operationEntry.operation?.state === 'retry_wait' ? 'refresh-cw' : entry.state === 'failed' ? 'circle-alert' : entry.state === 'unknown' ? 'circle-help' : 'clock'));
     status.setAttribute('role', 'status');
     if (entry.error && !(entry.state === 'unknown' && entry.retryText !== undefined && /^(?:文字)?发送结果未确认，请先检查聊天记录。?$/.test(entry.error))) {
@@ -3641,8 +3666,16 @@ function renderHistory(items: MessageItem[]) {
       const dismiss = create('button', 'ghost-btn outgoing-dismiss', '移除此提示');
       dismiss.type = 'button';
       dismiss.title = '仅移除本地发送提示，不删除聊天记录，也不重发消息';
+      if (entry.textBatch) {
+        dismiss.textContent = '移除本次分段发送提示';
+        dismiss.title = '移除本批次的失败提示及尚未发送的段落，不删除已发送记录，也不重发消息';
+      }
       dismiss.addEventListener('click', () => {
         if (operationEntry.operation) void dismissImageOperation(operationEntry);
+        if (entry.textBatch) {
+          entry.textBatch.paused = true;
+          for (const part of entry.textBatch.entries) if (part.textQueued) outgoingMessages.delete(part.localId);
+        }
         outgoingMessages.delete(entry.localId);
         saveImageOperationMetadata();
         refreshOutgoing();
@@ -3650,7 +3683,7 @@ function renderHistory(items: MessageItem[]) {
       bubble.append(dismiss);
     }
     // Insert local attempts at their send time instead of pinning them after all history.
-    const sentAt = Date.parse(entry.item.sentAt || entry.item.date || '');
+    const sentAt = entry.textQueued ? NaN : Date.parse(entry.item.sentAt || entry.item.date || '');
     const next = Number.isFinite(sentAt) ? items.find(item => {
       const time = Date.parse(item.sentAt || item.date || '');
       return Number.isFinite(time) && time > sentAt;
@@ -4736,6 +4769,18 @@ function requiresFullText(text: string) {
   return /^\s*\/(sticker|roomeffect)(\s|$)/i.test(text) || /\[(sticker|roomeffect)\b/i.test(text);
 }
 
+function textMessageTooLong(message: string, limit = state.steam.textMessageLimit === 1945 ? 1945 : 6340) {
+  // Match text-message-limit.ts and the SDK's default left-bracket escaping.
+  let size = 0;
+  for (const character of message.replace(/\r\n?/g, '\n')) {
+    const code = character.codePointAt(0)!;
+    size += character === '\n' ? 61 : character === '[' ? 2
+      : code < 0x80 ? 1 : code < 0x800 ? 2 : code < 0x10000 ? 3 : 4;
+  }
+  return size > limit
+    ? `消息过长（发送长度 ${size}/${limit}，中文、表情和换行会占用更多长度），请缩短或分段发送。` : '';
+}
+
 function steamRateLimitMetadata(payload: unknown, retryAfter?: string | null) {
   if (!isRecord(payload) || payload.code !== 'steam_rate_limited') return undefined;
   const now = Date.now();
@@ -4767,16 +4812,25 @@ function updateTextSendButton() {
   if (!send) return;
   const seconds = textCooldownSeconds();
   send.disabled = !steamOnline() || !steamAccessAllowed() || isCommunityGroup() || !state.activeId || !grantAtLeast('chat')
-    || composerSending.has(`${chatContext()}|${state.activeId}`) || seconds > 0;
+    || composerSending.has(`${chatContext()}|${state.activeId}`) || textBatchBusy.has(`${chatContext()}|${state.activeId}`) || seconds > 0;
   send.title = seconds ? `Steam 发送频率受限，${seconds} 秒后可重试` : '发送消息（Enter）';
 }
 
 function updateTextOutgoingButton(button: HTMLButtonElement, entry: OutgoingMessage) {
+  if (button.dataset.textSendAction === 'resume') {
+    const seconds = textCooldownSeconds(entry.textSteamAccountId);
+    button.textContent = seconds ? `${seconds} 秒后可继续` : '继续发送后续段落';
+    button.disabled = seconds > 0 || !entry.textQueued || !entry.textBatch || entry.textBatch.running
+      || textBatchBusy.has(`${entry.context}|${entry.item.id}`)
+      || entry.textBatch.entries[entry.textBatch.next] !== entry || !canActOnOutgoingText(entry) || !steamOnline();
+    return;
+  }
   const resend = button.dataset.textSendAction === 'resend';
   const seconds = textCooldownSeconds(entry.textSteamAccountId);
   button.textContent = seconds ? `${seconds} 秒后可重试` : resend ? '仍要发送一份' : '重试发送';
   button.title = seconds ? `Steam 账号发送频率受限，${seconds} 秒后可重试` : '';
   button.disabled = seconds > 0 || !canActOnOutgoingText(entry) || !steamOnline() || !!entry.textCheckBusy
+    || !!entry.textBatch && (entry.textBatch.running || textBatchBusy.has(`${entry.context}|${entry.item.id}`))
     || entry.state !== (resend ? 'unknown' : 'failed') || (resend && entry.replacementLocalId !== undefined);
 }
 
@@ -4803,10 +4857,119 @@ async function sendText(explicitMessage?: string, previewMessage?: string): Prom
   const msg = draft.trim();
   if (!id || !msg || isCommunityGroup(id)) return false;
   if (requiresFullText(msg) && !grantAtLeast('full')) { setFeedback('贴纸和聊天效果需要「完整」授权', 'warn'); return false; }
+  if (textBatchBusy.has(`${chatContext()}|${id}`)) return false;
   if (textCooldownBlocked()) return false;
+  if (textMessageTooLong(msg)) return prepareTextBatch(id, msg, draft, explicitMessage === undefined ? input : null);
   const outgoing = beginOutgoing(id, previewMessage ?? msg.replace(/\[/g, '\\['), 'message', msg);
   if (explicitMessage === undefined && input) { input.value = ''; resizeComposerInput(input); }
   return sendOutgoingText(outgoing);
+}
+
+async function prepareTextBatch(id: string, message: string, draft: string, input: HTMLTextAreaElement | null): Promise<boolean> {
+  const context = chatContext();
+  const account = state.steam.activeAccount?.steamId || state.steam.steamId;
+  const key = `${context}|${id}`;
+  if (!account) { setFeedback('Steam 账号尚未就绪', 'warn'); return false; }
+  textBatchBusy.add(key);
+  updateTextCooldownControls();
+  const controller = new AbortController();
+  const deadline = setTimeout(() => controller.abort(), networkDeadlineMs);
+  let batch: TextBatch | undefined;
+  try {
+    const result = await api('/api/messages/split', { ...jsonBody({ id, msg: message, steamAccountId: account }), signal: controller.signal });
+    if (context !== chatContext() || id !== state.activeId || account !== (state.steam.activeAccount?.steamId || state.steam.steamId)
+      || !grantAtLeast(requiresFullText(message) ? 'full' : 'chat')) return false;
+    if (!isRecord(result) || result.steamAccountId !== account || !Array.isArray(result.parts) || !result.parts.length
+      || ![1945, 6340].includes(Number(result.maxBytes)) || result.parts.some(part => typeof part !== 'string'
+        || !part.trim() || textMessageTooLong(part, Number(result.maxBytes))) || result.parts.join('') !== message) {
+      throw new Error('无法安全分段，原文已保留，请稍后重试。');
+    }
+    batch = { entries: [], next: 0, running: false, paused: false, nextSendAt: 0, owner: textBatchOwner() };
+    for (const part of result.parts as string[]) batch.entries.push(beginOutgoing(id, part.replace(/\[/g, '\\['), 'message', part, batch));
+    if (input && input.value === draft) { input.value = ''; resizeComposerInput(input); }
+    refreshOutgoing(true);
+  } catch (error) {
+    if (context === chatContext() && id === state.activeId) setFeedback(errorMessage(error), 'warn');
+  } finally {
+    clearTimeout(deadline);
+    textBatchBusy.delete(key);
+    updateTextCooldownControls();
+  }
+  return batch ? runTextBatch(batch) : false;
+}
+
+function textBatchOwner() {
+  return state.me ? `${state.me.id}:${state.me.sessionVersion || 0}` : '';
+}
+
+function suspendTextBatches() {
+  const owner = textBatchOwner();
+  for (const batch of pausedTextBatches) if (!owner || batch.owner !== owner) pausedTextBatches.delete(batch);
+  for (const entry of outgoingMessages.values()) {
+    const batch = entry.textBatch;
+    if (!batch || !owner || batch.owner !== owner) continue;
+    batch.paused = true;
+    // Invalidating the view cannot prove that an in-flight request was rejected.
+    if (!entry.textQueued && entry.state === 'sending') {
+      entry.state = 'unknown';
+      entry.error = '发送时会话发生变化，请检查发送结果后再继续。';
+    }
+    if (batch.next < batch.entries.length) pausedTextBatches.add(batch);
+  }
+}
+
+function restorePausedTextBatches() {
+  const owner = textBatchOwner();
+  const account = state.steam.activeAccount?.steamId || state.steam.steamId;
+  let restored = false;
+  for (const batch of pausedTextBatches) {
+    if (!owner || batch.owner !== owner) { pausedTextBatches.delete(batch); continue; }
+    if (!grantAtLeast('chat') || batch.entries[0].textSteamAccountId !== account) continue;
+    for (const entry of batch.entries) {
+      if (entry.state === 'sent') continue;
+      entry.context = chatContext();
+      outgoingMessages.set(entry.localId, entry);
+    }
+    pausedTextBatches.delete(batch);
+    restored = true;
+  }
+  if (restored) refreshOutgoing();
+}
+
+async function runTextBatch(batch: TextBatch): Promise<boolean> {
+  if (batch.running || batch.next >= batch.entries.length) return false;
+  const first = batch.entries[batch.next];
+  if (!first.textQueued || !canActOnOutgoingText(first)) return false;
+  const key = `${first.context}|${first.item.id}`;
+  if (textBatchBusy.has(key)) return false;
+  batch.running = true;
+  batch.paused = false;
+  textBatchBusy.add(key);
+  updateTextCooldownControls();
+  try {
+    while (batch.next < batch.entries.length) {
+      const entry = batch.entries[batch.next];
+      const allowed = () => !batch.paused && !!entry.textQueued && canActOnOutgoingText(entry) && steamOnline()
+        && !textCooldownSeconds(entry.textSteamAccountId);
+      if (!allowed()) return false;
+      const delay = batch.nextSendAt - Date.now();
+      if (delay > 0) await new Promise<void>(resolve => setTimeout(resolve, delay));
+      if (!allowed()) return false;
+      entry.textQueued = false;
+      entry.item = { ...entry.item, sentAt: new Date().toISOString() };
+      refreshOutgoing();
+      if (!(await sendOutgoingText(entry))) return false;
+      batch.next++;
+      batch.nextSendAt = Date.now() + 1000;
+    }
+    return true;
+  } finally {
+    batch.running = false;
+    if (batch.next < batch.entries.length) batch.paused = true;
+    textBatchBusy.delete(key);
+    updateTextCooldownControls();
+    if (first.context === chatContext() && first.item.id === state.activeId) refreshOutgoing();
+  }
 }
 
 function canActOnOutgoingText(entry: OutgoingMessage) {
@@ -4819,21 +4982,40 @@ function canActOnOutgoingText(entry: OutgoingMessage) {
 
 async function retryOutgoingText(entry: OutgoingMessage): Promise<boolean> {
   if (!canActOnOutgoingText(entry) || !steamOnline() || entry.state !== 'failed' || entry.textCheckBusy) return false;
+  if (entry.textBatch && (entry.textBatch.running || entry.textBatch.entries[entry.textBatch.next] !== entry
+    || textBatchBusy.has(`${entry.context}|${entry.item.id}`))) return false;
+  const lengthError = textMessageTooLong(entry.retryText!);
+  if (lengthError) { entry.error = lengthError; setFeedback(lengthError, 'warn'); refreshOutgoing(); return false; }
   if (textCooldownBlocked(entry.textSteamAccountId)) return false;
   entry.state = 'sending';
   entry.error = entry.textCheckReason = undefined;
   entry.textCandidateFound = undefined;
   entry.item = { ...entry.item, sentAt: new Date().toISOString() };
+  if (entry.textBatch) { entry.textQueued = true; return runTextBatch(entry.textBatch); }
   refreshOutgoing();
   return sendOutgoingText(entry);
 }
 
 async function resendOutgoingText(entry: OutgoingMessage): Promise<boolean> {
   if (!canActOnOutgoingText(entry) || !steamOnline() || entry.state !== 'unknown' || entry.textCheckBusy || entry.replacementLocalId !== undefined) return false;
+  if (entry.textBatch && (entry.textBatch.running || entry.textBatch.entries[entry.textBatch.next] !== entry
+    || textBatchBusy.has(`${entry.context}|${entry.item.id}`))) return false;
+  const lengthError = textMessageTooLong(entry.retryText!);
+  if (lengthError) { setFeedback(lengthError, 'warn'); return false; }
   if (textCooldownBlocked(entry.textSteamAccountId)) return false;
   const replacement = beginOutgoing(entry.item.id, entry.item.message || '', 'message', entry.retryText);
   replacement.previousLocalId = entry.localId;
   entry.replacementLocalId = replacement.localId;
+  if (entry.textBatch) {
+    const batch = entry.textBatch;
+    replacement.textBatch = batch;
+    replacement.textBatchIndex = entry.textBatchIndex;
+    replacement.textQueued = true;
+    batch.entries[batch.next] = replacement;
+    entry.textBatch = undefined;
+    refreshOutgoing(true);
+    return runTextBatch(batch);
+  }
   refreshOutgoing(true);
   return sendOutgoingText(replacement);
 }
@@ -4871,6 +5053,35 @@ async function checkOutgoingText(entry: OutgoingMessage): Promise<void> {
 }
 
 function appendTextOutgoingActions(container: HTMLElement, entry: OutgoingMessage) {
+  if (entry.textQueued && entry.textBatch) {
+    const batch = entry.textBatch;
+    if (batch.entries[batch.next] === entry && !batch.running) {
+      const resume = create('button', 'ghost-btn outgoing-resume', '继续发送后续段落');
+      resume.type = 'button';
+      resume.dataset.textSendAction = 'resume';
+      resume.dataset.textOutgoingId = String(entry.localId);
+      updateTextOutgoingButton(resume, entry);
+      resume.addEventListener('click', () => { if (!resume.disabled) void runTextBatch(batch); });
+      container.append(resume);
+    }
+    const firstQueued = batch.entries.find(part => part.textQueued && outgoingMessages.has(part.localId));
+    if (firstQueued === entry && batch.running) {
+      const pause = create('button', 'ghost-btn outgoing-pause', '暂停后续发送');
+      pause.type = 'button';
+      pause.addEventListener('click', () => { batch.paused = true; refreshOutgoing(); });
+      container.append(pause);
+    } else if (firstQueued === entry && !batch.running) {
+      const dismiss = create('button', 'ghost-btn outgoing-dismiss', '移除未发送段落');
+      dismiss.type = 'button';
+      dismiss.addEventListener('click', () => {
+        batch.paused = true;
+        for (const part of batch.entries) if (part.textQueued) outgoingMessages.delete(part.localId);
+        refreshOutgoing();
+      });
+      container.append(dismiss);
+    }
+    return;
+  }
   if (entry.state !== 'failed' && entry.state !== 'unknown') return;
   const allowed = canActOnOutgoingText(entry);
   const action = (label: string, className: string, enabled: boolean, run: () => Promise<unknown>) => {
