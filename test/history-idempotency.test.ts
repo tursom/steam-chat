@@ -257,13 +257,16 @@ for (const legacy of [false, true]) {
       callback(null, history.map(item => ({ ...item, steamID: peer, timestamp: item.time })));
     } });
     else Object.assign(steamUser.chat, { getFriendMessageHistory(_id: string, options: unknown, callback: Function) {
-      assert.deepEqual(options, { maxCount: 100, wantBbcode: true });
+      assert.deepEqual(options, { maxCount: 100, wantBbcode: true, startTime: 1 });
       callback(null, { messages: history.map(item => ({ ...item, sender: peer, server_timestamp: new Date(item.time * 1000) })) });
     } });
     const dispose = createSteamMessageLogger({ steamUser, historyStorage: storage, getSteamAccountId: () => account, logger: quiet });
+    t.after(() => dispose.close());
     steamUser.chat.emit('friendMessage', { steamid_friend: peer, message: 'oldest', ordinal: 1, server_timestamp: new Date(1710000000 * 1000) });
-    await dispose.close();
+    // Shutdown now cancels background recovery; first observe its completed
+    // archive to test ordering independently of the shutdown/restart protocol.
     await drained(storage, 4);
+    await dispose.close();
     const messages = (await rows(options.logPath)).map(item => item.message);
     assert.deepEqual(messages, ['oldest', 'same second, second ordinal', 'newest']);
     assert.deepEqual(history.map(item => item.message), ['newest', 'same second, second ordinal', 'oldest']);

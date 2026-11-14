@@ -1,0 +1,2 @@
+npm notice run steam-chat@1.0.0 build
+npm notice run tsc -p tsconfig.json && tsc -p tsconfig.web.json && node scripts/build-web.cjs

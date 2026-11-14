@@ -1,0 +1,19 @@
+[
+  "java",
+  "-XX:+UseParallelGC",
+  "-Xmx512m",
+  "-cp",
+  "/root/funds-fix-audits/matrix-20261026-154408/largest/tla2tools.jar",
+  "tlc2.TLC",
+  "-workers",
+  "1",
+  "-seed",
+  "1",
+  "-fp",
+  "0",
+  "-metadir",
+  "/root/dev/steam/steam-chat/spec/restart-history/.tlc-6l5f9ibi",
+  "-config",
+  "RestartHistory.cfg",
+  "RestartHistory.tla"
+]

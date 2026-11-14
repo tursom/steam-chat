@@ -227,7 +227,7 @@ test('logger shutdown has a deadline when Steam history never responds', async (
   assert.equal(f.records.length, 1);
 });
 
-test('logger persists realtime before history resolves and scopes imports and echoes to captured accounts', async () => {
+test('logger persists realtime before history resolves, rejects stale imports and scopes echoes to captured accounts', async () => {
   const f = fakeStorage();
   let active = account;
   const callbacks: Array<(error: unknown, result: unknown) => void> = [];
@@ -248,8 +248,7 @@ test('logger persists realtime before history resolves and scopes imports and ec
   callbacks[0](null, { messages: [{ sender: account, message: 'old A' }] });
   callbacks[1](null, { messages: [] });
   await dispose.close();
-  assert.equal(f.records.find((record) => record.message === 'old A')?.steamAccountId, account);
-  assert.equal(f.records.find((record) => record.message === 'old A')?.name, account);
+  assert.equal(f.records.some((record) => record.message === 'old A'), false);
   assert.equal(f.records.find((record) => record.message === 'live A')?.steamAccountId, account);
   assert.equal(f.records.find((record) => record.message === 'echo')?.steamAccountId, active);
 });

@@ -1,0 +1,102 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 0 and seed 1 with 1 worker on 12 cores with 491MB heap and 64MB offheap memory [pid: 955154] (Linux 7.0.14-4-pve amd64, Arch Linux 21.0.13.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /root/dev/steam/steam-chat/spec/restart-history/evidence/mutation-early-complete/RestartHistory.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RestartHistory
+Starting... (2026-11-14 15:08:35)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-14 15:08:35.
+Error: Invariant CompleteOnlyArchived is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "idle",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 2: <Discover line 58, col 5 to line 62, col 42 of module RestartHistory>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "idle",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 3: <Start line 70, col 5 to line 79, col 42 of module RestartHistory>
+/\ done = {1}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "query",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+8 states generated, 3 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 3.
+The average outdegree of the complete state graph is 1 (minimum is 1, the maximum 1 and the 95th percentile is 1).
+Finished in 00s at (2026-11-14 15:08:35)

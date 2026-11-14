@@ -1,0 +1,161 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 0 and seed 1 with 1 worker on 12 cores with 491MB heap and 64MB offheap memory [pid: 955066] (Linux 7.0.14-4-pve amd64, Arch Linux 21.0.13.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /root/dev/steam/steam-chat/spec/restart-history/evidence/mutation-failure-cache/RestartHistory.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RestartHistory
+Starting... (2026-11-14 15:08:34)
+Implied-temporal checking--satisfiability problem has 1 branches.
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-14 15:08:34.
+Progress(16) at 2026-11-14 15:08:34: 122 states generated, 28 distinct states found, 0 states left on queue.
+Checking temporal properties for the complete state space with 28 total distinct states at (2026-11-14 15:08:34)
+Error: Temporal properties were violated.
+
+Error: The following behavior constitutes a counter-example:
+
+State 1: <Initial predicate>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "idle",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 1
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 2: <Discover line 58, col 5 to line 62, col 42 of module RestartHistory>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "idle",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 1
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 3: <Start line 70, col 5 to line 79, col 42 of module RestartHistory>
+/\ done = {}
+/\ attempted = {1}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "query",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 1
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 4: <FailureAt line 130, col 5 to line 134, col 42 of module RestartHistory>
+/\ done = {}
+/\ attempted = {1}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "failed",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 5: <RetryTimer line 138, col 5 to line 142, col 43 of module RestartHistory>
+/\ done = {}
+/\ attempted = {1}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "idle",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = TRUE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 6: Stuttering
+Finished checking temporal properties in 00s at 2026-11-14 15:08:34
+122 states generated, 28 distinct states found, 0 states left on queue.
+Finished in 00s at (2026-11-14 15:08:34)

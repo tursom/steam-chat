@@ -120,17 +120,42 @@ function subscribe(emitter: FriendMessageEmitter | undefined, eventName: FriendM
 }
 
 function subscribeFriendMessageEvents(steamUser: SteamFriendMessageEventUser, handler: SteamFriendMessageEventHandler) {
-  const pendingLegacy = new Map<string, number>();
+  let pendingLegacy = new Map<string, number>();
   const disposers: Array<() => void> = [];
+  let chatDisposers: Array<() => void> = [];
+
+  function unbindChat() {
+    for (const dispose of chatDisposers) dispose();
+    chatDisposers = [];
+    // Expiry timers from the old connection must not consume a new count.
+    pendingLegacy = new Map();
+  }
+  function bindChat() {
+    unbindChat();
+    for (const eventName of ['friendMessage', 'friendMessageEcho'] as FriendMessageEventName[]) {
+      chatDisposers.push(subscribe(steamUser.chat, eventName, (body: unknown) => {
+        const event = chatEventFromBody(eventName, body);
+        if (!event) return;
+        incrementPendingLegacy(pendingLegacy, legacyCompatibilityKey(eventName, event));
+        handler(event);
+      }));
+    }
+  }
+  bindChat();
+  // The stable user proxy can point at a fresh SDK instance after reconnect.
+  const lifecycle = steamUser as { on?: (event: string, listener: () => void) => void;
+    off?: (event: string, listener: () => void) => void; removeListener?: (event: string, listener: () => void) => void };
+  lifecycle.on?.('loggedOn', bindChat);
+  lifecycle.on?.('disconnected', unbindChat);
+  lifecycle.on?.('loggedOff', unbindChat);
+  disposers.push(() => {
+    for (const [event, listener] of [['loggedOn', bindChat], ['disconnected', unbindChat], ['loggedOff', unbindChat]] as const) {
+      if (lifecycle.off) lifecycle.off(event, listener);
+      else lifecycle.removeListener?.(event, listener);
+    }
+  });
 
   for (const eventName of ['friendMessage', 'friendMessageEcho'] as FriendMessageEventName[]) {
-    disposers.push(subscribe(steamUser.chat, eventName, (body: unknown) => {
-      const event = chatEventFromBody(eventName, body);
-      if (!event) return;
-      incrementPendingLegacy(pendingLegacy, legacyCompatibilityKey(eventName, event));
-      handler(event);
-    }));
-
     disposers.push(subscribe(steamUser, eventName, (...args: unknown[]) => {
       const event = legacyEventFromArgs(eventName, args);
       if (!event) return;
@@ -141,6 +166,7 @@ function subscribeFriendMessageEvents(steamUser: SteamFriendMessageEventUser, ha
 
   return () => {
     for (const dispose of disposers) dispose();
+    for (const dispose of chatDisposers) dispose();
     pendingLegacy.clear();
   };
 }

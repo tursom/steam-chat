@@ -1,0 +1,18 @@
+[
+  {"name":"fixed-combined", "faults":1, "crashes":1, "switches":1, "property":"Recovery", "expect":"pass"},
+  {"name":"fixed-three-discovery-sources", "contacts":3, "property":"Recovery", "expect":"pass"},
+  {"name":"fixed-two-item-page", "pageSize":2, "faults":1, "crashes":1, "property":"Recovery", "expect":"pass"},
+  {"name":"legacy-silent-without-inbound", "mode":"legacy", "property":"Recovery", "expect":"Recovery"},
+  {"name":"legacy-single-page", "mode":"legacy", "inbound":true, "expect":"CompleteOnlyArchived"},
+  {"name":"mutation-single-page", "mode":"single_page", "expect":"CompleteOnlyArchived"},
+  {"name":"mutation-failure-cache", "mode":"failure_cache", "faults":1, "property":"Recovery", "expect":"Recovery"},
+  {"name":"mutation-early-complete", "mode":"early_complete", "expect":"CompleteOnlyArchived"},
+  {"name":"mutation-no-round-guard", "mode":"no_round_guard", "switches":1, "invariants":["TypeOK","NoStaleCallbacks"], "expect":"NoStaleCallbacks"},
+  {"name":"mutation-no-token-account-leak", "mode":"no_token_guard", "switches":1, "invariants":["TypeOK","AccountIsolation"], "expect":"AccountIsolation"},
+  {"name":"mutation-stale-followup", "mode":"stale_followup", "switches":1, "invariants":["TypeOK","NoStaleQueries"], "expect":"NoStaleQueries"},
+  {"name":"mutation-body-dedup", "mode":"body_dedup", "expect":"NoFalseMerge"},
+  {"name":"mutation-time-only-cursor", "mode":"time_only_cursor", "expect":"CompleteOnlyArchived"},
+  {"name":"reachable-partial-crash-replay", "crashes":1, "expect":"NeverRecoveredAfterPartialCrash"},
+  {"name":"reachable-retry-recovery", "faults":1, "expect":"NeverRecoveredAfterRetry"},
+  {"name":"reachable-three-sources", "contacts":3, "expect":"NeverAllSourcesRecovered"}
+]

@@ -1,0 +1,476 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 0 and seed 1 with 1 worker on 12 cores with 491MB heap and 64MB offheap memory [pid: 955605] (Linux 7.0.14-4-pve amd64, Arch Linux 21.0.13.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /root/dev/steam/steam-chat/spec/restart-history/evidence/mutation-time-only-cursor/RestartHistory.tla
+Parsing file /tmp/Naturals.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Sequences.tla
+Semantic processing of module Naturals
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module RestartHistory
+Starting... (2026-11-14 15:08:38)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-14 15:08:39.
+Error: Invariant CompleteOnlyArchived is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "idle",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 2: <Discover line 58, col 5 to line 62, col 42 of module RestartHistory>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "idle",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 3: <Start line 70, col 5 to line 79, col 42 of module RestartHistory>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "query",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 4: <IssueQuery line 82, col 5 to line 87, col 42 of module RestartHistory>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "waiting",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 5: <ReadPage line 90, col 5 to line 98, col 42 of module RestartHistory>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "buffered",
+  round |-> 0,
+  page |->
+      { [ owner |-> "A",
+          contact |-> 1,
+          number |-> 2,
+          time |-> 2,
+          ordinal |-> 2,
+          body |-> "same text",
+          echo |-> FALSE ] },
+  todo |->
+      { [ owner |-> "A",
+          contact |-> 1,
+          number |-> 2,
+          time |-> 2,
+          ordinal |-> 2,
+          body |-> "same text",
+          echo |-> FALSE ] },
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = {}
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = {}
+
+State 6: <Commit line 101, col 5 to line 110, col 79 of module RestartHistory>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "buffered",
+  round |-> 0,
+  page |->
+      { [ owner |-> "A",
+          contact |-> 1,
+          number |-> 2,
+          time |-> 2,
+          ordinal |-> 2,
+          body |-> "same text",
+          echo |-> FALSE ] },
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = { [ event |->
+        [ owner |-> "A",
+          contact |-> 1,
+          number |-> 2,
+          time |-> 2,
+          ordinal |-> 2,
+          body |-> "same text",
+          echo |-> FALSE ],
+    bucket |-> "A" ] }
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = { [ owner |-> "A",
+    contact |-> 1,
+    number |-> 2,
+    time |-> 2,
+    ordinal |-> 2,
+    body |-> "same text",
+    echo |-> FALSE ] }
+
+State 7: <Advance line 112, col 5 to line 119, col 42 of module RestartHistory>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 2, ordinal |-> 2],
+  phase |-> "query",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = { [ event |->
+        [ owner |-> "A",
+          contact |-> 1,
+          number |-> 2,
+          time |-> 2,
+          ordinal |-> 2,
+          body |-> "same text",
+          echo |-> FALSE ],
+    bucket |-> "A" ] }
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = { [ owner |-> "A",
+    contact |-> 1,
+    number |-> 2,
+    time |-> 2,
+    ordinal |-> 2,
+    body |-> "same text",
+    echo |-> FALSE ] }
+
+State 8: <IssueQuery line 82, col 5 to line 87, col 42 of module RestartHistory>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 2, ordinal |-> 2],
+  phase |-> "waiting",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = { [ event |->
+        [ owner |-> "A",
+          contact |-> 1,
+          number |-> 2,
+          time |-> 2,
+          ordinal |-> 2,
+          body |-> "same text",
+          echo |-> FALSE ],
+    bucket |-> "A" ] }
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = { [ owner |-> "A",
+    contact |-> 1,
+    number |-> 2,
+    time |-> 2,
+    ordinal |-> 2,
+    body |-> "same text",
+    echo |-> FALSE ] }
+
+State 9: <ReadPage line 90, col 5 to line 98, col 42 of module RestartHistory>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 2, ordinal |-> 2],
+  phase |-> "buffered",
+  round |-> 0,
+  page |->
+      { [ owner |-> "A",
+          contact |-> 1,
+          number |-> 3,
+          time |-> 1,
+          ordinal |-> 1,
+          body |-> "same text",
+          echo |-> FALSE ] },
+  todo |->
+      { [ owner |-> "A",
+          contact |-> 1,
+          number |-> 3,
+          time |-> 1,
+          ordinal |-> 1,
+          body |-> "same text",
+          echo |-> FALSE ] },
+  eof |-> TRUE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = { [ event |->
+        [ owner |-> "A",
+          contact |-> 1,
+          number |-> 2,
+          time |-> 2,
+          ordinal |-> 2,
+          body |-> "same text",
+          echo |-> FALSE ],
+    bucket |-> "A" ] }
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = { [ owner |-> "A",
+    contact |-> 1,
+    number |-> 2,
+    time |-> 2,
+    ordinal |-> 2,
+    body |-> "same text",
+    echo |-> FALSE ] }
+
+State 10: <Commit line 101, col 5 to line 110, col 79 of module RestartHistory>
+/\ done = {}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 2, ordinal |-> 2],
+  phase |-> "buffered",
+  round |-> 0,
+  page |->
+      { [ owner |-> "A",
+          contact |-> 1,
+          number |-> 3,
+          time |-> 1,
+          ordinal |-> 1,
+          body |-> "same text",
+          echo |-> FALSE ] },
+  todo |-> {},
+  eof |-> TRUE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = { [ event |->
+        [ owner |-> "A",
+          contact |-> 1,
+          number |-> 2,
+          time |-> 2,
+          ordinal |-> 2,
+          body |-> "same text",
+          echo |-> FALSE ],
+    bucket |-> "A" ],
+  [ event |->
+        [ owner |-> "A",
+          contact |-> 1,
+          number |-> 3,
+          time |-> 1,
+          ordinal |-> 1,
+          body |-> "same text",
+          echo |-> FALSE ],
+    bucket |-> "A" ] }
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = { [ owner |-> "A",
+    contact |-> 1,
+    number |-> 2,
+    time |-> 2,
+    ordinal |-> 2,
+    body |-> "same text",
+    echo |-> FALSE ],
+  [ owner |-> "A",
+    contact |-> 1,
+    number |-> 3,
+    time |-> 1,
+    ordinal |-> 1,
+    body |-> "same text",
+    echo |-> FALSE ] }
+
+State 11: <Finish line 122, col 5 to line 128, col 42 of module RestartHistory>
+/\ done = {1}
+/\ attempted = {}
+/\ job = [ owner |-> "A",
+  contact |-> 1,
+  cursor |-> [time |-> 3, ordinal |-> 0],
+  phase |-> "idle",
+  round |-> 0,
+  page |-> {},
+  todo |-> {},
+  eof |-> FALSE ]
+/\ badCallback = FALSE
+/\ account = "A"
+/\ badQuery = FALSE
+/\ faults = 0
+/\ retried = FALSE
+/\ archive = { [ event |->
+        [ owner |-> "A",
+          contact |-> 1,
+          number |-> 2,
+          time |-> 2,
+          ordinal |-> 2,
+          body |-> "same text",
+          echo |-> FALSE ],
+    bucket |-> "A" ],
+  [ event |->
+        [ owner |-> "A",
+          contact |-> 1,
+          number |-> 3,
+          time |-> 1,
+          ordinal |-> 1,
+          body |-> "same text",
+          echo |-> FALSE ],
+    bucket |-> "A" ] }
+/\ replayed = FALSE
+/\ online = TRUE
+/\ switches = 0
+/\ crashes = 0
+/\ incoming = FALSE
+/\ discovered = {1}
+/\ round = 0
+/\ partialCrash = FALSE
+/\ receipts = { [ owner |-> "A",
+    contact |-> 1,
+    number |-> 2,
+    time |-> 2,
+    ordinal |-> 2,
+    body |-> "same text",
+    echo |-> FALSE ],
+  [ owner |-> "A",
+    contact |-> 1,
+    number |-> 3,
+    time |-> 1,
+    ordinal |-> 1,
+    body |-> "same text",
+    echo |-> FALSE ] }
+
+41 states generated, 11 distinct states found, 0 states left on queue.
+The depth of the complete state graph search is 11.
+The average outdegree of the complete state graph is 1 (minimum is 1, the maximum 1 and the 95th percentile is 1).
+Finished in 00s at (2026-11-14 15:08:39)

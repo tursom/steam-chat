@@ -11,14 +11,14 @@ const test = require('node:test');
 const { setTimeout: delay } = require('node:timers/promises');
 
 const { createSteamMessageLogger } = require('../src/steam/message-logger');
-const { readHistory } = require('../src/storage/chat-log');
+const { readHistory, formatDate } = require('../src/storage/chat-log');
 
 type SteamHistoryMessage = {
   accountid?: string | number;
   message?: string;
   ordinal?: string | number | null;
   steamID?: unknown;
-  timestamp?: number;
+  timestamp?: Date | number;
 };
 
 type SteamFriendHistoryMessage = {
@@ -62,7 +62,7 @@ test('createSteamMessageLogger imports chat friend history with original ordinal
     getFriendMessageHistory(id: string, options: { maxCount: number; wantBbcode: boolean }, callback: (error: unknown, response?: { messages?: SteamFriendHistoryMessage[] }) => void) {
       historyCalls += 1;
       assert.equal(id, '76561198000000000');
-      assert.deepEqual(options, { maxCount: 100, wantBbcode: true });
+      assert.deepEqual(options, { maxCount: 100, wantBbcode: true, startTime: 1 });
       callback(null, {
         messages: [
           { sender: steamID, message: 'old friend text', ordinal: 11, server_timestamp: new Date(1710000000 * 1000) },
@@ -103,7 +103,7 @@ test('createSteamMessageLogger merges chat object events with legacy compatibili
   chat.getFriendMessageHistory = (id: string, options: { maxCount: number; wantBbcode: boolean }, callback: (error: unknown, response?: { messages?: SteamFriendHistoryMessage[] }) => void) => {
     historyCalls += 1;
     assert.equal(id, '76561198000000000');
-    assert.deepEqual(options, { maxCount: 100, wantBbcode: true });
+    assert.deepEqual(options, { maxCount: 100, wantBbcode: true, startTime: 1 });
     callback(null, {
       messages: [
         { sender: steamID, message: 'history from chat object trigger', ordinal: 43, server_timestamp: new Date(1709999999 * 1000) }
@@ -157,7 +157,7 @@ test('createSteamMessageLogger falls back to legacy Steam history before live fr
     historyCalls += 1;
     assert.equal(id, '76561198000000000');
     callback(null, [
-      { accountid: 'history-user', message: 'old text', ordinal: 1, timestamp: 1710000000 },
+      { accountid: 'history-user', message: 'old text', ordinal: 1, timestamp: new Date(1710000000 * 1000) },
       { accountid: 'history-user', message: 'old image', ordinal: 2, timestamp: 1710000001 }
     ]);
   };
@@ -175,6 +175,8 @@ test('createSteamMessageLogger falls back to legacy Steam history before live fr
   assert.equal(historyCalls, 1);
   assert.deepEqual(history.map((item: { message: string }) => item.message), ['old text', 'old image', 'live one']);
   assert.deepEqual(history.map((item: { ordinal: number | string | null }) => item.ordinal), [1, 2, 3]);
+  assert.equal(history[0].date, formatDate(new Date(1710000000 * 1000)), 'SDK Date timestamps must not be multiplied by 1000 again');
+  assert.equal(history[1].date, formatDate(new Date(1710000001 * 1000)), 'numeric seconds remain compatible');
   assert.equal(history[1].type, 'message');
   assert.equal(history[2].name, 'Alice');
   const raw = await fs.readFile(logPath, 'utf8');
