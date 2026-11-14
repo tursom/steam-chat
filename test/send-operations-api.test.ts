@@ -166,7 +166,8 @@ test('auth/me includes Steam status and the same supported config as api/config,
   const response = await f.request('/api/config');
   assert.equal(response.headers.get('cache-control'), 'no-store');
   const config = await response.json();
-  assert.deepEqual(config, { wsPath: '/custom-ws', sendOperations: true, imageOperationUpload: true });
+  assert.match(config.imageBatchEpoch, /^[a-f0-9]{32}$/);
+  assert.deepEqual(config, { wsPath: '/custom-ws', sendOperations: true, imageOperationUpload: true, imageBatchEpoch: config.imageBatchEpoch });
   for (const cookie of [f.cookie, '']) {
     const response = await f.request('/api/auth/me', undefined, cookie);
     assert.equal(response.status, 200);
@@ -375,4 +376,102 @@ test('accepted upload survives going offline, while cancel and replay cannot rev
   assert.equal((await replay.json()).state, 'cancelled');
   assert.equal(f.calls.length, 0);
   assert.equal(f.saved.length, 0);
+});
+
+async function batchBody(f: Awaited<ReturnType<typeof fixture>>, names = ['One', 'Two']) {
+  const config = await (await f.request('/api/config')).json();
+  return { kind: 'image', id: peer, names, steamAccountId: account, instanceId: config.imageBatchEpoch };
+}
+
+test('batch API preserves input order under reverse starts and never accepts generic upload for a member', async t => {
+  let commit: Reply | undefined;
+  const f = await fixture(t, (phase, reply) => {
+    if (phase !== 'commit' || commit) return false;
+    commit = reply; return true;
+  });
+  t.after(() => commit?.(null, { statusCode: 200, headers: {} }, { success: 16 }));
+  const response = await f.request('/api/send-operations/batch', await batchBody(f));
+  assert.equal(response.status, 201); assert.equal(response.headers.get('cache-control'), 'no-store');
+  const result = await response.json(), [one, two] = result.operations;
+  assert.match(result.batchId, /^[a-f0-9]{32}$/);
+  assert.deepEqual(result.operations.map((op: any) => [op.name, op.batchId, op.batchIndex, op.batchSize]),
+    [['One', result.batchId, 0, 2], ['Two', result.batchId, 1, 2]]);
+  assert.equal(two.waitingForOperationId, one.id);
+  assert.equal((await f.upload(one.id, { name: 'One' })).status, 409);
+  const body = { img: png.toString('base64') };
+  assert.equal((await f.request(`/api/send-operations/${two.id}/start`, body)).status, 202);
+  await delay(20); assert.deepEqual(f.calls, []);
+  assert.equal((await f.request(`/api/send-operations/${one.id}/start`, body)).status, 202);
+  await until(() => Boolean(commit)); await delay(20);
+  assert.deepEqual(f.calls, ['begin', 'upload', 'commit']); assert.equal((await f.status(two.id)).deadline, 0);
+  commit!(null, { statusCode: 200, headers: {} }, { success: 1, result: { success: 1, details: { url: 'https://images.steamusercontent.com/first.png' } } });
+  await until(async () => (await f.status(two.id)).state === 'sent');
+  assert.deepEqual(f.calls, ['begin', 'upload', 'commit', 'begin', 'upload', 'commit']);
+  assert.equal(f.saved.length, 2); assert.ok(f.saved[0].message.endsWith('/first.png'));
+  assert.equal((await f.request(`/api/send-operations/${two.id}/start`, body)).status, 202);
+  assert.equal(f.saved.length, 2);
+});
+
+test('batch API rejects stale epochs, validates every member, and reserves quotas atomically', async t => {
+  const f = await fixture(t, undefined, { maxTasks: 3 });
+  const body = await batchBody(f);
+  const other = await fixture(t);
+  assert.notEqual((await batchBody(other)).instanceId, body.instanceId);
+  for (const instanceId of [undefined, '', 'f'.repeat(32), (await batchBody(other)).instanceId]) {
+    assert.equal((await f.request('/api/send-operations/batch', { ...body, instanceId })).status, 409);
+  }
+  for (const names of [undefined, [], ['One', null], [123], Array(11).fill('One'), 'One']) {
+    assert.equal((await f.request('/api/send-operations/batch', { ...body, names })).status, 400);
+  }
+  const invalidMetadata: object[] = [{ kind: 'text' }, { id: '42' }, { steamAccountId: undefined }, { steamAccountId: null }];
+  for (const extra of invalidMetadata) {
+    assert.equal((await f.request('/api/send-operations/batch', { ...body, ...extra })).status, 400);
+  }
+  assert.equal((await f.request('/api/send-operations/batch', { ...body, steamAccountId: f.second.steamId })).status, 409);
+  assert.equal((await f.request('/api/send-operations/batch', { ...body, names: ['1', '2', '3', '4'] })).status, 429);
+  const responses = await Promise.all([f.request('/api/send-operations/batch', body), f.request('/api/send-operations/batch', body)]);
+  assert.deepEqual(responses.map(response => response.status).sort(), [201, 429]);
+  assert.equal((await f.request('/api/send-operations/batch', { ...body, names: ['Last'] })).status, 201);
+  assert.deepEqual(f.calls, []);
+});
+
+test('batch API retains session, owner, account, online and grant boundaries', async t => {
+  const f = await fixture(t), body = await batchBody(f);
+  assert.equal((await f.request('/api/send-operations/batch', body, '')).status, 401);
+  f.setOnline(false); assert.equal((await f.request('/api/send-operations/batch', body)).status, 503); f.setOnline(true);
+  const { operations: [one, two] } = await (await f.request('/api/send-operations/batch', body)).json();
+  const image = { img: png.toString('base64') };
+  for (const session of [f.adminCookie, f.sessions.createSetCookie(f.user).split(';')[0]]) {
+    assert.equal((await f.request(`/api/send-operations/${one.id}`, undefined, session)).status, 403);
+    assert.equal((await f.request(`/api/send-operations/${two.id}/start`, image, session)).status, 403);
+  }
+  f.auth.setActiveSteamAccount(f.second.id);
+  assert.equal((await f.request(`/api/send-operations/${one.id}/start`, image)).status, 403);
+  f.auth.setActiveSteamAccount(f.active.id);
+  f.auth.replaceUserSteamAccounts(f.user.id, [], f.admin.id);
+  assert.equal((await f.request('/api/send-operations/batch', body)).status, 403);
+  assert.equal((await f.request(`/api/send-operations/${one.id}/start`, image)).status, 403);
+  assert.deepEqual(f.calls, []);
+});
+
+test('batch member loaders recheck authorization and never recreate an expired member', async t => {
+  for (const change of ['account', 'grant', 'session', 'expiry']) await t.test(change, async t => {
+    let finish!: (response: Response) => void;
+    const f = await fixture(t, undefined, change === 'expiry' ? { batchMs: 100, resultMs: 10 } : {},
+      { fetchImpl: () => new Promise(resolve => { finish = resolve; }) });
+    const { operations: [one, two] } = await (await f.request('/api/send-operations/batch', await batchBody(f))).json();
+    const pending = f.request(`/api/send-operations/${one.id}/start`, { url: remoteUrl(t) });
+    await until(() => Boolean(finish));
+    if (change === 'account') f.auth.setActiveSteamAccount(f.second.id);
+    else if (change === 'grant') f.auth.replaceUserSteamAccounts(f.user.id, [], f.admin.id);
+    else if (change === 'session') f.sessions.revokeUserSessions(f.user.id, f.admin.id);
+    else await until(async () => (await f.request(`/api/send-operations/${one.id}`)).status === 410);
+    finish(new Response(png));
+    assert.equal((await pending).status, change === 'account' ? 409 : change === 'grant' ? 403 : change === 'session' ? 401 : 410);
+    if (change === 'expiry') {
+      assert.equal((await f.request(`/api/send-operations/${two.id}/start`, { img: png.toString('base64') })).status, 410);
+      assert.equal((await f.request(`/api/send-operations/${one.id}`)).status, 410);
+    }
+    assert.deepEqual(f.calls, []); assert.equal(f.saved.length, 0);
+  });
 });

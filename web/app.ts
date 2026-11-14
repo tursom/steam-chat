@@ -103,7 +103,7 @@ type MeResponse = {
   permissions: Permission[];
   permissionDetails?: Array<{ permission: Permission; effective: boolean; source: string }>;
   steam: SteamStatus;
-  config?: { wsPath?: string; sendOperations?: boolean; imageOperationUpload?: boolean };
+  config?: { wsPath?: string; sendOperations?: boolean; imageOperationUpload?: boolean; imageBatchEpoch?: string };
 };
 
 type ListEntry = Record<string, unknown> & {
@@ -212,6 +212,7 @@ type AppState = {
   wsPath: string;
   sendOperations: boolean;
   imageOperationUpload: boolean;
+  imageBatchEpoch: string;
   ws: WebSocket | null;
   reconnectTimer: ReturnType<typeof setTimeout> | null;
   statusTimer: ReturnType<typeof setInterval> | null;
@@ -271,6 +272,7 @@ const state: AppState = {
   wsPath: '/ws',
   sendOperations: false,
   imageOperationUpload: false,
+  imageBatchEpoch: '',
   ws: null,
   reconnectTimer: null,
   statusTimer: null,
@@ -287,10 +289,11 @@ type OutgoingState = 'sending' | 'sent' | 'failed' | 'unknown';
 type OutgoingMessage = { localId: number; context: string; item: MessageItem; state: OutgoingState; error?: string; eventId?: string;
   readonly retryText?: string; readonly textSteamAccountId?: string; textCheckBusy?: boolean; textCheckReason?: string; textCandidateFound?: boolean; replacementLocalId?: number; previousLocalId?: number };
 type ImageOperation = { id: string; peerId: string; steamAccountId: string; state: string; version: number;
-  attempts: number; maxAttempts: number; nextRetryAt: number; phase: string; error?: string; retryable: boolean; hasImage: boolean; item?: MessageItem; cooldownUntil?: number; replacementId?: string };
+  attempts: number; maxAttempts: number; nextRetryAt: number; phase: string; error?: string; retryable: boolean; hasImage: boolean; item?: MessageItem; cooldownUntil?: number; replacementId?: string;
+  batchId?: string; batchIndex?: number; batchSize?: number; waitingForOperationId?: string };
 type ImageOperationEntry = OutgoingMessage & { operation?: ImageOperation; imagePayload?: Record<string, string>; transfer?: ImageTransfer;
-  operationBusy?: boolean; operationQueryBusy?: boolean; operationQueryError?: boolean; lastOperationQuery?: number; operationMissing?: boolean; operationCreatingFailed?: boolean;
-  uploadRejection?: string };
+  operationBusy?: boolean; operationCancelBusy?: boolean; operationQueryBusy?: boolean; operationQueryError?: boolean; lastOperationQuery?: number; operationMissing?: boolean; operationCreatingFailed?: boolean;
+  uploadRejection?: string; imageReading?: boolean };
 const outgoingMessages = new Map<number, OutgoingMessage>();
 const textAccountCooldowns = new Map<string, number>();
 let textCooldownTimer: ReturnType<typeof setTimeout> | null = null;
@@ -4997,8 +5000,9 @@ async function sendComposer() {
     if (text && !(await sendText())) return;
     if (context !== chatContext() || peerId !== state.activeId || !canSendImages()) return;
     const selected = drafts.filter(item => imageDrafts.has(item.id));
-    for (const item of selected) removeImageDraft(item.id);
-    sendFiles(selected.map(item => item.file));
+    const sending = sendFiles(selected.map(item => item.file));
+    const accepted = typeof sending === 'boolean' ? sending : await sending;
+    if (accepted) for (const item of selected) removeImageDraft(item.id);
   } finally {
     composerSending.delete(key);
     updateChatAvailability();
@@ -5020,11 +5024,20 @@ const imageOperationRequests = new Set<AbortController>();
 function imageOperationKey() { return `steam-chat.send-operations.${state.me?.id}.${state.steam.activeAccount?.steamId || state.steam.steamId}`; }
 function saveImageOperationMetadata() {
   try {
-    sessionStorage.setItem(imageOperationKey(), JSON.stringify([...outgoingMessages.values()].map(item => item as ImageOperationEntry)
-      .filter(item => item.context === chatContext() && item.operation && item.state !== 'sent')
+    const entries = [...outgoingMessages.values()].map(item => item as ImageOperationEntry)
+      .filter(item => item.context === chatContext() && item.operation);
+    const known = new Set(entries.map(item => item.operation!.id));
+    let stored: unknown;
+    try { stored = JSON.parse(sessionStorage.getItem(imageOperationKey()) || '[]'); } catch { stored = []; }
+    // A reservation can reply after its original UI context has been cleared.
+    // Preserve those received identities until restoration adopts their rows.
+    const pending = (Array.isArray(stored) ? stored : []).filter(item => isRecord(item)
+      && item.pendingReservation === true && typeof item.operationId === 'string'
+      && /^[a-f0-9]{32}$/.test(item.operationId) && !known.has(item.operationId));
+    sessionStorage.setItem(imageOperationKey(), JSON.stringify([...entries.filter(item => item.state !== 'sent')
       .slice(-100).map(item => ({ operationId: item.operation!.id, peerId: item.item.id, createdAt: item.item.sentAt,
         uploadRejection: item.uploadRejection,
-        thread: state.chatPanel === 'thread' && state.activeId === item.item.id }))));
+        thread: state.chatPanel === 'thread' && state.activeId === item.item.id })), ...pending].slice(-100)));
   } catch { /* Browser storage may be disabled. Current-page retry still works. */ }
 }
 function stopImageOperationPolling() {
@@ -5039,6 +5052,7 @@ function imageOperationLabel(op: ImageOperation, uploadRejection?: string) {
   if (op.state === 'retry_wait') return `${Math.max(0, Math.ceil((op.nextRetryAt - Date.now()) / 1000))} 秒后重试 · ${count}`;
   if (op.state === 'waiting_connection') return '等待 Steam 恢复连接…';
   if (op.state === 'prepared') return '准备上传图片…';
+  if (op.state === 'queued' && op.waitingForOperationId) return '等待前一张图片确认…';
   if (op.state === 'queued') return '等待发送…';
   if (op.state === 'sending') return `发送中… · ${count}`;
   if (op.state === 'failed') return `发送失败 · 已尝试 ${op.attempts} 次`;
@@ -5062,7 +5076,7 @@ function applyImageOperation(entry: ImageOperationEntry, value: unknown) {
     return;
   }
   if (op.state !== 'prepared') entry.uploadRejection = undefined;
-  if (op.state === 'prepared' && !entry.imagePayload) entry.error = '原图尚未上传。请先停止此任务，再重新选择图片。';
+  if (op.state === 'prepared' && !entry.imagePayload && !entry.imageReading) entry.error = '原图尚未上传。请先停止此任务，再重新选择图片。';
   if (op.state === 'sent') {
     if (entry.transfer) updateImageTransfer(entry.transfer, 'sent', 100);
     finishOutgoing(entry, 'sent', { item: op.item });
@@ -5070,7 +5084,10 @@ function applyImageOperation(entry: ImageOperationEntry, value: unknown) {
   } else {
     entry.state = op.state === 'failed' || op.state === 'cancelled' ? 'failed' : op.state === 'unknown' ? 'unknown' : 'sending';
     if (!entry.imagePayload) entry.item.message = op.hasImage ? `/api/send-operations/${op.id}/image` : '[图片]';
-    if (entry.transfer) updateImageTransfer(entry.transfer, entry.state === 'sending' ? 'processing' : entry.state, null, op.error);
+    if (entry.transfer) {
+      if (op.state === 'prepared' && entry.imageReading) updateImageTransfer(entry.transfer, 'reading', entry.transfer.percent);
+      else updateImageTransfer(entry.transfer, entry.state === 'sending' ? 'processing' : entry.state, null, op.error);
+    }
     refreshOutgoing();
   }
   saveImageOperationMetadata();
@@ -5136,13 +5153,19 @@ function restoreImageOperations() {
   } catch { /* Invalid or disabled browser storage does not start any sends. */ }
 }
 async function imageOperationAction(entry: ImageOperationEntry, action: string) {
-  if (!entry.operation || entry.operationBusy || entry.context !== chatContext()) return;
-  entry.operationBusy = true;
+  const cancelling = action === 'cancel';
+  if (!entry.operation || (cancelling ? entry.operationCancelBusy : entry.operationBusy) || entry.context !== chatContext()) return;
+  if (cancelling) entry.operationCancelBusy = true;
+  else entry.operationBusy = true;
   try { applyImageOperation(entry, await api(`/api/send-operations/${entry.operation.id}/${action}`, jsonBody({ expectedVersion: entry.operation.version }))); }
   catch (error) {
     if (entry.context !== chatContext()) return;
     entry.error = errorMessage(error); refreshOutgoing();
-  } finally { entry.operationBusy = false; void queryImageOperation(entry, true); }
+  } finally {
+    if (cancelling) entry.operationCancelBusy = false;
+    else entry.operationBusy = false;
+    void queryImageOperation(entry, true);
+  }
 }
 async function dismissImageOperation(entry: ImageOperationEntry) {
   if (!entry.operation || entry.context !== chatContext()) return;
@@ -5354,43 +5377,152 @@ function handleImagePaste(event: ClipboardEvent) {
   queueImageDrafts(files);
 }
 
-function sendFiles(files: FileList | File[] | null) {
-  if (!files || !canSendImages()) return;
+function sendFiles(files: FileList | File[] | null): boolean | Promise<boolean> {
+  if (!files || !canSendImages()) return false;
   const context = chatContext();
   const target = state.activeId;
   const current = () => context === chatContext() && target === state.activeId && canSendImages();
-  for (const file of Array.from(files).filter((file) => file.type.startsWith('image/'))) {
-    const transfer = createImageTransfer(file.name || '剪贴板图片', 'reading');
-    // Base64 plus JSON must fit the server's 10 MiB request body limit.
-    if (!file.size || file.size > 7 * 1024 * 1024) {
-      const message = file.size ? '图片不能超过 7 MiB。' : '不能发送空图片。';
-      updateImageTransfer(transfer, 'failed', null, message);
-      setFeedback(message, 'warn');
-      continue;
+  const images = Array.from(files).filter(file => file.type.startsWith('image/'));
+  if (!images.length) return false;
+  if (images.length > 1) {
+    if (!state.sendOperations || !/^[a-f0-9]{32}$/.test(state.imageBatchEpoch)) {
+      setFeedback('服务器尚不支持按序发送多张图片，请刷新页面或逐张发送。', 'warn');
+      return false;
     }
-    const reader = new FileReader();
-    pendingImageReaders.add(reader);
-    reader.onprogress = (event) => {
-      if (pendingImageReaders.has(reader)) updateImageTransfer(transfer, 'reading', event.lengthComputable && event.total > 0 ? Math.floor(event.loaded / event.total * 100) : null);
-    };
-    reader.onload = () => {
-      if (!pendingImageReaders.delete(reader)) return;
-      if (current() && typeof reader.result === 'string') void sendImage({ img: reader.result }, transfer);
-      else updateImageTransfer(transfer, 'cancelled');
-    };
-    reader.onerror = () => {
-      if (!pendingImageReaders.delete(reader)) return;
-      updateImageTransfer(transfer, 'failed', null, '读取图片失败');
-      if (current()) setFeedback('读取图片失败', 'error');
-    };
-    reader.onabort = () => { pendingImageReaders.delete(reader); updateImageTransfer(transfer, 'cancelled'); };
-    try { reader.readAsDataURL(file); }
-    catch (_) {
-      pendingImageReaders.delete(reader);
-      updateImageTransfer(transfer, 'failed', null, '读取图片失败');
-      if (current()) setFeedback('读取图片失败', 'error');
+    if (images.length > 10 || images.reduce((bytes, file) => bytes + file.size, 0) > 32 * 1024 * 1024) {
+      setFeedback('每批最多发送 10 张图片，总大小不能超过 32 MiB。', 'warn');
+      return false;
     }
+    if (images.some(file => !file.size || file.size > 7 * 1024 * 1024)) {
+      setFeedback('图片必须非空，且每张不能超过 7 MiB。', 'warn');
+      return false;
+    }
+    return sendImageBatch(images, current);
   }
+  readImageFile(images[0], createImageTransfer(images[0].name || '剪贴板图片', 'reading'), current);
+  return true;
+}
+
+async function sendImageBatch(files: File[], current: () => boolean): Promise<boolean> {
+  const peerId = state.activeId;
+  const steamAccountId = state.steam.activeAccount?.steamId || state.steam.steamId;
+  const instanceId = state.imageBatchEpoch;
+  const metadataKey = imageOperationKey();
+  // Capture input order before any FileReader or per-image request can finish.
+  const entries = files.map(file => {
+    const entry = beginOutgoing(peerId, '[图片]', 'image') as ImageOperationEntry;
+    entry.transfer = createImageTransfer(file.name || '剪贴板图片', 'reading');
+    entry.imageReading = true;
+    return entry;
+  });
+  try {
+    const response = await api('/api/send-operations/batch', jsonBody({ kind: 'image', id: peerId,
+      names: files.map(file => file.name || '剪贴板图片'), steamAccountId, instanceId }));
+    if (!isRecord(response) || typeof response.batchId !== 'string' || !/^[a-f0-9]{32}$/.test(response.batchId)
+      || !Array.isArray(response.operations) || response.operations.length !== entries.length) throw new Error('服务器未登记完整的图片批次。');
+    const operations = response.operations;
+    const ids = new Set<string>();
+    for (let index = 0; index < entries.length; index++) {
+      const op: unknown = operations[index];
+      if (!isRecord(op) || typeof op.id !== 'string' || !/^[a-f0-9]{32}$/.test(op.id) || ids.has(op.id)
+        || op.peerId !== peerId || op.steamAccountId !== steamAccountId || op.batchId !== response.batchId
+        || op.batchIndex !== index || op.batchSize !== entries.length || op.state !== 'prepared'
+        || typeof op.version !== 'number' || op.version < 1) throw new Error('服务器返回的图片顺序无效。');
+      ids.add(op.id);
+    }
+    if (!current()) {
+      // Keep the received identities under the original account even if the
+      // current account no longer has permission to cancel them immediately.
+      try {
+        let stored: unknown;
+        try { stored = JSON.parse(sessionStorage.getItem(metadataKey) || '[]'); } catch { stored = []; }
+        const retained = (Array.isArray(stored) ? stored : []).filter(value => !isRecord(value) || !ids.has(String(value.operationId)));
+        sessionStorage.setItem(metadataKey, JSON.stringify([...retained, ...operations.map((op, index) => ({
+          operationId: op.id, peerId, createdAt: entries[index].item.sentAt, pendingReservation: true
+        }))].slice(-100)));
+      } catch { /* Cancellation still proceeds when browser storage is disabled. */ }
+      await Promise.all(operations.map(async (op, index) => {
+        const entry = entries[index];
+        applyImageOperation(entry, op);
+        entry.imageReading = false;
+        try { applyImageOperation(entry, await api(`/api/send-operations/${op.id}/cancel`, jsonBody({}))); }
+        catch { /* Retained IDs allow a later status check under the original account. */ }
+        finishOutgoing(entry, 'failed', undefined, '会话已改变，图片批次未开始。');
+        updateImageTransfer(entry.transfer!, 'cancelled');
+      }));
+      if (metadataKey === imageOperationKey()) restoreImageOperations();
+      startImageOperationPolling();
+      return false;
+    }
+    for (let index = 0; index < entries.length; index++) applyImageOperation(entries[index], operations[index]);
+    saveImageOperationMetadata();
+    startImageOperationPolling();
+    for (let index = 0; index < entries.length; index++) readImageFile(files[index], entries[index].transfer!, current, entries[index]);
+    return true;
+  } catch (error) {
+    if (!current()) {
+      for (const entry of entries) {
+        entry.imageReading = false;
+        finishOutgoing(entry, 'failed', undefined, '会话已改变，图片批次未开始。');
+        updateImageTransfer(entry.transfer!, 'cancelled');
+      }
+      return false;
+    }
+    for (const entry of entries) {
+      entry.imageReading = false;
+      finishOutgoing(entry, 'failed', undefined, errorMessage(error));
+      updateImageTransfer(entry.transfer!, 'failed', null, errorMessage(error));
+    }
+    setFeedback(`图片批次未开始：${errorMessage(error)}`, 'error');
+    return false;
+  }
+}
+
+function readImageFile(file: File, transfer: ImageTransfer, current: () => boolean, entry?: ImageOperationEntry) {
+  const failed = (message: string) => {
+    updateImageTransfer(transfer, 'failed', null, message);
+    if (entry && entry.context === chatContext() && outgoingMessages.has(entry.localId)) {
+      entry.imageReading = false;
+      entry.uploadRejection = message;
+      entry.state = 'failed'; entry.error = message;
+      refreshOutgoing(); saveImageOperationMetadata();
+    }
+    if (current()) setFeedback(message, 'error');
+  };
+  if (!file.size || file.size > 7 * 1024 * 1024) {
+    failed(file.size ? '图片不能超过 7 MiB。' : '不能发送空图片。');
+    return;
+  }
+  const reader = new FileReader();
+  updateImageTransfer(transfer, 'reading', 0);
+  pendingImageReaders.add(reader);
+  reader.onprogress = event => {
+    if (pendingImageReaders.has(reader)) updateImageTransfer(transfer, 'reading', event.lengthComputable && event.total > 0 ? Math.floor(event.loaded / event.total * 100) : null);
+  };
+  reader.onload = () => {
+    if (!pendingImageReaders.delete(reader)) return;
+    if (entry) entry.imageReading = false;
+    if (!current() || typeof reader.result !== 'string') {
+      updateImageTransfer(transfer, 'cancelled');
+      if (entry && entry.context === chatContext() && outgoingMessages.has(entry.localId)) void imageOperationAction(entry, 'cancel');
+      return;
+    }
+    const payload = { img: reader.result };
+    if (entry) {
+      if (!outgoingMessages.has(entry.localId) || entry.operation?.state !== 'prepared') { updateImageTransfer(transfer, 'cancelled'); return; }
+      entry.imagePayload = payload;
+      updateImageTransfer(transfer, 'uploading', 0);
+      void activateImageOperation(entry, payload);
+    } else void sendImage(payload, transfer);
+  };
+  reader.onerror = () => { if (pendingImageReaders.delete(reader)) failed('读取图片失败'); };
+  reader.onabort = () => {
+    if (entry) entry.imageReading = false;
+    pendingImageReaders.delete(reader); updateImageTransfer(transfer, 'cancelled');
+    if (entry && entry.context === chatContext() && outgoingMessages.has(entry.localId)) void imageOperationAction(entry, 'cancel');
+  };
+  try { reader.readAsDataURL(file); }
+  catch (_) { pendingImageReaders.delete(reader); failed('读取图片失败'); }
 }
 
 async function loadImageEmotes() {
@@ -6032,6 +6164,7 @@ async function bootstrap() {
   if (isRecord(config) && typeof config.wsPath === 'string') state.wsPath = config.wsPath;
   state.sendOperations = isRecord(config) && config.sendOperations === true;
   state.imageOperationUpload = isRecord(config) && config.imageOperationUpload === true;
+  state.imageBatchEpoch = isRecord(config) && typeof config.imageBatchEpoch === 'string' ? config.imageBatchEpoch : '';
   renderShell();
   void restoreChatCache();
   if (grantAtLeast('full')) restoreImageOperations();

@@ -11,7 +11,9 @@ export type SendOperationView = {
   item?: HistoryItem;
   cooldownUntil: number;
   previousOperationId?: string; replacementId?: string;
+  batchId?: string; batchIndex?: number; batchSize?: number; waitingForOperationId?: string;
 };
+type Batch = { id: string; members: Operation[]; size: number; expiresAt: number; expired: boolean; finished: boolean };
 type Operation = {
   id: string; owner: SendOwner; peerId: string; name: string; state: SendState; version: number;
   phase: ImageUploadPhase; attempts: number; totalAttempts: number; nextRetryAt: number; deadline: number;
@@ -20,6 +22,7 @@ type Operation = {
   controller?: AbortController; authorize: () => boolean;
   previousOperationId?: string; replacementId?: string;
   transports: number; releaseRequested: boolean;
+  batch?: Batch; batchIndex?: number; waitingForOperationId?: string;
 };
 export type SendOperationOptions = {
   send: (op: { operationId: string; attempt: number; totalAttempts: number; account: string; peerId: string; buffer: Buffer; deadline: number; signal: AbortSignal;
@@ -29,12 +32,15 @@ export type SendOperationOptions = {
   // Timing and limits are injectable for deterministic local verification.
   tickMs?: number; windowMs?: number; delaysMs?: number[]; maxAttempts?: number; random?: () => number;
   preparedMs?: number; imageMs?: number; resultMs?: number; maxBytes?: number; userBytes?: number; maxTasks?: number;
+  batchMs?: number;
 };
 const fault = (message: string, statusCode = 409) => Object.assign(new Error(message), { statusCode });
 const active = (state: SendState) => ['queued', 'sending', 'retry_wait', 'waiting_connection'].includes(state);
 
 export class SendOperations {
+  readonly instanceId = randomBytes(16).toString('hex');
   private operations = new Map<string, Operation>();
+  private batches = new Set<Batch>();
   private cooldowns = new Map<string, number>();
   private tasks = new Set<Promise<void>>();
   private transports = new Set<Promise<unknown>>();
@@ -47,8 +53,25 @@ export class SendOperations {
     this.timer.unref?.();
   }
   private touch(op: Operation) {
+    op.waitingForOperationId = this.blocker(op)?.id;
+    this.emit(op);
+    // Only changed dependency hints are emitted; never recursively touch a batch.
+    for (const member of op.batch?.members ?? []) {
+      if (member === op) continue;
+      const waiting = this.blocker(member)?.id;
+      if (member.waitingForOperationId !== waiting) {
+        member.waitingForOperationId = waiting; this.emit(member);
+      }
+    }
+  }
+  private emit(op: Operation) {
     op.version++;
     try { this.options.onChange?.(op.owner, this.view(op)); } catch { /* A dropped UI hint cannot affect sending. */ }
+  }
+  private blocker(op: Operation): Operation | undefined {
+    if (!op.batch || op.batch.expired || op.batch.finished || (!active(op.state) && op.state !== 'prepared' && op.state !== 'failed')) return;
+    return op.batch.members.slice(0, op.batchIndex).find(previous => this.operations.get(previous.id) !== previous
+      || !(previous.state === 'sent' || (previous.state === 'cancelled' && !previous.running && !previous.transports)));
   }
   cooldownUntil(account: string): number {
     const until = this.cooldowns.get(account) || 0;
@@ -67,7 +90,8 @@ export class SendOperations {
       version: op.version, phase: op.phase, attempts: op.attempts, totalAttempts: op.totalAttempts,
       maxAttempts: this.maxAttempts, nextRetryAt: op.nextRetryAt, deadline: op.deadline, createdAt: op.createdAt,
       expiresAt: op.expiresAt, error: op.error, retryable: op.retryable && !op.transports && Boolean(op.buffer), hasImage: !op.releaseRequested && Boolean(op.buffer), item: op.item,
-      cooldownUntil: this.cooldowns.get(op.owner.account) || 0, previousOperationId: op.previousOperationId, replacementId: op.replacementId };
+      cooldownUntil: this.cooldowns.get(op.owner.account) || 0, previousOperationId: op.previousOperationId, replacementId: op.replacementId,
+      batchId: op.batch?.id, batchIndex: op.batchIndex, batchSize: op.batch?.size, waitingForOperationId: op.waitingForOperationId };
   }
   private find(id: string, owner: SendOwner): Operation {
     const op = this.operations.get(id);
@@ -89,6 +113,7 @@ export class SendOperations {
     // have changed unknown to sent, or its retained result may already have expired.
     if (clientOperationId && this.operations.has(clientOperationId)) {
       const existing = this.find(clientOperationId, owner);
+      if (existing.batch) throw fault('批次成员只能通过原任务启动。');
       if (existing.peerId !== peerId || existing.previousOperationId !== previousOperationId || existing.name !== name.slice(0, 240)) {
         throw fault('同一发送任务不能更换联系人、名称或原任务关联。');
       }
@@ -102,19 +127,42 @@ export class SendOperations {
       if (replacement.peerId !== peerId || replacement.previousOperationId !== previous.id) throw fault('原任务的替换关联已失效，请检查聊天记录。');
       return this.view(replacement);
     }
-    if (this.closed) throw fault('服务正在停止。', 503);
-    if (this.operations.size >= (this.options.maxTasks ?? 1000)
-      || [...this.operations.values()].filter(op => op.owner.userId === owner.userId && (active(op.state) || op.state === 'prepared')).length >= 10) {
-      throw fault('待发送任务已满，请稍后重试。', 429);
-    }
-    const now = Date.now();
-    const op: Operation = { id: clientOperationId ?? randomBytes(16).toString('hex'), owner: { ...owner }, peerId, name: name.slice(0, 240),
-      state: 'prepared', version: 1, phase: 'prepare', attempts: 0, totalAttempts: 0, nextRetryAt: 0, deadline: 0,
-      createdAt: now, expiresAt: now + (this.options.preparedMs ?? 300000), retryable: false,
-      running: false, refreshed: false, stopped: false, authorize, previousOperationId, transports: 0, releaseRequested: false };
+    this.checkCapacity(owner, 1);
+    const op = this.createOperation(owner, peerId, name, authorize, previousOperationId, clientOperationId);
     this.operations.set(op.id, op);
     if (previous) { previous.replacementId = op.id; this.touch(previous); }
     return this.view(op);
+  }
+  private checkCapacity(owner: SendOwner, count: number) {
+    if (this.closed) throw fault('服务正在停止。', 503);
+    if (this.operations.size + count > (this.options.maxTasks ?? 1000)
+      || [...this.operations.values()].filter(op => op.owner.userId === owner.userId && (active(op.state) || op.state === 'prepared')).length + count > 10) {
+      throw fault('待发送任务已满，请稍后重试。', 429);
+    }
+  }
+  prepareBatch(owner: SendOwner, peerId: string, names: string[], authorize: () => boolean, instanceId: string) {
+    if (instanceId !== this.instanceId) throw fault('发送服务已重启，请刷新后重新选择图片。');
+    if (!Array.isArray(names) || names.length < 1 || names.length > 10 || Array.from(names).some(name => typeof name !== 'string')) {
+      throw fault('names must contain 1 to 10 image names', 400);
+    }
+    this.cleanup(); this.checkCapacity(owner, names.length);
+    const batch: Batch = { id: randomBytes(16).toString('hex'), members: [], size: names.length,
+      expiresAt: Date.now() + (this.options.batchMs ?? 30 * 60 * 1000), expired: false, finished: false };
+    // Build every member before publishing any: validation and quota failures cannot create a prefix.
+    batch.members = names.map((name, batchIndex) => ({ ...this.createOperation(owner, peerId, name, authorize),
+      batch, batchIndex, expiresAt: batch.expiresAt }));
+    for (const op of batch.members) this.operations.set(op.id, op);
+    this.batches.add(batch);
+    for (const op of batch.members) op.waitingForOperationId = this.blocker(op)?.id;
+    return { batchId: batch.id, operations: batch.members.map(op => this.view(op)) };
+  }
+  private createOperation(owner: SendOwner, peerId: string, name: string, authorize: () => boolean,
+    previousOperationId?: string, clientOperationId?: string): Operation {
+    const now = Date.now();
+    return { id: clientOperationId ?? randomBytes(16).toString('hex'), owner: { ...owner }, peerId, name: name.slice(0, 240),
+      state: 'prepared', version: 1, phase: 'prepare', attempts: 0, totalAttempts: 0, nextRetryAt: 0, deadline: 0,
+      createdAt: now, expiresAt: now + (this.options.preparedMs ?? 300000), retryable: false,
+      running: false, refreshed: false, stopped: false, authorize, previousOperationId, transports: 0, releaseRequested: false };
   }
   get(id: string, owner: SendOwner) { this.cleanup(); return this.view(this.find(id, owner)); }
   image(id: string, owner: SendOwner) {
@@ -151,8 +199,8 @@ export class SendOperations {
   }
   private newRound(op: Operation) {
     op.state = 'queued'; op.attempts = 0; op.refreshed = false; op.stopped = false; op.retryable = false;
-    op.error = undefined; op.nextRetryAt = 0; op.deadline = Date.now() + (this.options.windowMs ?? 120000);
-    op.expiresAt = op.deadline + (this.options.imageMs ?? 900000); this.touch(op);
+    op.error = undefined; op.nextRetryAt = 0; op.deadline = op.batch ? 0 : Date.now() + (this.options.windowMs ?? 120000);
+    op.expiresAt = op.batch?.expiresAt ?? op.deadline + (this.options.imageMs ?? 900000); this.touch(op);
   }
   retry(id: string, owner: SendOwner, expectedVersion: number) {
     this.cleanup(); const op = this.find(id, owner);
@@ -162,6 +210,7 @@ export class SendOperations {
     this.newRound(op); return this.view(op);
   }
   expedite(id: string, owner: SendOwner, expectedVersion: number) {
+    this.cleanup();
     const op = this.find(id, owner);
     if (op.version !== expectedVersion) throw fault('发送状态已改变，请刷新发送结果。');
     if (op.state !== 'retry_wait' || op.running) return this.view(op);
@@ -169,7 +218,11 @@ export class SendOperations {
     op.nextRetryAt = 0; op.state = 'queued'; this.touch(op); return this.view(op);
   }
   cancel(id: string, owner: SendOwner) {
-    const op = this.find(id, owner);
+    this.cleanup();
+    return this.cancelOperation(this.find(id, owner));
+  }
+  private cancelOperation(op: Operation) {
+    if (op.batch?.expired) return this.view(op);
     if (op.state === 'sent' || op.state === 'cancelled') return this.view(op);
     op.stopped = true; op.retryable = false; op.nextRetryAt = 0;
     if (op.state === 'unknown' || (op.running && (op.phase === 'commit' || op.phase === 'unknown'))) {
@@ -186,12 +239,35 @@ export class SendOperations {
   }
   private cleanup() {
     const now = Date.now();
+    for (const batch of this.batches) {
+      if (now >= batch.expiresAt) this.expireBatch(batch);
+      const finished = batch.expired || batch.members.every(op => !op.running && !op.transports
+        && (op.state === 'sent' || op.state === 'cancelled' || (op.state === 'failed' && !op.retryable)));
+      if (finished) {
+        batch.finished = true; this.batches.delete(batch);
+        for (const op of batch.members) this.touch(op);
+        batch.members = []; // Results may remain queryable, but no longer pin the whole batch.
+      }
+    }
     for (const [id, op] of this.operations) {
       if (op.running || op.transports || active(op.state) || op.expiresAt > now) continue;
       if (op.buffer) { this.release(op); op.retryable = false; op.error = '原图已过期，请重新选择图片。'; this.touch(op); }
-      else this.operations.delete(id);
+      else if (!op.batch || op.batch.finished) this.operations.delete(id);
     }
     for (const [id, until] of this.cooldowns) if (until <= now) this.cooldowns.delete(id);
+  }
+  private expireBatch(batch: Batch) {
+    if (batch.expired || batch.finished) return;
+    batch.expired = true;
+    for (const op of batch.members) {
+      op.stopped = true; op.retryable = false; op.nextRetryAt = 0;
+      if (op.state !== 'sent' && op.state !== 'cancelled') {
+        op.state = op.state === 'unknown' || (op.running && (op.phase === 'commit' || op.phase === 'unknown')) ? 'unknown' : 'failed';
+        op.error = op.state === 'unknown' ? '批次已过期，发送结果未确认，请检查聊天记录。' : '发送批次已过期，请重新选择图片。';
+      }
+      if (op.state !== 'unknown') op.controller?.abort();
+      this.release(op); this.touch(op);
+    }
   }
   private fail(op: Operation, message: string, retryable: boolean) {
     op.state = 'failed'; op.retryable = retryable; op.error = message; op.nextRetryAt = 0;
@@ -211,6 +287,11 @@ export class SendOperations {
           } else op.controller?.abort(Object.assign(fault('自动重试等待已超时，请稍后重试。'), { retryable: true }));
         }
         continue;
+      }
+      if (op.batch?.expired || this.blocker(op)) continue;
+      if (!op.deadline) {
+        op.deadline = now + (this.options.windowMs ?? 120000);
+        op.expiresAt = op.deadline + (this.options.imageMs ?? 900000); this.touch(op);
       }
       if (now >= op.deadline || op.attempts >= this.maxAttempts) { this.fail(op, op.error || '自动重试已结束，请稍后重试。', true); continue; }
       let online: boolean;
@@ -237,6 +318,7 @@ export class SendOperations {
         account: op.owner.account, peerId: op.peerId, buffer: op.buffer!,
         signal: op.controller!.signal, deadline: op.deadline,
         authorize: () => {
+          if (op.batch && Date.now() >= op.batch.expiresAt) this.expireBatch(op.batch);
           if (this.closed || op.stopped) throw fault('发送已停止。');
           if (op.controller!.signal.aborted) throw op.controller!.signal.reason;
           if (Date.now() >= op.deadline) throw Object.assign(fault('自动重试等待已超时，请稍后重试。'), { retryable: true });
@@ -252,8 +334,12 @@ export class SendOperations {
           }).catch(() => {});
         }
       });
+      if (op.batch && Date.now() >= op.batch.expiresAt) this.expireBatch(op.batch);
+      if (op.state === 'cancelled' || (op.batch?.expired && op.state === 'failed')) return;
       op.item = item; op.state = 'sent'; op.retryable = false; op.error = undefined; this.release(op); this.touch(op);
     } catch (error) {
+      if (op.batch && Date.now() >= op.batch.expiresAt) this.expireBatch(op.batch);
+      if (op.batch?.expired) return;
       if (op.state === 'cancelled') return;
       const retryAfter = isRecord(error) && typeof error.retryAfterMs === 'number' ? error.retryAfterMs : 30000;
       if (isRecord(error) && Number(error.eresult) === 84) {
@@ -286,7 +372,7 @@ export class SendOperations {
       }
       op.state = 'retry_wait'; op.error = errorMessage(error); op.retryable = true;
       op.nextRetryAt = Date.now() + wait; this.touch(op);
-    } finally { op.running = false; op.controller = undefined; }
+    } finally { op.running = false; op.controller = undefined; this.touch(op); }
   }
   private async refresh(op: Operation) {
     const signal = op.controller!.signal;
@@ -303,7 +389,8 @@ export class SendOperations {
   }
   async close() {
     this.closed = true; clearInterval(this.timer);
-    for (const op of this.operations.values()) this.cancel(op.id, op.owner);
-    await Promise.allSettled([...this.tasks]); await Promise.allSettled([...this.transports]); this.operations.clear();
+    this.cleanup();
+    for (const op of this.operations.values()) this.cancelOperation(op);
+    await Promise.allSettled([...this.tasks]); await Promise.allSettled([...this.transports]); this.operations.clear(); this.batches.clear();
   }
 }

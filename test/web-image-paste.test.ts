@@ -35,7 +35,11 @@ class Element {
   }
 }
 
-function harness() {
+const batchEpoch = 'e'.repeat(32);
+type BatchOperation = { id: string; peerId: string; steamAccountId: string; batchId: string; batchIndex: number;
+  batchSize: number; state: string; version: number; waitingForOperationId?: string };
+type BatchReply = { batchId: string; operations: BatchOperation[] };
+function harness(options: { batch?: boolean; holdBatch?: boolean; holdStart?: boolean; cancelError?: boolean; batchError?: string; mutateBatch?: (reply: BatchReply) => void } = {}) {
   const readers: Reader[] = [];
   class Reader {
     result: string | null = null;
@@ -47,11 +51,15 @@ function harness() {
     constructor() { readers.push(this); }
     readAsDataURL(file: ImageFile) { this.file = file; }
     abort() { this.aborted = true; this.onabort?.(); }
-    finish() { this.result = `data:${this.file?.type};base64,YWJj`; this.onload?.(); }
+    finish(data = 'YWJj') { this.result = `data:${this.file?.type};base64,${data}`; this.onload?.(); }
   }
   const root = new Element('main');
   const elements: Element[] = [root];
-  const requests: Array<{ url: string; body: Record<string, string> }> = [];
+  const requests: Array<{ url: string; body: Record<string, any> }> = [];
+  const operations = new Map<string, BatchOperation>();
+  let releaseBatch = () => {};
+  let releaseStart = () => {};
+  const metadata = new Map<string, string>();
   class FetchXHR {
     upload = { onprogress: null as ((event: unknown) => void) | null, onload: null as (() => void) | null };
     onload?: () => void;
@@ -67,7 +75,7 @@ function harness() {
     send(body: string) {
       void sandbox.fetch(this.path, { body }).then(async response => {
         this.upload.onload?.();
-        this.status = 200;
+        this.status = 'status' in response ? Number(response.status) : 200;
         this.responseText = JSON.stringify(await response.json());
         this.onload?.();
       }, () => this.onerror?.());
@@ -87,11 +95,37 @@ function harness() {
       createElement: (tag: string) => { const element = new Element(tag); elements.push(element); return element; }
     },
     localStorage: { getItem: (): null => null, setItem() {} },
+    sessionStorage: { getItem: (key: string) => metadata.get(key) ?? null, setItem(key: string, value: string) { metadata.set(key, value); } },
     FileReader: Reader, XMLHttpRequest: FetchXHR, URL: SandboxURL, URLSearchParams, Headers, AbortController, console,
     setTimeout: () => 0, clearTimeout() {}, setInterval: () => 0, clearInterval() {},
     fetch: async (url: string, init: { body?: string }) => {
       if (url === '/message') await new Promise<void>((resolve, reject) => textRequests.push({ body: JSON.parse(init?.body || '{}'), resolve, reject }));
       requests.push({ url, body: JSON.parse(init?.body || '{}') });
+      if (url === '/api/send-operations/batch') {
+        const body = JSON.parse(init.body!);
+        if (options.holdBatch) await new Promise<void>(resolve => { releaseBatch = resolve; });
+        if (options.batchError) return { ok: false, status: 503, json: async () => ({ error: options.batchError }) };
+        const batchId = 'b'.repeat(32);
+        const reply: BatchReply = { batchId, operations: body.names.map((_: string, index: number) => ({
+          id: (index + 1).toString(16).padStart(32, '0'), peerId: body.id, steamAccountId: body.steamAccountId,
+          batchId, batchIndex: index, batchSize: body.names.length, state: 'prepared', version: 1
+        })) };
+        options.mutateBatch?.(reply);
+        for (const op of reply.operations) operations.set(op.id, op);
+        return { ok: true, json: async () => JSON.parse(JSON.stringify(reply)) as BatchReply };
+      }
+      const match = /^\/api\/send-operations\/([a-f0-9]{32})(?:\/(start|cancel))?$/.exec(url);
+      if (match) {
+        const op = operations.get(match[1])!;
+        if (match[2] === 'cancel' && options.cancelError) return { ok: false, status: 503, json: async () => ({ error: 'cancel unavailable' }) };
+        if (match[2] === 'start' && options.holdStart) await new Promise<void>(resolve => { releaseStart = resolve; });
+        if (match[2] === 'start' && op.state === 'cancelled') return { ok: false, status: 409, json: async () => ({ error: 'task cancelled' }) };
+        if (match[2]) {
+          op.state = match[2] === 'start' ? 'queued' : 'cancelled'; op.version++;
+          if (op.batchIndex) op.waitingForOperationId = [...operations.keys()][0];
+        }
+        return { ok: true, json: async () => ({ ...op }) };
+      }
       return { ok: true, json: async () => ({ ok: true }) };
     },
     __test: undefined as unknown
@@ -100,15 +134,25 @@ function harness() {
   runInNewContext(`${source.slice(0, source.indexOf('\nbootstrap().catch'))}
     state.me = {id:1}; state.permissions = ['chat.use', 'self.password.change']; state.view = 'chat'; state.activeId = '76561198000000002';
     state.steam = {...state.steam, status:'online', accessAllowed:true, steamId:'76561198000000001', steamGrant: {level:'full', scope:'all', peerCount:0, expiresAt:null}};
+    state.sendOperations = ${Boolean(options.batch)}; state.imageBatchEpoch = ${JSON.stringify(options.batch ? batchEpoch : '')};
     root.append(renderComposer());
     loadHistory = async () => {};
-    globalThis.__test = {state, resetHistory, invalidateChat, sendFiles, drafts: () => Array.from(imageDrafts.values()), currentDrafts: getImageDrafts, pending: () => pendingImageReaders.size};`, sandbox);
+    globalThis.__test = {state, resetHistory, invalidateChat, sendFiles, imageOperationLabel, saveImageOperationMetadata,
+      cancel: (index) => imageOperationAction(Array.from(outgoingMessages.values())[index], 'cancel'),
+      outgoing: () => Array.from(outgoingMessages.values()),
+      drafts: () => Array.from(imageDrafts.values()), currentDrafts: getImageDrafts, pending: () => pendingImageReaders.size};`, sandbox);
   const api = sandbox.__test as {
-    state: { me: unknown; view: string; activeId: string; feedback: string; steam: { status: string; accessAllowed: boolean; steamId: string } };
+    state: { me: unknown; view: string; activeId: string; feedback: string; sendOperations: boolean; imageBatchEpoch: string;
+      steam: { status: string; accessAllowed: boolean; steamId: string } };
+    imageOperationLabel: (op: BatchOperation) => string;
+    cancel: (index: number) => Promise<void>;
+    saveImageOperationMetadata: () => void;
+    outgoing: () => Array<{ operation?: BatchOperation; imageReading?: boolean; error?: string; state: string;
+      transfer: { name: string; stage: string }; imagePayload?: { img: string } }>;
     invalidateChat: () => void;
     drafts: () => Array<{ id: number; peerId: string; context: string; file: ImageFile; url: string }>;
     currentDrafts: () => Array<{ id: number; file: ImageFile }>;
-    resetHistory: () => void; sendFiles: (files: ImageFile[]) => void; pending: () => number;
+    resetHistory: () => void; sendFiles: (files: ImageFile[]) => boolean | Promise<boolean>; pending: () => number;
   };
   const input = elements.find(element => element.id === 'messageInput')!;
   function paste(files: ImageFile[], options: { onlyFiles?: boolean; nullItem?: boolean; text?: boolean } = {}) {
@@ -124,7 +168,9 @@ function harness() {
     input.listeners.get('keydown')!({ key: 'Enter', shiftKey, preventDefault() { prevented = true; } });
     return prevented;
   };
-  return { ...api, root, input, elements, requests, readers, paste, send, enter, created, revoked, textRequests };
+  return { ...api, root, input, elements, requests, readers, paste, send, enter, created, revoked, textRequests,
+    releaseBatch: () => releaseBatch(), releaseStart: () => releaseStart(), metadata,
+    starts: () => requests.filter(request => request.url.endsWith('/start')) };
 }
 const image = (name = 'clipboard.png'): ImageFile => ({ name, type: 'image/png', size: 3 });
 
@@ -174,19 +220,20 @@ test('Shift+Enter leaves image drafts untouched', () => {
   assert.equal(h.readers.length, 0);
 });
 
-test('individual remove buttons revoke only the selected draft and send the remaining images', () => {
-  const h = harness(); h.paste([image('one.png'), image('two.png'), image('three.png')]);
+test('individual remove buttons revoke only the selected draft and send the remaining images', async () => {
+  const h = harness({ batch: true }); h.paste([image('one.png'), image('two.png'), image('three.png')]);
   h.root.querySelectorAll('.image-draft-remove')[1].listeners.get('click')!({});
   assert.deepEqual(Array.from(h.drafts(), draft => draft.file.name), ['one.png', 'three.png']);
   assert.equal(h.root.querySelectorAll('.image-draft').length, 2);
   assert.deepEqual(h.revoked, [h.created[1].url]);
   h.send();
+  await settle();
   assert.deepEqual(h.readers.map(reader => reader.file?.name), ['one.png', 'three.png']);
   assert.equal(new Set(h.revoked).size, 3);
 });
 
 test('uncertain text keeps images but is not automatically retried on the next send', async () => {
-  const h = harness(); h.input.value = 'keep caption'; h.paste([image()]); h.send();
+  const h = harness({ batch: true }); h.input.value = 'keep caption'; h.paste([image()]); h.send();
   h.paste([image('new.png')]);
   h.textRequests[0].reject(new Error('text rejected'));
   await settle();
@@ -331,15 +378,17 @@ test('text and video pastes retain the default browser behavior and do not uploa
 
 test('multiple images, files-only clipboard and null item fallbacks do not duplicate uploads', async () => {
   for (const options of [{}, { onlyFiles: true }, { nullItem: true }]) {
-    const h = harness();
+    const h = harness({ batch: true });
     assert.equal(h.paste([image('one.png'), image('two.png')], options), true);
     assert.equal(h.readers.length, 0);
     assert.equal(h.drafts().length, 2);
     h.send();
+    await settle();
     assert.equal(h.readers.length, 2);
     h.readers.forEach(reader => reader.finish());
     await settle();
-    assert.equal(h.requests.length, 2);
+    assert.equal(h.requests.filter(request => request.url === '/api/send-operations/batch').length, 1);
+    assert.equal(h.starts().length, 2);
   }
 });
 
@@ -392,4 +441,132 @@ test('oversized, empty and unreadable images are rejected with feedback and no u
   assert.match(h.state.feedback, /读取图片失败/);
   assert.equal(h.pending(), 0);
   assert.equal(h.requests.length, 0);
+});
+
+test('batch reserves input order before reading and reverse reads activate only their fixed IDs', async () => {
+  const h = harness({ batch: true, holdBatch: true });
+  h.paste([image('first.png'), image('second.png'), image('third.png')]); h.send(); h.send();
+  assert.equal(h.requests.length, 1);
+  assert.deepEqual(h.requests[0], { url: '/api/send-operations/batch', body: {
+    kind: 'image', id: '76561198000000002', names: ['first.png', 'second.png', 'third.png'],
+    steamAccountId: '76561198000000001', instanceId: batchEpoch
+  } });
+  assert.equal(h.readers.length, 0);
+  assert.equal(h.drafts().length, 3);
+  h.paste([image('later.png')]);
+  h.releaseBatch(); await settle();
+  assert.deepEqual(Array.from(h.drafts(), draft => draft.file.name), ['later.png']);
+  const entries = h.outgoing();
+  assert.deepEqual(Array.from(entries, entry => entry.transfer.name), ['first.png', 'second.png', 'third.png']);
+  assert.ok(entries.every(entry => entry.imageReading && !entry.error && entry.transfer.stage === 'reading'));
+  assert.equal(h.starts().length, 0, 'registration never activates unread images');
+  for (const index of [2, 1, 0]) { h.readers[index].finish(`file-${index}`); await settle(); }
+  assert.deepEqual(h.starts().map(request => request.url), [2, 1, 0].map(index => `/api/send-operations/${entries[index].operation!.id}/start`));
+  assert.deepEqual(h.starts().map(request => request.body.img), [2, 1, 0].map(index => `data:image/png;base64,file-${index}`));
+  assert.equal(h.requests.some(request => ['/image', '/api/send-operations', '/api/send-operations/upload'].includes(request.url)), false);
+  assert.match(h.imageOperationLabel(entries[1].operation!), /等待前一张/);
+});
+
+test('batch creation failure retains captured and later drafts without reading or activation', async () => {
+  const h = harness({ batch: true, holdBatch: true, batchError: 'batch unavailable' });
+  h.paste([image('first.png'), image('second.png')]); h.send();
+  h.paste([image('later.png')]); h.releaseBatch(); await settle();
+  assert.equal(h.drafts().length, 3); assert.equal(h.revoked.length, 0);
+  assert.equal(h.readers.length, 0); assert.equal(h.starts().length, 0);
+  assert.match(h.state.feedback, /batch unavailable/);
+});
+
+test('missing or invalid batch capability retains drafts and never falls back to unordered sends', async () => {
+  for (const [enabled, epoch] of [[false, batchEpoch], [true, ''], [true, 'bad-epoch']] as const) {
+    const h = harness({ batch: true }); h.state.sendOperations = enabled; h.state.imageBatchEpoch = epoch;
+    h.paste([image('first.png'), image('second.png')]); h.send(); await settle();
+    assert.equal(h.drafts().length, 2); assert.equal(h.requests.length, 0); assert.equal(h.readers.length, 0);
+    assert.match(h.state.feedback, /按序发送/);
+  }
+});
+
+for (const change of ['peer', 'account', 'permission'] as const) {
+  test(`${change} change during registration prevents all batch activation`, async () => {
+    const h = harness({ batch: true, holdBatch: true });
+    h.paste([image('first.png'), image('second.png')]); h.send();
+    if (change === 'peer') { h.state.activeId = '76561198000000003'; h.resetHistory(); }
+    if (change === 'account') { h.state.steam.steamId = '76561198000000004'; h.invalidateChat(); }
+    if (change === 'permission') h.state.steam.accessAllowed = false;
+    h.releaseBatch(); await settle();
+    assert.equal(h.readers.length, 0); assert.equal(h.starts().length, 0);
+    assert.equal(h.requests.filter(request => request.url === '/api/send-operations/batch').length, 1);
+    assert.equal(h.requests.filter(request => request.url.endsWith('/cancel')).length, 2);
+    const stored = JSON.parse(h.metadata.get('steam-chat.send-operations.1.76561198000000001') || '[]');
+    assert.equal(stored.length, 2, 'late identities remain recoverable under their original account');
+    if (change !== 'account') assert.equal(h.drafts().length, 2);
+  });
+}
+
+test('malformed batch order is rejected atomically before any reader or activation', async () => {
+  for (const mutateBatch of [
+    (reply: BatchReply) => { reply.operations.reverse(); },
+    (reply: BatchReply) => { reply.operations[1].id = reply.operations[0].id; },
+    (reply: BatchReply) => { reply.operations.pop(); },
+    (reply: BatchReply) => { reply.operations[1].steamAccountId = 'wrong-account'; }
+  ]) {
+    const h = harness({ batch: true, mutateBatch });
+    h.paste([image('first.png'), image('second.png')]); h.send(); await settle();
+    assert.equal(h.drafts().length, 2); assert.equal(h.revoked.length, 0);
+    assert.equal(h.readers.length, 0); assert.equal(h.starts().length, 0);
+    assert.ok(h.outgoing().every(entry => !entry.operation));
+    assert.match(h.state.feedback, /批次未开始/);
+  }
+});
+
+test('head read error keeps its prepared operation and does not cancel or bypass it', async () => {
+  const h = harness({ batch: true });
+  await h.sendFiles([image('head.png'), image('tail.png')]);
+  h.readers[0].onerror?.(); h.readers[1].finish(); await settle();
+  const [head, tail] = h.outgoing();
+  assert.equal(head.state, 'failed'); assert.equal(head.operation!.state, 'prepared');
+  assert.equal(head.imageReading, false); assert.match(head.error!, /读取图片失败/);
+  assert.equal(h.starts().length, 1);
+  assert.equal(h.starts()[0].url, `/api/send-operations/${tail.operation!.id}/start`);
+  assert.equal(tail.operation!.waitingForOperationId, head.operation!.id);
+  assert.match(h.imageOperationLabel(tail.operation!), /等待前一张/);
+  assert.equal(h.requests.some(request => request.url.endsWith('/cancel')), false);
+});
+
+test('switching peer before a ten-image reservation replies cancels every received slot', async () => {
+  const h = harness({ batch: true, holdBatch: true });
+  const pending = h.sendFiles(Array.from({ length: 10 }, (_, index) => image(`${index}.png`)));
+  h.state.activeId = '76561198000000003'; h.resetHistory();
+  h.releaseBatch();
+  assert.equal(await pending, false); await settle();
+  assert.equal(h.readers.length, 0); assert.equal(h.starts().length, 0);
+  assert.equal(h.requests.filter(request => request.url.endsWith('/cancel')).length, 10);
+  assert.ok(h.outgoing().every(entry => entry.operation?.state === 'cancelled'));
+});
+
+test('explicit cancellation reaches the server while a member start upload is still pending', async () => {
+  const h = harness({ batch: true, holdStart: true });
+  await h.sendFiles([image('head.png'), image('tail.png')]);
+  h.readers[0].finish(); await settle();
+  assert.equal(h.starts().length, 1);
+  await h.cancel(0); await settle();
+  assert.equal(h.requests.filter(request => request.url.endsWith('/cancel')).length, 1);
+  assert.equal(h.outgoing()[0].operation!.state, 'cancelled');
+  h.releaseStart(); await settle();
+  assert.equal(h.outgoing()[0].operation!.state, 'cancelled', 'late start response cannot revive the cancelled slot');
+  assert.equal(h.outgoing()[0].state, 'failed');
+});
+
+test('late reservation after account context restoration survives failed cancels and another metadata save', async () => {
+  const h = harness({ batch: true, holdBatch: true, cancelError: true });
+  const pending = h.sendFiles(Array.from({ length: 10 }, (_, index) => image(`${index}.png`)));
+  h.state.steam.steamId = '76561198000000004'; h.invalidateChat();
+  h.state.steam.steamId = '76561198000000001'; h.invalidateChat();
+  h.releaseBatch(); assert.equal(await pending, false); await settle();
+  h.saveImageOperationMetadata();
+  const stored = JSON.parse(h.metadata.get('steam-chat.send-operations.1.76561198000000001') || '[]');
+  assert.equal(stored.length, 10, 'normal saves cannot erase the received reservation identities');
+  assert.equal(new Set(stored.map((item: { operationId: string }) => item.operationId)).size, 10);
+  assert.equal(h.outgoing().length, 10, 'the restored account can query and cancel the late batch');
+  assert.ok(h.outgoing().every(entry => entry.operation?.state === 'prepared'));
+  assert.equal(h.starts().length, 0); assert.equal(h.readers.length, 0);
 });

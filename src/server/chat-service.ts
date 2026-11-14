@@ -123,7 +123,7 @@ type GetEmoticonsOptions = {
 
 type ChatServiceOptions = {
   inventoryCacheDir?: string;
-  sendOperationOptions?: Partial<Pick<SendOperationOptions, 'tickMs' | 'windowMs' | 'delaysMs' | 'maxAttempts' | 'random' | 'preparedMs' | 'imageMs' | 'resultMs' | 'maxBytes' | 'userBytes' | 'maxTasks'>>;
+  sendOperationOptions?: Partial<Pick<SendOperationOptions, 'tickMs' | 'windowMs' | 'delaysMs' | 'maxAttempts' | 'random' | 'preparedMs' | 'imageMs' | 'resultMs' | 'maxBytes' | 'userBytes' | 'maxTasks' | 'batchMs'>>;
   imageEmoteDir?: string;
   deploymentWebhookUrl?: string;
   historyStorage?: HistoryStorage;
@@ -973,7 +973,8 @@ function createChatService(options: ChatServiceOptions = {}) {
   }
 
   function clientConfig() {
-    return { wsPath: config.wsPath, ...(sessionManager && authStore ? { sendOperations: true, imageOperationUpload: true } : {}) };
+    return { wsPath: config.wsPath, ...(sessionManager && authStore ? { sendOperations: true, imageOperationUpload: true,
+      imageBatchEpoch: sendOperations.instanceId } : {}) };
   }
 
   function authMe(req: IncomingMessage) {
@@ -1805,7 +1806,8 @@ function createChatService(options: ChatServiceOptions = {}) {
     if (!url.pathname.startsWith('/api/send-operations')) return false;
     const owner = sendOwner(req);
     const upload = url.pathname === '/api/send-operations/upload';
-    if ((url.pathname === '/api/send-operations' || upload) && req.method === 'POST') {
+    const batch = url.pathname === '/api/send-operations/batch';
+    if ((url.pathname === '/api/send-operations' || upload || batch) && req.method === 'POST') {
       if (currentSteamStatus().status !== 'online') throw Object.assign(new Error('Steam 尚未在线，暂不能创建发送任务。'), { statusCode: 503 });
       const body = await readJsonBody(req);
       if (body.kind !== 'image' || typeof body.id !== 'string' || !/^\d{17}$/.test(body.id)) throw Object.assign(new Error('Invalid image recipient'), { statusCode: 400 });
@@ -1814,6 +1816,12 @@ function createChatService(options: ChatServiceOptions = {}) {
       rejectGroupRecipient(body.id);
       validateAccountPrecondition(body.steamAccountId);
       if (body.steamAccountId !== undefined && body.steamAccountId !== owner.account) throw Object.assign(new Error('Steam account changed'), { statusCode: 409 });
+      if (batch) {
+        if (body.steamAccountId === undefined) throw Object.assign(new Error('steamAccountId required'), { statusCode: 400 });
+        const prepared = sendOperations.prepareBatch(owner, body.id, body.names as string[], authorize, body.instanceId as string);
+        jsonResponse(res, 201, prepared, { 'Cache-Control': 'no-store' });
+        return true;
+      }
       if (body.previousOperationId !== undefined && (typeof body.previousOperationId !== 'string' || !/^[a-f0-9]{32}$/.test(body.previousOperationId))) {
         throw Object.assign(new Error('Invalid previous operation'), { statusCode: 400 });
       }

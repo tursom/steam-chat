@@ -1,0 +1,270 @@
+TLC2 Version 2.19 of 08 August 2024 (rev: 5a47802)
+Running breadth-first search Model-Checking with fp 0 and seed 1 with 1 worker on 12 cores with 491MB heap and 64MB offheap memory [pid: 592657] (Linux 7.0.14-4-pve amd64, Arch Linux 21.0.13.0.3 x86_64, MSBDiskFPSet, DiskStateQueue).
+Parsing file /root/dev/.cache/steam-chat-tla/image-batch-d9jtrwm3/legacy-two-inversions/ImageBatch.tla
+Parsing file /tmp/Integers.tla
+Parsing file /tmp/Sequences.tla
+Parsing file /tmp/FiniteSets.tla
+Parsing file /tmp/TLC.tla
+Parsing file /tmp/Naturals.tla
+Semantic processing of module Naturals
+Semantic processing of module Integers
+Semantic processing of module Sequences
+Semantic processing of module FiniteSets
+Semantic processing of module TLC
+Semantic processing of module ImageBatch
+Starting... (2026-11-14 14:05:49)
+Computing initial states...
+Finished computing initial states: 1 distinct state generated at 2026-11-14 14:05:50.
+Error: Invariant AcceptedInInputOrder is violated.
+Error: The behavior up to this point is:
+State 1: <Initial predicate>
+/\ badGate = FALSE
+/\ registration = <<>>
+/\ attempts = <<0, 0>>
+/\ wire = <<"idle", "idle">>
+/\ http = {}
+/\ running = {}
+/\ stopped = FALSE
+/\ state = <<"absent", "absent">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<>>
+/\ reserved = FALSE
+/\ arrived = {}
+/\ loaded = {}
+/\ read = {}
+/\ live = {}
+
+State 2: <ReadFile line 38, col 5 to line 45, col 48 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<>>
+/\ attempts = <<0, 0>>
+/\ wire = <<"idle", "idle">>
+/\ http = {1}
+/\ running = {}
+/\ stopped = FALSE
+/\ state = <<"absent", "absent">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<>>
+/\ reserved = FALSE
+/\ arrived = {}
+/\ loaded = {}
+/\ read = {1}
+/\ live = {}
+
+State 3: <Arrive line 59, col 5 to line 67, col 74 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<1>>
+/\ attempts = <<0, 0>>
+/\ wire = <<"idle", "idle">>
+/\ http = {1}
+/\ running = {}
+/\ stopped = FALSE
+/\ state = <<"prepared", "absent">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<>>
+/\ reserved = FALSE
+/\ arrived = {1}
+/\ loaded = {}
+/\ read = {1}
+/\ live = {1}
+
+State 4: <LoadImage line 70, col 5 to line 77, col 48 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<1>>
+/\ attempts = <<0, 0>>
+/\ wire = <<"idle", "idle">>
+/\ http = {1}
+/\ running = {}
+/\ stopped = FALSE
+/\ state = <<"queued", "absent">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<>>
+/\ reserved = FALSE
+/\ arrived = {1}
+/\ loaded = {1}
+/\ read = {1}
+/\ live = {1}
+
+State 5: <Start line 100, col 5 to line 109, col 65 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<1>>
+/\ attempts = <<1, 0>>
+/\ wire = <<"upload", "idle">>
+/\ http = {1}
+/\ running = {1}
+/\ stopped = FALSE
+/\ state = <<"running", "absent">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<>>
+/\ reserved = FALSE
+/\ arrived = {1}
+/\ loaded = {1}
+/\ read = {1}
+/\ live = {1}
+
+State 6: <IssueCommit line 112, col 5 to line 117, col 39 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<1>>
+/\ attempts = <<1, 0>>
+/\ wire = <<"commit", "idle">>
+/\ http = {1}
+/\ running = {1}
+/\ stopped = FALSE
+/\ state = <<"running", "absent">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {<<1, 1>>}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<>>
+/\ reserved = FALSE
+/\ arrived = {1}
+/\ loaded = {1}
+/\ read = {1}
+/\ live = {1}
+
+State 7: <ReadFile line 38, col 5 to line 45, col 48 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<1>>
+/\ attempts = <<1, 0>>
+/\ wire = <<"commit", "idle">>
+/\ http = {1, 2}
+/\ running = {1}
+/\ stopped = FALSE
+/\ state = <<"running", "absent">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {<<1, 1>>}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<>>
+/\ reserved = FALSE
+/\ arrived = {1}
+/\ loaded = {1}
+/\ read = {1, 2}
+/\ live = {1}
+
+State 8: <Arrive line 59, col 5 to line 67, col 74 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<1, 2>>
+/\ attempts = <<1, 0>>
+/\ wire = <<"commit", "idle">>
+/\ http = {1, 2}
+/\ running = {1}
+/\ stopped = FALSE
+/\ state = <<"running", "prepared">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {<<1, 1>>}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<>>
+/\ reserved = FALSE
+/\ arrived = {1, 2}
+/\ loaded = {1}
+/\ read = {1, 2}
+/\ live = {1, 2}
+
+State 9: <LoadImage line 70, col 5 to line 77, col 48 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<1, 2>>
+/\ attempts = <<1, 0>>
+/\ wire = <<"commit", "idle">>
+/\ http = {1, 2}
+/\ running = {1}
+/\ stopped = FALSE
+/\ state = <<"running", "queued">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {<<1, 1>>}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<>>
+/\ reserved = FALSE
+/\ arrived = {1, 2}
+/\ loaded = {1, 2}
+/\ read = {1, 2}
+/\ live = {1, 2}
+
+State 10: <Start line 100, col 5 to line 109, col 65 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<1, 2>>
+/\ attempts = <<1, 1>>
+/\ wire = <<"commit", "upload">>
+/\ http = {1, 2}
+/\ running = {1, 2}
+/\ stopped = FALSE
+/\ state = <<"running", "running">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {<<1, 1>>}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<>>
+/\ reserved = FALSE
+/\ arrived = {1, 2}
+/\ loaded = {1, 2}
+/\ read = {1, 2}
+/\ live = {1, 2}
+
+State 11: <IssueCommit line 112, col 5 to line 117, col 39 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<1, 2>>
+/\ attempts = <<1, 1>>
+/\ wire = <<"commit", "commit">>
+/\ http = {1, 2}
+/\ running = {1, 2}
+/\ stopped = FALSE
+/\ state = <<"running", "running">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {<<1, 1>>, <<2, 1>>}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<>>
+/\ reserved = FALSE
+/\ arrived = {1, 2}
+/\ loaded = {1, 2}
+/\ read = {1, 2}
+/\ live = {1, 2}
+
+State 12: <Accept line 122, col 5 to line 128, col 83 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<1, 2>>
+/\ attempts = <<1, 1>>
+/\ wire = <<"commit", "accepted">>
+/\ http = {1, 2}
+/\ running = {1, 2}
+/\ stopped = FALSE
+/\ state = <<"running", "running">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {<<1, 1>>}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<2>>
+/\ reserved = FALSE
+/\ arrived = {1, 2}
+/\ loaded = {1, 2}
+/\ read = {1, 2}
+/\ live = {1, 2}
+
+State 13: <Accept line 122, col 5 to line 128, col 83 of module ImageBatch>
+/\ badGate = FALSE
+/\ registration = <<1, 2>>
+/\ attempts = <<1, 1>>
+/\ wire = <<"accepted", "accepted">>
+/\ http = {1, 2}
+/\ running = {1, 2}
+/\ stopped = FALSE
+/\ state = <<"running", "running">>
+/\ restarted = [occurred |-> FALSE, acceptedCount |-> 0]
+/\ network = [pending |-> {}, cancelledDrained |-> {}]
+/\ faulted = {}
+/\ actual = <<2, 1>>
+/\ reserved = FALSE
+/\ arrived = {1, 2}
+/\ loaded = {1, 2}
+/\ read = {1, 2}
+/\ live = {1, 2}
+
+2847 states generated, 1042 distinct states found, 323 states left on queue.
+The depth of the complete state graph search is 13.
+The average outdegree of the complete state graph is 1 (minimum is 0, the maximum 6 and the 95th percentile is 4).
+Finished in 00s at (2026-11-14 14:05:50)

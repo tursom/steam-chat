@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { setTimeout as delay } from 'node:timers/promises';
-import { SendOperations, SendOperationOptions } from '../src/server/send-operations';
+import { SendOperations, SendOperationOptions, SendOperationView } from '../src/server/send-operations';
 import type { HistoryItem } from '../src/types';
 const owner = { userId: 1, sessionId: 'session-one', account: '76561198000000001' };
 const peer = '76561198000000002';
@@ -313,4 +313,232 @@ test('legacy replacement lookup cannot follow an expired child ID into an unrela
   manager.prepare(owner, owner.account, 'Unrelated', () => true, undefined, child.id);
   assert.throws(() => manager.prepare(owner, peer, 'Copy', () => true, parent.id), (e: any) => e.statusCode === 409);
   assert.equal(manager.get(child.id, owner).state, 'prepared');
+});
+
+const batch = (manager: SendOperations, names = ['One', 'Two'], authorize = () => true) =>
+  manager.prepareBatch(owner, peer, names, authorize, manager.instanceId).operations;
+
+test('batch preparation validates the whole request and reserves global and per-user quotas atomically', async t => {
+  const manager = new SendOperations({ ...config, maxTasks: 3, refreshWebSession: async () => {}, send: async () => sent });
+  const other = new SendOperations({ ...config, refreshWebSession: async () => {}, send: async () => sent });
+  t.after(async () => { await manager.close(); await other.close(); });
+  assert.match(manager.instanceId, /^[a-f0-9]{32}$/); assert.notEqual(manager.instanceId, other.instanceId);
+  assert.throws(() => manager.prepareBatch(owner, peer, ['One'], () => true, other.instanceId), (e: any) => e.statusCode === 409);
+  for (const names of [[], Array(11).fill('x'), ['One', null], ['One', , 'Three'], 'One']) {
+    assert.throws(() => batch(manager, names as string[]), (e: any) => e.statusCode === 400);
+  }
+  assert.throws(() => batch(manager, ['One', 'Two', 'Three', 'Four']), (e: any) => e.statusCode === 429);
+  const ops = batch(manager, ['One', 'Two', 'Three']);
+  assert.deepEqual(ops.map(op => op.name), ['One', 'Two', 'Three']);
+  assert.equal(new Set(ops.map(op => op.id)).size, 3);
+  for (const [index, op] of ops.entries()) {
+    assert.match(op.id, /^[a-f0-9]{32}$/); assert.equal(op.batchId, ops[0].batchId);
+    assert.equal(op.batchIndex, index); assert.equal(op.batchSize, 3); assert.equal(op.state, 'prepared');
+  }
+  for (let i = 0; i < 9; i++) other.prepare(owner, peer, 'Existing', () => true);
+  assert.throws(() => batch(other), (e: any) => e.statusCode === 429);
+  assert.equal(batch(other, ['Last']).length, 1, 'failed two-member reservation did not consume the last slot');
+});
+
+test('reverse activation sends in batch order and dependency changes emit newer follower views', async t => {
+  const calls: string[] = [], updates: SendOperationView[] = [], finishes: Array<(item: HistoryItem) => void> = [];
+  const manager = new SendOperations({ ...config, onChange: (_owner, op) => updates.push(op), refreshWebSession: async () => {},
+    send: input => { calls.push(input.operationId); return new Promise(resolve => finishes.push(resolve)); } });
+  t.after(async () => { for (const finish of finishes) finish(sent); await manager.close(); });
+  const [one, two, three] = batch(manager, ['One', 'Two', 'Three']);
+  manager.start(three.id, owner, image); manager.start(two.id, owner, image);
+  await delay(20); assert.deepEqual(calls, []);
+  assert.equal(manager.get(three.id, owner).waitingForOperationId, one.id);
+  const version = manager.get(two.id, owner).version;
+  manager.start(one.id, owner, image);
+  await until(() => calls.length === 1); await delay(20); assert.deepEqual(calls, [one.id]);
+  finishes[0](sent); await until(() => calls.length === 2);
+  assert.deepEqual(calls, [one.id, two.id]);
+  assert.ok(updates.some(op => op.id === two.id && op.version > version && op.waitingForOperationId === undefined));
+  assert.ok(updates.some(op => op.id === three.id && op.waitingForOperationId === two.id));
+  finishes[1](sent); await until(() => calls.length === 3); finishes[2](sent);
+  await until(() => manager.get(three.id, owner).state === 'sent');
+  const stable = manager.get(three.id, owner).version; await delay(20);
+  assert.equal(manager.get(three.id, owner).version, stable, 'idle ticks do not recursively touch followers');
+});
+
+test('cancelled middle member cannot hide an earlier unknown from the third member', async t => {
+  const calls: string[] = [];
+  const manager = new SendOperations({ ...config, refreshWebSession: async () => {}, send: async input => {
+    calls.push(input.operationId); input.phase('commit'); throw transient({ uncertain: true });
+  } }); t.after(() => manager.close());
+  const [one, two, three] = batch(manager, ['One', 'Two', 'Three']);
+  manager.start(one.id, owner, image); manager.cancel(two.id, owner); manager.start(three.id, owner, image);
+  await until(() => manager.get(one.id, owner).state === 'unknown');
+  manager.cancel(one.id, owner); await delay(20);
+  assert.deepEqual(calls, [one.id]); assert.equal(manager.get(three.id, owner).waitingForOperationId, one.id);
+  assert.equal(manager.get(three.id, owner).deadline, 0);
+});
+
+test('a failed predecessor blocks until its explicit retry is confirmed', async t => {
+  const calls: string[] = [];
+  const manager = new SendOperations({ ...config, maxAttempts: 1, refreshWebSession: async () => {}, send: async input => {
+    calls.push(input.operationId); if (calls.length === 1) throw transient(); return sent;
+  } }); t.after(() => manager.close());
+  const [one, two] = batch(manager); manager.start(two.id, owner, image); manager.start(one.id, owner, image);
+  await until(() => manager.get(one.id, owner).state === 'failed'); await delay(20);
+  assert.deepEqual(calls, [one.id]); assert.equal(manager.get(two.id, owner).waitingForOperationId, one.id);
+  manager.retry(one.id, owner, manager.get(one.id, owner).version);
+  await until(() => manager.get(two.id, owner).state === 'sent'); assert.deepEqual(calls, [one.id, one.id, two.id]);
+});
+
+test('cancelling a batch commit blocks followers until a late confirmation', async t => {
+  let finish: ((item: HistoryItem) => void) | undefined;
+  const calls: string[] = [];
+  const manager = new SendOperations({ ...config, refreshWebSession: async () => {}, send: input => {
+    calls.push(input.operationId); input.phase('commit');
+    return calls.length === 1 ? new Promise(resolve => { finish = resolve; }) : Promise.resolve(sent);
+  } }); t.after(async () => { finish?.(sent); await manager.close(); });
+  const [one, two] = batch(manager); manager.start(one.id, owner, image); manager.start(two.id, owner, image);
+  await until(() => Boolean(finish)); assert.equal(manager.cancel(one.id, owner).state, 'unknown');
+  await delay(20); assert.deepEqual(calls, [one.id]);
+  finish!(sent); await until(() => manager.get(two.id, owner).state === 'sent'); assert.deepEqual(calls, [one.id, two.id]);
+});
+
+test('precommit cancellation waits for both worker exit and actual transport drain', async t => {
+  let drain = () => {}, reject = (_error: Error) => {};
+  const calls: string[] = [], updates: SendOperationView[] = [];
+  const manager = new SendOperations({ ...config, onChange: (_owner, op) => updates.push(op), refreshWebSession: async () => {}, send: input => {
+    calls.push(input.operationId);
+    if (calls.length > 1) return Promise.resolve(sent);
+    input.phase('upload'); input.transport(new Promise<void>(resolve => { drain = resolve; }));
+    return new Promise((_resolve, fail) => { reject = fail; });
+  } }); t.after(async () => { reject(transient()); drain(); await manager.close(); });
+  const [one, two] = batch(manager); manager.start(one.id, owner, image); manager.start(two.id, owner, image);
+  await until(() => calls.length === 1); manager.cancel(one.id, owner);
+  await delay(10); assert.deepEqual(calls, [one.id]);
+  reject(transient()); await delay(10); assert.deepEqual(calls, [one.id]);
+  assert.equal(manager.get(two.id, owner).waitingForOperationId, one.id);
+  drain(); await until(() => manager.get(two.id, owner).state === 'sent');
+  assert.ok(updates.some(op => op.id === two.id && op.waitingForOperationId === undefined));
+});
+
+test('transport drain alone cannot release a cancelled member while its worker is running', async t => {
+  let drain = () => {}, reject = (_error: Error) => {};
+  let calls = 0;
+  const manager = new SendOperations({ ...config, refreshWebSession: async () => {}, send: input => {
+    if (++calls > 1) return Promise.resolve(sent);
+    input.transport(new Promise<void>(resolve => { drain = resolve; }));
+    return new Promise((_resolve, fail) => { reject = fail; });
+  } }); t.after(async () => { reject(transient()); drain(); await manager.close(); });
+  const [one, two] = batch(manager); manager.start(one.id, owner, image); manager.start(two.id, owner, image);
+  await until(() => calls === 1); manager.cancel(one.id, owner); drain(); await delay(20);
+  assert.equal(calls, 1); reject(transient()); await until(() => manager.get(two.id, owner).state === 'sent');
+});
+
+test('dependency wait spends no window or account slot and distinct batches run concurrently', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const calls: string[] = [], finishes: Array<(item: HistoryItem) => void> = [];
+  const manager = new SendOperations({ ...config, windowMs: 100, refreshWebSession: async () => {}, send: input => {
+    calls.push(input.operationId); return new Promise(resolve => finishes.push(resolve));
+  } }); t.after(async () => { for (const finish of finishes) finish(sent); await manager.close(); });
+  const [one, two] = batch(manager), [three, four] = batch(manager);
+  manager.start(two.id, owner, image); manager.start(four.id, owner, image);
+  t.mock.timers.tick(1000); await delay(20);
+  for (const op of [two, four]) { assert.equal(manager.get(op.id, owner).deadline, 0); assert.equal(manager.get(op.id, owner).attempts, 0); }
+  manager.start(one.id, owner, image); manager.start(three.id, owner, image);
+  await until(() => calls.length === 2); assert.deepEqual(calls, [one.id, three.id]);
+  finishes[0](sent); finishes[1](sent); await until(() => calls.length === 4);
+  assert.equal(manager.get(two.id, owner).deadline, Date.now() + 100);
+  finishes[2](sent); finishes[3](sent); await until(() => manager.get(four.id, owner).state === 'sent');
+});
+
+test('batch dependencies pin confirmed objects through individual result GC, then release metadata', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const manager = new SendOperations({ ...config, preparedMs: 10, resultMs: 10, refreshWebSession: async () => {}, send: async () => sent });
+  t.after(() => manager.close());
+  const [one, two] = batch(manager); manager.start(one.id, owner, image);
+  await until(() => manager.get(one.id, owner).state === 'sent'); t.mock.timers.tick(100);
+  assert.equal(manager.get(one.id, owner).state, 'sent'); assert.equal(manager.get(two.id, owner).state, 'prepared');
+  manager.start(two.id, owner, image); await until(() => manager.get(two.id, owner).state === 'sent');
+  t.mock.timers.tick(100);
+  for (const op of [one, two]) assert.throws(() => manager.get(op.id, owner), (e: any) => e.statusCode === 410);
+  assert.equal((manager as any).batches.size, 0);
+});
+
+test('missing and ABA-replaced predecessors fail closed even when the new same-ID task is sent', async t => {
+  const calls: string[] = [];
+  const manager = new SendOperations({ ...config, refreshWebSession: async () => {}, send: async input => { calls.push(input.operationId); return sent; } });
+  t.after(() => manager.close());
+  const [one, two] = batch(manager); manager.start(two.id, owner, image);
+  // Fault-inject collection/reuse: normal cleanup must pin this object, and the gate must also defend its identity.
+  (manager as any).operations.delete(one.id);
+  await delay(20); assert.deepEqual(calls, []);
+  manager.prepare(owner, peer, 'Replacement', () => true, undefined, one.id); manager.start(one.id, owner, image);
+  await until(() => manager.get(one.id, owner).state === 'sent'); await delay(20);
+  assert.deepEqual(calls, [one.id]); assert.equal(manager.get(two.id, owner).waitingForOperationId, one.id);
+});
+
+test('generic prepare cannot replace batch metadata or its authorization callback', async t => {
+  let online = false, calls = 0;
+  const manager = new SendOperations({ ...config, refreshWebSession: async () => {}, send: async () => { calls++; return sent; } });
+  t.after(() => manager.close());
+  const [one, two] = batch(manager, ['One', 'Two'], () => online);
+  for (const name of ['One', 'Changed']) assert.throws(() => manager.prepare(owner, peer, name, () => true, undefined, one.id), (e: any) => e.statusCode === 409);
+  manager.start(two.id, owner, image); manager.start(one.id, owner, image);
+  await until(() => manager.get(one.id, owner).state === 'waiting_connection'); assert.equal(calls, 0);
+  assert.equal(manager.get(two.id, owner).batchIndex, 1); online = true;
+  await until(() => manager.get(two.id, owner).state === 'sent');
+});
+
+test('default thirty-minute expiry terminates the whole batch, frees bytes and eventually collects IDs', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  let calls = 0;
+  const manager = new SendOperations({ ...config, maxBytes: image.length, resultMs: 10, refreshWebSession: async () => {}, send: async () => { calls++; return sent; } });
+  t.after(() => manager.close());
+  const [one, two] = batch(manager); manager.start(two.id, owner, image);
+  t.mock.timers.tick(30 * 60 * 1000 - 1); assert.equal(manager.get(two.id, owner).state, 'queued');
+  t.mock.timers.tick(1);
+  for (const op of [one, two]) {
+    const view = manager.get(op.id, owner); assert.equal(view.state, 'failed'); assert.equal(view.retryable, false); assert.equal(view.hasImage, false);
+    assert.throws(() => manager.retry(op.id, owner, view.version), (e: any) => e.statusCode === 409);
+    assert.equal(manager.cancel(op.id, owner).state, 'failed');
+  }
+  assert.throws(() => manager.start(one.id, owner, image), (e: any) => e.statusCode === 409);
+  assert.equal(calls, 0);
+  const fresh = batch(manager, ['Fresh'])[0]; manager.start(fresh.id, owner, image);
+  await until(() => manager.get(fresh.id, owner).state === 'sent'); assert.equal(calls, 1);
+  t.mock.timers.tick(11);
+  for (const op of [one, two]) assert.throws(() => manager.start(op.id, owner, image), (e: any) => e.statusCode === 410);
+  assert.equal((manager as any).batches.size, 0);
+});
+
+test('batch expiry preserves commit uncertainty, stops followers and drains precommit resources', async t => {
+  for (const phase of ['commit', 'upload', 'unknown'] as const) await t.test(phase, async t => {
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    let finish = (_item: HistoryItem) => {}, reject = (_error: Error) => {}, drain = () => {}, calls = 0;
+    const manager = new SendOperations({ ...config, batchMs: 100, resultMs: 10, refreshWebSession: async () => {}, send: input => {
+      calls++; input.phase(phase === 'unknown' ? 'commit' : phase);
+      if (phase === 'unknown') return Promise.reject(transient({ uncertain: true }));
+      input.transport(new Promise<void>(resolve => { drain = resolve; }));
+      return new Promise((resolve, fail) => { finish = resolve; reject = fail; });
+    } }); t.after(async () => { reject(transient()); drain(); await manager.close(); });
+    const [one, two] = batch(manager); manager.start(one.id, owner, image); manager.start(two.id, owner, image);
+    await until(() => calls === 1);
+    if (phase === 'unknown') await until(() => manager.get(one.id, owner).state === 'unknown');
+    t.mock.timers.tick(100);
+    assert.equal(manager.get(one.id, owner).state, phase === 'upload' ? 'failed' : 'unknown');
+    assert.equal(manager.get(two.id, owner).state, 'failed'); assert.equal(manager.get(two.id, owner).retryable, false);
+    if (phase === 'commit') finish(sent); else reject(transient());
+    drain(); await delay(20); assert.equal(calls, 1, 'late completion cannot restart the expired batch');
+    assert.equal(manager.get(two.id, owner).state, 'failed');
+    if (phase === 'upload') assert.equal(manager.get(one.id, owner).state, 'failed', 'aborted worker must not turn expiry into a passable cancellation');
+    t.mock.timers.tick(11);
+    assert.throws(() => manager.get(two.id, owner), (e: any) => e.statusCode === 410);
+  });
+});
+
+test('shutdown cleans expired IDs before cancelling retained batch members', async t => {
+  t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+  const manager = new SendOperations({ ...config, preparedMs: 10, refreshWebSession: async () => {}, send: async () => sent });
+  t.after(() => manager.close());
+  manager.prepare(owner, peer, 'Expired single', () => true); batch(manager);
+  t.mock.timers.tick(11);
+  await manager.close();
+  assert.equal((manager as any).operations.size, 0); assert.equal((manager as any).batches.size, 0);
 });

@@ -1,0 +1,12 @@
+✔ reverse file completion activates the pre-reserved input positions without creating new sends (125.103991ms)
+✔ legacy ungrouped SendOperations still allows unrelated image tasks to run concurrently (64.128468ms)
+✔ ordered batch prevents the old concurrent-commit counterexample even with reverse activation (69.976737ms)
+✔ unknown predecessor cannot be released by stop-waiting, retry, or an old instance registration (51.13481ms)
+ℹ tests 4
+ℹ suites 0
+ℹ pass 4
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 486.189305
