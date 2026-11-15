@@ -753,6 +753,52 @@ test('web chat renders HAR-style Steam image BBCode with proxying, aspect ratio,
   assert.equal(fallback.textContent, fullUrl);
 });
 
+test('web chat renders proxied Steam image wrappers with a bare source URL and Steam thumbnail', async () => {
+  const fullUrl = 'https://i0.hdslb.com/bfs/new_dyn/6a841b92f5ed3d147101e51acb0343a43814977.jpg';
+  const thumbnailUrl = 'https://community.steamstatic.com/chat/image/screenshot-fixture/share_image.jpg';
+  for (const attributes of [
+    `src=${fullUrl} thumbnail_src=${thumbnailUrl} proxied=true`,
+    `src="${fullUrl}" thumbnail_src="${thumbnailUrl}" proxied="true"`,
+    `\nsrc=${fullUrl}\nthumbnail_src=${thumbnailUrl}\nproxied=true`,
+    `src=${fullUrl} thumbnail_src=${thumbnailUrl} proxied=false`,
+    `src=${fullUrl} thumbnail_src=${thumbnailUrl}`
+  ]) {
+    for (const body of [fullUrl, `\n${fullUrl}\n`, `[url=${fullUrl}]${fullUrl}[/url]`]) {
+      const { renderMessage, lightbox, lightboxImage } = loadWebTestApi();
+      const message = `图片前文 [img ${attributes}]${body}[/img] 图片后文`;
+      const rendered = renderMessage({ id: '1', type: 'message', message });
+      const image = rendered.findByClass('bbcode-image');
+      assert.ok(image, message);
+      assert.equal(image.src, `/proxy/image?url=${encodeURIComponent(thumbnailUrl)}`);
+      assert.equal(image.srcset, '');
+      assert.doesNotMatch(rendered.textContent, /\[\/?(?:img|url)\b|proxied=/i);
+      assert.match(rendered.textContent, /图片前文\s+图片后文/);
+      await rendered.findByClass('bbcode-image-button')!.dispatch('click');
+      assert.equal(lightbox.hidden, false);
+      assert.equal(lightboxImage.src, `/proxy/image?url=${encodeURIComponent(fullUrl)}`);
+      await image.dispatch('error');
+      assert.equal(rendered.findByClass('bbcode-image-fallback')!.href, fullUrl);
+    }
+  }
+});
+
+test('proxied image compatibility preserves invalid wrappers and escaped literal markup', () => {
+  const { renderMessage } = loadWebTestApi();
+  const fullUrl = 'https://i0.hdslb.com/bfs/new_dyn/example.jpg';
+  for (const message of [
+    `[img src=${fullUrl} proxied=true]https://example.com/other.jpg[/img]`,
+    `[img src=javascript:alert(1) proxied=true]javascript:alert(1)[/img]`,
+    `[img src=${fullUrl} proxied=true proxied=false]${fullUrl}[/img]`,
+    `[img src=${fullUrl} proxied=true unknown=1]${fullUrl}[/img]`,
+    `[img src=${fullUrl} proxied=true]${fullUrl} trailing text[/img]`,
+    `\\[img src=${fullUrl} proxied=true]${fullUrl}\\[/img]`
+  ]) {
+    const rendered = renderMessage({ id: '1', type: 'message', message });
+    assert.equal(rendered.findByClass('bbcode-image'), null, message);
+    assert.equal(rendered.findByClass('msg-body')!.textContent, message.replace(/\\([\\\[])/g, '$1'));
+  }
+});
+
 test('web chat falls back from invalid optional image attributes without rejecting the image', () => {
   const { renderMessage } = loadWebTestApi();
   const fullUrl = 'https://images.example.com/ugc/full/image/';

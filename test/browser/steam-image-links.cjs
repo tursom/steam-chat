@@ -13,6 +13,9 @@ const fixtures = process.env.STEAM_IMAGE_FIXTURE_URLS ? JSON.parse(process.env.S
   'https://images.steamusercontent.com/ugc/13627318694928895524/FEDCBA9876543210FEDCBA9876543210FEDCBA98/'
 ];
 const broken = 'https://images.steamusercontent.com/ugc/123/0000000000000000000000000000000000000000/';
+const externalImage = 'https://i0.hdslb.com/bfs/new_dyn/6a841b92f5ed3d147101e51acb0343a43814977.jpg';
+const steamThumbnail = 'https://community.steamstatic.com/chat/image/screenshot-fixture/share_image.jpg';
+const proxiedImageMessage = `[img src=${externalImage} thumbnail_src=${steamThumbnail} proxied=true]${externalImage}[/img]`;
 const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=', 'base64');
 
 (async () => {
@@ -32,6 +35,7 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
     chatConfig: { host: '127.0.0.1', port: 0 }, logger: { info() {}, warn() {}, error() {} },
     fetchImpl: async (url, options) => {
       if (String(url) === broken) return new Response('', { status: 404 });
+      if ([externalImage, steamThumbnail].includes(String(url))) return new Response(png, { headers: { 'Content-Type': 'image/png' } });
       assert.ok(fixtures.includes(String(url)), 'Only declared image fixtures may be downloaded');
       return process.env.STEAM_IMAGE_FIXTURE_URLS ? fetch(url, options) : new Response(png, { headers: { 'Content-Type': 'image/png' } });
     } });
@@ -57,6 +61,7 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
         }, peer);
         const history = fixtures.map((message, index) => ({ id: peer, steamAccountId: account, type: 'message', message,
           eventId: `history-${index}`, echo: false, sentAt: new Date(1700000000000 + index * 1000).toISOString() }));
+        history.push({ ...history[0], message: proxiedImageMessage, eventId: 'history-proxied' });
         const replies = {
           '/api/conversations': { items: [{ id: peer, name: 'Image regression' }] },
           '/api/history': { items: history }, '/api/history/status': {}, '/api/friends': [], '/api/groups': [],
@@ -82,6 +87,20 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
           assert.equal(await page.locator('#lightboxImage').getAttribute('src'), `/proxy/image?url=${encodeURIComponent(url)}`);
           await page.locator('#lightboxClose').click();
         }
+        const proxied = page.locator('[data-event-id="history-proxied"]');
+        const thumbnail = proxied.locator('.bbcode-image');
+        await thumbnail.scrollIntoViewIfNeeded(); await thumbnail.evaluate(node => node.decode());
+        assert.equal(await thumbnail.getAttribute('src'), `/proxy/image?url=${encodeURIComponent(steamThumbnail)}`);
+        assert.doesNotMatch(await proxied.locator('.msg-body').innerText(), /\[img|proxied=/);
+        const bounds = await thumbnail.boundingBox(); assert.ok(bounds.x >= 0 && bounds.x + bounds.width <= width);
+        await proxied.getByRole('button', { name: '查看大图' }).click();
+        await page.locator('#lightboxImage').evaluate(node => node.decode());
+        assert.equal(await page.locator('#lightboxImage').getAttribute('src'), `/proxy/image?url=${encodeURIComponent(externalImage)}`);
+        await page.locator('#lightboxClose').click();
+        socket.send(JSON.stringify({ ...history[0], eventId: 'live-proxied-image', message: proxiedImageMessage, sentAt: new Date().toISOString() }));
+        const liveProxied = page.locator('[data-event-id="live-proxied-image"] .bbcode-image');
+        await liveProxied.scrollIntoViewIfNeeded(); await liveProxied.evaluate(node => node.decode());
+        assert.equal(await liveProxied.getAttribute('src'), `/proxy/image?url=${encodeURIComponent(steamThumbnail)}`);
         socket.send(JSON.stringify({ ...history[0], eventId: 'live-image', type: 'message', sentAt: new Date().toISOString() }));
         const live = page.locator('[data-event-id="live-image"] .bbcode-image'); await live.scrollIntoViewIfNeeded(); await live.evaluate(node => node.decode());
         socket.send(JSON.stringify({ ...history[0], eventId: 'broken-image', type: 'message', message: broken, sentAt: new Date().toISOString() }));
@@ -89,7 +108,7 @@ const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR
         await failed.locator('.bbcode-image-fallback').waitFor(); assert.equal(await failed.locator('a').getAttribute('href'), broken);
         assert.equal(await page.evaluate(() => document.documentElement.scrollWidth > innerWidth), false);
         assert.deepEqual(errors, []); assert.deepEqual(writes, []);
-        console.log(`PASS ${width}px: two ${process.env.STEAM_IMAGE_FIXTURE_URLS ? 'real' : 'fixture'} PNGs decoded through authenticated image proxy, text history and WS images, lightbox, failed-image link and responsive layout`);
+        console.log(`PASS ${width}px: two ${process.env.STEAM_IMAGE_FIXTURE_URLS ? 'real' : 'fixture'} PNGs and proxied external image wrappers decoded through authenticated image proxy, text history and WS images, lightbox, failed-image link and responsive layout`);
       } finally { await context.close(); }
     }
   } finally { await browser.close(); await service.stop(); auth.close(); await rm(dir, { recursive: true, force: true }); }

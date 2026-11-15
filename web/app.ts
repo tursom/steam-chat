@@ -4170,10 +4170,10 @@ function steamUgcImageUrl(value: string): string {
 }
 
 function parseSteamImagePreview(attributes: string, body: string): SteamImagePreview | null {
-  const values = parseBbcodeAttributes(attributes, new Set(['src', 'thumbnail_src', 'srcset', 'width', 'height']));
+  const values = parseBbcodeAttributes(attributes, new Set(['src', 'thumbnail_src', 'srcset', 'width', 'height', 'proxied']));
   if (!values) return null;
   const sourceUrl = httpUrl(values.src);
-  if (!sourceUrl || !bbcodeLinkMatchesSource(body, sourceUrl)) return null;
+  if (!sourceUrl || (body.trim() !== sourceUrl && !bbcodeLinkMatchesSource(body, sourceUrl))) return null;
   return {
     sourceUrl,
     displayUrl: httpUrl(values.thumbnail_src) || sourceUrl,
